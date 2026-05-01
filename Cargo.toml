@@ -36,6 +36,10 @@ lto = false
 opt-level = 0
 debug = true
 
+[features]
+default = []
+hw-acceleration = []
+
 [lints.clippy]
 empty-line-after-doc-comments = "allow"
 

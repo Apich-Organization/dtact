@@ -12,6 +12,19 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::task::Context;
 use std::task::Poll;
+use std::sync::atomic::AtomicU8;
+use std::task::RawWaker;
+
+/// Safety policies for context pool memory layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SafetyLevel {
+    /// Allocates large linear memory arenas via Huge-Pages without Guard Pages.
+    Safety0,
+    /// Organizes every 32 stack slots into a Segment, with an mprotect Guard Page at the end.
+    Safety1,
+    /// Each stack slot occupies a dedicated virtual memory page with its own independent Guard Page.
+    Safety2,
+}
 
 /// Machine-specific registers for context switching.
 #[repr(C, align(64))]
@@ -46,50 +59,152 @@ impl Default for Registers {
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FiberStatus {
-    /// Fiber has been allocated but not yet started executing.
-    Initial,
-    /// Fiber is currently executing or ready to execute.
-    Running,
-    /// Fiber was suspended while waiting for additional async I/O data.
-    Yielded,
-    /// Fiber has completed its closure execution.
-    Finished,
-    /// Fiber experienced a panic that was caught.
-    Panicked,
+    Initial = 0,
+    Running = 1,
+    Yielded = 2,
+    Finished = 3,
+    Panicked = 4,
+}
+
+pub(crate) enum StackMemory {
+    Safety0 {
+        base: *mut u8,
+        usable_size: usize,
+    },
+    Safety1 {
+        base: *mut u8,
+        usable_size: usize,
+        is_guard: bool,
+    },
+    Safety2(GuardedStack),
+}
+
+pub(crate) struct ContextPool {
+    safety: SafetyLevel,
+    usable_size: usize,
+    free_list: crossbeam::queue::ArrayQueue<Box<FiberContext>>, // Assuming lock-free queue is needed, we'll use a simple approach here for demonstration if crossbeam isn't available, but the docs mention lock-free free-list.
+}
+
+impl StackMemory {
+    #[cfg(unix)]
+    pub(crate) fn allocate_safety0(usable_size: usize) -> Result<Self, crate::error::DecodeError> {
+        let usable_size = (usable_size + page_size() - 1) & !(page_size() - 1);
+        unsafe {
+            // Use huge pages if possible (MAP_HUGETLB is Linux specific, but we map anonymous memory)
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | 0x40000; // MAP_HUGETLB is usually 0x40000
+            let base = libc::mmap(
+                core::ptr::null_mut(),
+                usable_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags,
+                -1,
+                0,
+            );
+            if base == libc::MAP_FAILED {
+                // Fallback to normal pages
+                let base = libc::mmap(
+                    core::ptr::null_mut(),
+                    usable_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                if base == libc::MAP_FAILED {
+                    return crate::error::cold_decode_error_other("mmap failed for safety 0");
+                }
+                return Ok(Self::Safety0 {
+                    base: base.cast::<u8>(),
+                    usable_size,
+                });
+            }
+            Ok(Self::Safety0 {
+                base: base.cast::<u8>(),
+                usable_size,
+            })
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn allocate_safety0(usable_size: usize) -> Result<Self, crate::error::DecodeError> {
+        let usable_size = (usable_size + page_size() - 1) & !(page_size() - 1);
+        unsafe {
+            let base = winapi_shim::VirtualAlloc(
+                core::ptr::null_mut(),
+                usable_size,
+                winapi_shim::MEM_COMMIT | winapi_shim::MEM_RESERVE | 0x20000000, // MEM_LARGE_PAGES
+                winapi_shim::PAGE_READWRITE,
+            );
+            if base.is_null() {
+                // Fallback to normal pages
+                let base = winapi_shim::VirtualAlloc(
+                    core::ptr::null_mut(),
+                    usable_size,
+                    winapi_shim::MEM_COMMIT | winapi_shim::MEM_RESERVE,
+                    winapi_shim::PAGE_READWRITE,
+                );
+                if base.is_null() {
+                    return crate::error::cold_decode_error_other("VirtualAlloc failed for safety 0");
+                }
+                return Ok(Self::Safety0 {
+                    base: base.cast::<u8>(),
+                    usable_size,
+                });
+            }
+            Ok(Self::Safety0 {
+                base: base.cast::<u8>(),
+                usable_size,
+            })
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn top(&self) -> u64 {
+        match self {
+            Self::Safety0 { base, usable_size } => {
+                let raw = *base as u64 + *usable_size as u64;
+                raw & !15
+            }
+            Self::Safety1 { base, usable_size, .. } => {
+                let raw = *base as u64 + *usable_size as u64;
+                raw & !15
+            }
+            Self::Safety2(stack) => stack.top(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn bottom(&self) -> u64 {
+        match self {
+            Self::Safety0 { base, .. } => *base as u64,
+            Self::Safety1 { base, .. } => *base as u64,
+            Self::Safety2(stack) => stack.bottom(),
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn allocation_base(&self) -> u64 {
+        match self {
+            Self::Safety0 { base, .. } => *base as u64,
+            Self::Safety1 { base, .. } => *base as u64,
+            Self::Safety2(stack) => stack.allocation_base(),
+        }
+    }
 }
 
 /// A fiber stack with an `mmap`-backed guard page at the bottom.
-///
-/// Layout (low → high):
-/// ```text
-/// [ guard page  |  usable stack memory ]
-///   PAGE_SIZE       stack_size
-/// ```
-///
-/// The guard page is mapped `PROT_NONE`, so any access (stack overflow) will
-/// trigger a hardware fault (SIGSEGV / SIGBUS) instead of silently corrupting
-/// adjacent heap memory.
 #[allow(dead_code)]
 pub(crate) struct GuardedStack {
-    /// Base pointer returned by `mmap` (start of guard page).
     base: *mut u8,
-    /// Total allocation length (guard + usable).
     total_len: usize,
-    /// Page size used for the guard.
     page_size: usize,
 }
 
 impl GuardedStack {
-    /// Allocate a new guarded stack of *at least* `usable_size` bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `mmap` or `mprotect` fails.
     #[inline]
     #[cfg(unix)]
     pub(crate) fn new(usable_size: usize) -> core::result::Result<Self, crate::error::DecodeError> {
         let page_size = page_size();
-        // Round usable_size up to page boundary.
         let usable_size = (usable_size + page_size - 1) & !(page_size - 1);
         let total_len = page_size + usable_size;
 
@@ -106,7 +221,6 @@ impl GuardedStack {
                 return crate::error::cold_decode_error_other("mmap failed for fiber stack");
             }
 
-            // Protect the first page as a guard (PROT_NONE → any access faults).
             let rc = libc::mprotect(base, page_size, libc::PROT_NONE);
             if rc != 0 {
                 libc::munmap(base, total_len);
@@ -121,11 +235,6 @@ impl GuardedStack {
         }
     }
 
-    /// Allocate a new guarded stack on Windows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `VirtualAlloc` or `VirtualProtect` fails.
     #[inline]
     #[cfg(windows)]
     pub(crate) fn new(usable_size: usize) -> core::result::Result<Self, crate::error::DecodeError> {
@@ -134,7 +243,6 @@ impl GuardedStack {
         let total_len = page_size + usable_size;
 
         unsafe {
-            // Reserve and commit the entire stack
             let base = winapi_shim::VirtualAlloc(
                 core::ptr::null_mut(),
                 total_len,
@@ -147,7 +255,6 @@ impl GuardedStack {
                 );
             }
 
-            // Guard the first page
             let mut old_protect = 0;
             let rc = winapi_shim::VirtualProtect(
                 base,
@@ -170,7 +277,6 @@ impl GuardedStack {
         }
     }
 
-    /// Usable stack region (excludes guard page).
     #[inline(always)]
     #[must_use]
     #[allow(dead_code)]
@@ -183,7 +289,6 @@ impl GuardedStack {
         }
     }
 
-    /// Usable stack region (mutable).
     #[inline(always)]
     #[allow(dead_code)]
     pub(crate) const fn usable_mut(&mut self) -> &mut [u8] {
@@ -195,16 +300,14 @@ impl GuardedStack {
         }
     }
 
-    /// The top of the usable stack (highest address), 16-byte aligned.
     #[inline(always)]
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn top(&self) -> u64 {
         let raw = self.base as u64 + self.total_len as u64;
-        raw & !15 // 16-byte align
+        raw & !15
     }
 
-    /// The bottom of the usable stack (lowest usable address, just above guard page).
     #[inline(always)]
     #[must_use]
     #[allow(dead_code)]
@@ -212,7 +315,6 @@ impl GuardedStack {
         self.base as u64 + self.page_size as u64
     }
 
-    /// The absolute base of the mapping (potentially including guard page).
     #[inline(always)]
     #[must_use]
     #[allow(dead_code)]
@@ -237,7 +339,7 @@ impl Drop for GuardedStack {
         unsafe {
             let rc = winapi_shim::VirtualFree(
                 self.base.cast::<core::ffi::c_void>(),
-                0, // dwSize must be 0 for MEM_RELEASE
+                0,
                 winapi_shim::MEM_RELEASE,
             );
             debug_assert!(rc != 0, "VirtualFree failed for fiber stack");
@@ -245,13 +347,11 @@ impl Drop for GuardedStack {
     }
 }
 
-// GuardedStack owns a unique mmap region — safe to move between threads.
 unsafe impl Send for GuardedStack {}
 
 #[cfg(unix)]
 #[inline(always)]
 fn page_size() -> usize {
-    // Cached via a static to avoid repeated syscalls.
     static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *PAGE_SIZE.get_or_init(|| unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize })
 }
@@ -314,10 +414,22 @@ mod winapi_shim {
 }
 
 /// Context metadata for an executing fiber, managing stacks, registers, and closure passing.
-#[repr(C, align(16))]
+#[repr(C, align(64))]
 pub(crate) struct FiberContext {
-    /// The `GuardedStack` which maps the actual stack space in memory.
-    pub(crate) stack: GuardedStack,
+    /// RSP at the time of suspension
+    pub(crate) stack_ptr: usize,
+    /// Scheduler RSP before entering this Fiber
+    pub(crate) scheduler_stack_ptr: usize,
+    /// Ready, Running, Waiting, Dead
+    pub(crate) state: AtomicU8,
+    /// Topology Information
+    pub(crate) origin_core: u16,
+    pub(crate) fiber_index: u32,
+    /// Custom P2P wakeup logic implemented via RawWaker
+    pub(crate) static_raw_waker: RawWaker,
+
+    /// The memory region mapping the stack space in memory.
+    pub(crate) stack: StackMemory,
     /// Registers for the fiber state.
     pub(crate) regs: Registers,
     /// Registers for the executor state (where the fiber yields back to).
@@ -342,15 +454,9 @@ pub(crate) struct FiberContext {
     pub(crate) read_buffer: Box<[u8]>,
 }
 
-// FiberContext is intentionally NOT Send/Sync.
-// It is only accessed through BridgeFuture, which manually implements
-// Send/Sync with the correct safety invariants.
 std::thread_local! {
     static CONTEXT_POOL: RefCell<Vec<Box<FiberContext>>> = const { RefCell::new(Vec::new()) };
     static CURRENT_FIBER: std::cell::Cell<*mut FiberContext> = const { std::cell::Cell::new(core::ptr::null_mut()) };
 }
 
-/// Cap the number of contexts pooled per thread to prevent unbounded mmap accumulation.
 const MAX_POOLED_CONTEXTS: usize = 8_192;
-
-
