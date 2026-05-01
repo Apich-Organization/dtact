@@ -314,13 +314,17 @@ impl Worker {
     pub unsafe fn dispatch_loop_asm(&mut self, context_base: *mut u8, context_size: usize) -> ! {
         loop {
             if self.local_head != self.local_tail {
-                let task = (*self.local_queue.ptr)[self.local_head];
+                let task = (unsafe { *self.local_queue.ptr })[self.local_head];
                 self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
                 
-                let target_ptr = context_base.add((task as usize) * context_size);
+                let target_ptr = unsafe {
+                    context_base.add((task as usize) * context_size)
+                };
                 
                 // Hardware Prefetch: Bring FiberContext to L1 using T0 hint immediately
-                core::arch::x86_64::_mm_prefetch::<0>(target_ptr as *const i8);
+                unsafe {
+                    core::arch::x86_64::_mm_prefetch::<0>(target_ptr as *const i8);
+                }
                 
                 // Inline Assembly Fast-Path Context Switch (Minimal Registers)
                 // rcx holds target_ptr (FiberContext pointer)
