@@ -138,6 +138,22 @@ impl Mailbox {
             // anticipating the consumer core will read it soon, significantly reducing coherency traffic.
             core::arch::asm!("cldemote [{}]", in(reg) &self.tail);
         }
+
+        #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
+        unsafe {
+            // Hardware Acceleration: ARM Data Cache Clean by VA to Point of Coherency (DC CVAC)
+            // Pushes the updated tail index out of the local L1/L2 down to the shared Point of Coherency,
+            // acting identically to CLDEMOTE by accelerating visibility to the remote consumer core.
+            core::arch::asm!("dc cvac, {}", in(reg) &self.tail);
+        }
+
+        #[cfg(all(feature = "hw-acceleration", target_arch = "riscv64"))]
+        unsafe {
+            // Hardware Acceleration: RISC-V Zicbom Cache Block Clean (cbo.clean)
+            // Cleans the cache block to the point of coherency, effectively demoting it 
+            // to a shared level so other harts can see the updated tail pointer instantly.
+            core::arch::asm!("cbo.clean 0({0})", in(reg) &self.tail);
+        }
         
         Ok(())
     }
@@ -406,6 +422,23 @@ impl DtaScheduler {
                 out("rax") _,
                 options(nostack, preserves_flags),
             );
+        }
+
+        #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
+        unsafe {
+            // Hardware Acceleration: ARM Send Event (SEV)
+            // Broadcasts an event to all cores. If the target core is in a low-power yield state
+            // via WFE (Wait For Event), this wakes it up instantly in userspace without OS traps.
+            core::arch::asm!("sev", options(nostack, preserves_flags));
+        }
+
+        #[cfg(all(feature = "hw-acceleration", target_arch = "riscv64"))]
+        unsafe {
+            // Hardware Acceleration: RISC-V AIA (Advanced Interrupt Architecture)
+            // Sends a User-level IPI (UIPI) to the target hart.
+            // Writing to the `uipi` CSR triggers a user-level interrupt directly on the 
+            // target core, allowing instantaneous wakeups from `Zihintpause` spin states.
+            core::arch::asm!("csrw uipi, {0}", in(reg) target_core);
         }
     }
 
