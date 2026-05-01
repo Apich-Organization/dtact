@@ -1,0 +1,1004 @@
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::pin::Pin;
+use std::arch::naked_asm;
+use std::cell::RefCell;
+use std::future::Future;
+use std::task::Context;
+use std::task::Poll;
+
+// --- context switch for non-same thread and with float cases
+
+// x86_64 context switch — System V ABI (Linux, macOS, FreeBSD, …)
+// Arguments: rdi = save, rsi = restore
+#[cfg(all(target_arch = "x86_64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rdi + 0], rsp",
+        "mov [rdi + 8], rbp",
+        "mov [rdi + 16], rbx",
+        "mov [rdi + 24], r12",
+        "mov [rdi + 32], r13",
+        "mov [rdi + 40], r14",
+        "mov [rdi + 48], r15",
+        "fxsave [rdi + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rdi + 56], rax",
+        "fxrstor [rsi + 128]",
+        "mov rsp, [rsi + 0]",
+        "mov rbp, [rsi + 8]",
+        "mov rbx, [rsi + 16]",
+        "mov r12, [rsi + 24]",
+        "mov r13, [rsi + 32]",
+        "mov r14, [rsi + 40]",
+        "mov r15, [rsi + 48]",
+        "jmp [rsi + 56]",
+        "1: ret"
+    );
+}
+
+// x86_64 context switch — Microsoft x64 ABI (Windows)
+// Arguments: rcx = save, rdx = restore
+// Additional: rdi/rsi are callee-saved; TIB stack bounds must be swapped.
+//   gprs[8]  = rdi      gprs[9]  = rsi
+//   gprs[10] = TIB StackBase      (gs:[0x08])
+//   gprs[11] = TIB StackLimit     (gs:[0x10])
+//   gprs[12] = TIB DeallocationStack (gs:[0x1478])
+//   gprs[13] = TIB ExceptionList  (gs:[0x00])
+#[cfg(all(target_arch = "x86_64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rcx + 0], rsp",
+        "mov [rcx + 8], rbp",
+        "mov [rcx + 16], rbx",
+        "mov [rcx + 24], r12",
+        "mov [rcx + 32], r13",
+        "mov [rcx + 40], r14",
+        "mov [rcx + 48], r15",
+        "mov [rcx + 64], rdi",
+        "mov [rcx + 72], rsi",
+        "mov rax, gs:[0x08]",
+        "mov [rcx + 80], rax",
+        "mov rax, gs:[0x10]",
+        "mov [rcx + 88], rax",
+        "mov rax, gs:[0x1478]",
+        "mov [rcx + 96], rax",
+        "mov rax, gs:[0x00]",
+        "mov [rcx + 104], rax",
+        "fxsave [rcx + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rcx + 56], rax",
+        "fxrstor [rdx + 128]",
+        "mov rax, [rdx + 80]",
+        "mov gs:[0x08], rax",
+        "mov rax, [rdx + 88]",
+        "mov gs:[0x10], rax",
+        "mov rax, [rdx + 96]",
+        "mov gs:[0x1478], rax",
+        "mov rax, [rdx + 104]",
+        "mov gs:[0x00], rax",
+        "mov rsp, [rdx + 0]",
+        "mov rbp, [rdx + 8]",
+        "mov rbx, [rdx + 16]",
+        "mov r12, [rdx + 24]",
+        "mov r13, [rdx + 32]",
+        "mov r14, [rdx + 40]",
+        "mov r15, [rdx + 48]",
+        "mov rdi, [rdx + 64]",
+        "mov rsi, [rdx + 72]",
+        "jmp [rdx + 56]",
+        "1: ret"
+    );
+}
+
+// aarch64 context switch — AAPCS64 (Linux, macOS, FreeBSD)
+// Arguments: x0 = save, x1 = restore
+#[cfg(all(target_arch = "aarch64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ret"
+    );
+}
+
+// aarch64 context switch — Windows ARM64
+// Arguments: x0 = save, x1 = restore
+// Additional: TEB is at x18; must swap stack bounds.
+//   gprs[13] = TEB StackBase      (x18 + 0x08)
+//   gprs[14] = TEB StackLimit     (x18 + 0x10)
+//   gprs[15] = TEB DeallocationStack (x18 + 0x1478)
+#[cfg(all(target_arch = "aarch64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "ldr x9, [x18, #0x08]",
+        "str x9, [x0, #104]",
+        "ldr x9, [x18, #0x10]",
+        "str x9, [x0, #112]",
+        "ldr x9, [x18, #0x1478]",
+        "str x9, [x0, #120]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ldr x9, [x1, #104]",
+        "str x9, [x18, #0x08]",
+        "ldr x9, [x1, #112]",
+        "str x9, [x18, #0x10]",
+        "ldr x9, [x1, #120]",
+        "str x9, [x18, #0x1478]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ret"
+    );
+}
+
+// riscv64 context switch — unix only (no Windows RISC-V target exists)
+#[cfg(all(target_arch = "riscv64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "sd sp, 0(a0)",
+        "sd s0, 8(a0)",
+        "sd s1, 16(a0)",
+        "sd s2, 24(a0)",
+        "sd s3, 32(a0)",
+        "sd s4, 40(a0)",
+        "sd s5, 48(a0)",
+        "sd s6, 56(a0)",
+        "sd s7, 64(a0)",
+        "sd s8, 72(a0)",
+        "sd s9, 80(a0)",
+        "sd s10, 88(a0)",
+        "sd s11, 96(a0)",
+        "sd ra, 104(a0)",
+        "fsd fs0, 128(a0)",
+        "fsd fs1, 136(a0)",
+        "fsd fs2, 144(a0)",
+        "fsd fs3, 152(a0)",
+        "fsd fs4, 160(a0)",
+        "fsd fs5, 168(a0)",
+        "fsd fs6, 176(a0)",
+        "fsd fs7, 184(a0)",
+        "fsd fs8, 192(a0)",
+        "fsd fs9, 200(a0)",
+        "fsd fs10, 208(a0)",
+        "fsd fs11, 216(a0)",
+        "ld sp, 0(a1)",
+        "ld s0, 8(a1)",
+        "ld s1, 16(a1)",
+        "ld s2, 24(a1)",
+        "ld s3, 32(a1)",
+        "ld s4, 40(a1)",
+        "ld s5, 48(a1)",
+        "ld s6, 56(a1)",
+        "ld s7, 64(a1)",
+        "ld s8, 72(a1)",
+        "ld s9, 80(a1)",
+        "ld s10, 88(a1)",
+        "ld s11, 96(a1)",
+        "ld ra, 104(a1)",
+        "fld fs0, 128(a1)",
+        "fld fs1, 136(a1)",
+        "fld fs2, 144(a1)",
+        "fld fs3, 152(a1)",
+        "fld fs4, 160(a1)",
+        "fld fs5, 168(a1)",
+        "fld fs6, 176(a1)",
+        "fld fs7, 184(a1)",
+        "fld fs8, 192(a1)",
+        "fld fs9, 200(a1)",
+        "fld fs10, 208(a1)",
+        "fld fs11, 216(a1)",
+        "ret"
+    );
+}
+
+// --- context switch for non-same thread and without float cases
+
+// x86_64 context switch — System V ABI (Linux, macOS, FreeBSD, …)
+// Arguments: rdi = save, rsi = restore
+#[cfg(all(target_arch = "x86_64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rdi + 0], rsp",
+        "mov [rdi + 8], rbp",
+        "mov [rdi + 16], rbx",
+        "mov [rdi + 24], r12",
+        "mov [rdi + 32], r13",
+        "mov [rdi + 40], r14",
+        "mov [rdi + 48], r15",
+        "fxsave [rdi + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rdi + 56], rax",
+        "fxrstor [rsi + 128]",
+        "mov rsp, [rsi + 0]",
+        "mov rbp, [rsi + 8]",
+        "mov rbx, [rsi + 16]",
+        "mov r12, [rsi + 24]",
+        "mov r13, [rsi + 32]",
+        "mov r14, [rsi + 40]",
+        "mov r15, [rsi + 48]",
+        "jmp [rsi + 56]",
+        "1: ret"
+    );
+}
+
+// x86_64 context switch — Microsoft x64 ABI (Windows)
+// Arguments: rcx = save, rdx = restore
+// Additional: rdi/rsi are callee-saved; TIB stack bounds must be swapped.
+//   gprs[8]  = rdi      gprs[9]  = rsi
+//   gprs[10] = TIB StackBase      (gs:[0x08])
+//   gprs[11] = TIB StackLimit     (gs:[0x10])
+//   gprs[12] = TIB DeallocationStack (gs:[0x1478])
+//   gprs[13] = TIB ExceptionList  (gs:[0x00])
+#[cfg(all(target_arch = "x86_64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rcx + 0], rsp",
+        "mov [rcx + 8], rbp",
+        "mov [rcx + 16], rbx",
+        "mov [rcx + 24], r12",
+        "mov [rcx + 32], r13",
+        "mov [rcx + 40], r14",
+        "mov [rcx + 48], r15",
+        "mov [rcx + 64], rdi",
+        "mov [rcx + 72], rsi",
+        "mov rax, gs:[0x08]",
+        "mov [rcx + 80], rax",
+        "mov rax, gs:[0x10]",
+        "mov [rcx + 88], rax",
+        "mov rax, gs:[0x1478]",
+        "mov [rcx + 96], rax",
+        "mov rax, gs:[0x00]",
+        "mov [rcx + 104], rax",
+        "fxsave [rcx + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rcx + 56], rax",
+        "fxrstor [rdx + 128]",
+        "mov rax, [rdx + 80]",
+        "mov gs:[0x08], rax",
+        "mov rax, [rdx + 88]",
+        "mov gs:[0x10], rax",
+        "mov rax, [rdx + 96]",
+        "mov gs:[0x1478], rax",
+        "mov rax, [rdx + 104]",
+        "mov gs:[0x00], rax",
+        "mov rsp, [rdx + 0]",
+        "mov rbp, [rdx + 8]",
+        "mov rbx, [rdx + 16]",
+        "mov r12, [rdx + 24]",
+        "mov r13, [rdx + 32]",
+        "mov r14, [rdx + 40]",
+        "mov r15, [rdx + 48]",
+        "mov rdi, [rdx + 64]",
+        "mov rsi, [rdx + 72]",
+        "jmp [rdx + 56]",
+        "1: ret"
+    );
+}
+
+// aarch64 context switch — AAPCS64 (Linux, macOS, FreeBSD)
+// Arguments: x0 = save, x1 = restore
+#[cfg(all(target_arch = "aarch64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ret"
+    );
+}
+
+// aarch64 context switch — Windows ARM64
+// Arguments: x0 = save, x1 = restore
+// Additional: TEB is at x18; must swap stack bounds.
+//   gprs[13] = TEB StackBase      (x18 + 0x08)
+//   gprs[14] = TEB StackLimit     (x18 + 0x10)
+//   gprs[15] = TEB DeallocationStack (x18 + 0x1478)
+#[cfg(all(target_arch = "aarch64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "ldr x9, [x18, #0x08]",
+        "str x9, [x0, #104]",
+        "ldr x9, [x18, #0x10]",
+        "str x9, [x0, #112]",
+        "ldr x9, [x18, #0x1478]",
+        "str x9, [x0, #120]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ldr x9, [x1, #104]",
+        "str x9, [x18, #0x08]",
+        "ldr x9, [x1, #112]",
+        "str x9, [x18, #0x10]",
+        "ldr x9, [x1, #120]",
+        "str x9, [x18, #0x1478]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ret"
+    );
+}
+
+// riscv64 context switch — unix only (no Windows RISC-V target exists)
+#[cfg(all(target_arch = "riscv64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "sd sp, 0(a0)",
+        "sd s0, 8(a0)",
+        "sd s1, 16(a0)",
+        "sd s2, 24(a0)",
+        "sd s3, 32(a0)",
+        "sd s4, 40(a0)",
+        "sd s5, 48(a0)",
+        "sd s6, 56(a0)",
+        "sd s7, 64(a0)",
+        "sd s8, 72(a0)",
+        "sd s9, 80(a0)",
+        "sd s10, 88(a0)",
+        "sd s11, 96(a0)",
+        "sd ra, 104(a0)",
+        "fsd fs0, 128(a0)",
+        "fsd fs1, 136(a0)",
+        "fsd fs2, 144(a0)",
+        "fsd fs3, 152(a0)",
+        "fsd fs4, 160(a0)",
+        "fsd fs5, 168(a0)",
+        "fsd fs6, 176(a0)",
+        "fsd fs7, 184(a0)",
+        "fsd fs8, 192(a0)",
+        "fsd fs9, 200(a0)",
+        "fsd fs10, 208(a0)",
+        "fsd fs11, 216(a0)",
+        "ld sp, 0(a1)",
+        "ld s0, 8(a1)",
+        "ld s1, 16(a1)",
+        "ld s2, 24(a1)",
+        "ld s3, 32(a1)",
+        "ld s4, 40(a1)",
+        "ld s5, 48(a1)",
+        "ld s6, 56(a1)",
+        "ld s7, 64(a1)",
+        "ld s8, 72(a1)",
+        "ld s9, 80(a1)",
+        "ld s10, 88(a1)",
+        "ld s11, 96(a1)",
+        "ld ra, 104(a1)",
+        "fld fs0, 128(a1)",
+        "fld fs1, 136(a1)",
+        "fld fs2, 144(a1)",
+        "fld fs3, 152(a1)",
+        "fld fs4, 160(a1)",
+        "fld fs5, 168(a1)",
+        "fld fs6, 176(a1)",
+        "fld fs7, 184(a1)",
+        "fld fs8, 192(a1)",
+        "fld fs9, 200(a1)",
+        "fld fs10, 208(a1)",
+        "fld fs11, 216(a1)",
+        "ret"
+    );
+}
+
+// --- context switch for non-same thread and without float cases
+
+// x86_64 context switch — System V ABI (Linux, macOS, FreeBSD, …)
+// Arguments: rdi = save, rsi = restore
+#[cfg(all(target_arch = "x86_64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rdi + 0], rsp",
+        "mov [rdi + 8], rbp",
+        "mov [rdi + 16], rbx",
+        "mov [rdi + 24], r12",
+        "mov [rdi + 32], r13",
+        "mov [rdi + 40], r14",
+        "mov [rdi + 48], r15",
+        "fxsave [rdi + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rdi + 56], rax",
+        "fxrstor [rsi + 128]",
+        "mov rsp, [rsi + 0]",
+        "mov rbp, [rsi + 8]",
+        "mov rbx, [rsi + 16]",
+        "mov r12, [rsi + 24]",
+        "mov r13, [rsi + 32]",
+        "mov r14, [rsi + 40]",
+        "mov r15, [rsi + 48]",
+        "jmp [rsi + 56]",
+        "1: ret"
+    );
+}
+
+// x86_64 context switch — Microsoft x64 ABI (Windows)
+// Arguments: rcx = save, rdx = restore
+// Additional: rdi/rsi are callee-saved; TIB stack bounds must be swapped.
+//   gprs[8]  = rdi      gprs[9]  = rsi
+//   gprs[10] = TIB StackBase      (gs:[0x08])
+//   gprs[11] = TIB StackLimit     (gs:[0x10])
+//   gprs[12] = TIB DeallocationStack (gs:[0x1478])
+//   gprs[13] = TIB ExceptionList  (gs:[0x00])
+#[cfg(all(target_arch = "x86_64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rcx + 0], rsp",
+        "mov [rcx + 8], rbp",
+        "mov [rcx + 16], rbx",
+        "mov [rcx + 24], r12",
+        "mov [rcx + 32], r13",
+        "mov [rcx + 40], r14",
+        "mov [rcx + 48], r15",
+        "mov [rcx + 64], rdi",
+        "mov [rcx + 72], rsi",
+        "mov rax, gs:[0x08]",
+        "mov [rcx + 80], rax",
+        "mov rax, gs:[0x10]",
+        "mov [rcx + 88], rax",
+        "mov rax, gs:[0x1478]",
+        "mov [rcx + 96], rax",
+        "mov rax, gs:[0x00]",
+        "mov [rcx + 104], rax",
+        "fxsave [rcx + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rcx + 56], rax",
+        "fxrstor [rdx + 128]",
+        "mov rax, [rdx + 80]",
+        "mov gs:[0x08], rax",
+        "mov rax, [rdx + 88]",
+        "mov gs:[0x10], rax",
+        "mov rax, [rdx + 96]",
+        "mov gs:[0x1478], rax",
+        "mov rax, [rdx + 104]",
+        "mov gs:[0x00], rax",
+        "mov rsp, [rdx + 0]",
+        "mov rbp, [rdx + 8]",
+        "mov rbx, [rdx + 16]",
+        "mov r12, [rdx + 24]",
+        "mov r13, [rdx + 32]",
+        "mov r14, [rdx + 40]",
+        "mov r15, [rdx + 48]",
+        "mov rdi, [rdx + 64]",
+        "mov rsi, [rdx + 72]",
+        "jmp [rdx + 56]",
+        "1: ret"
+    );
+}
+
+// aarch64 context switch — AAPCS64 (Linux, macOS, FreeBSD)
+// Arguments: x0 = save, x1 = restore
+#[cfg(all(target_arch = "aarch64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ret"
+    );
+}
+
+// aarch64 context switch — Windows ARM64
+// Arguments: x0 = save, x1 = restore
+// Additional: TEB is at x18; must swap stack bounds.
+//   gprs[13] = TEB StackBase      (x18 + 0x08)
+//   gprs[14] = TEB StackLimit     (x18 + 0x10)
+//   gprs[15] = TEB DeallocationStack (x18 + 0x1478)
+#[cfg(all(target_arch = "aarch64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "ldr x9, [x18, #0x08]",
+        "str x9, [x0, #104]",
+        "ldr x9, [x18, #0x10]",
+        "str x9, [x0, #112]",
+        "ldr x9, [x18, #0x1478]",
+        "str x9, [x0, #120]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ldr x9, [x1, #104]",
+        "str x9, [x18, #0x08]",
+        "ldr x9, [x1, #112]",
+        "str x9, [x18, #0x10]",
+        "ldr x9, [x1, #120]",
+        "str x9, [x18, #0x1478]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ret"
+    );
+}
+
+// riscv64 context switch — unix only (no Windows RISC-V target exists)
+#[cfg(all(target_arch = "riscv64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "sd sp, 0(a0)",
+        "sd s0, 8(a0)",
+        "sd s1, 16(a0)",
+        "sd s2, 24(a0)",
+        "sd s3, 32(a0)",
+        "sd s4, 40(a0)",
+        "sd s5, 48(a0)",
+        "sd s6, 56(a0)",
+        "sd s7, 64(a0)",
+        "sd s8, 72(a0)",
+        "sd s9, 80(a0)",
+        "sd s10, 88(a0)",
+        "sd s11, 96(a0)",
+        "sd ra, 104(a0)",
+        "fsd fs0, 128(a0)",
+        "fsd fs1, 136(a0)",
+        "fsd fs2, 144(a0)",
+        "fsd fs3, 152(a0)",
+        "fsd fs4, 160(a0)",
+        "fsd fs5, 168(a0)",
+        "fsd fs6, 176(a0)",
+        "fsd fs7, 184(a0)",
+        "fsd fs8, 192(a0)",
+        "fsd fs9, 200(a0)",
+        "fsd fs10, 208(a0)",
+        "fsd fs11, 216(a0)",
+        "ld sp, 0(a1)",
+        "ld s0, 8(a1)",
+        "ld s1, 16(a1)",
+        "ld s2, 24(a1)",
+        "ld s3, 32(a1)",
+        "ld s4, 40(a1)",
+        "ld s5, 48(a1)",
+        "ld s6, 56(a1)",
+        "ld s7, 64(a1)",
+        "ld s8, 72(a1)",
+        "ld s9, 80(a1)",
+        "ld s10, 88(a1)",
+        "ld s11, 96(a1)",
+        "ld ra, 104(a1)",
+        "fld fs0, 128(a1)",
+        "fld fs1, 136(a1)",
+        "fld fs2, 144(a1)",
+        "fld fs3, 152(a1)",
+        "fld fs4, 160(a1)",
+        "fld fs5, 168(a1)",
+        "fld fs6, 176(a1)",
+        "fld fs7, 184(a1)",
+        "fld fs8, 192(a1)",
+        "fld fs9, 200(a1)",
+        "fld fs10, 208(a1)",
+        "fld fs11, 216(a1)",
+        "ret"
+    );
+}
+
+// --- context switch for non-same thread and with float cases
+
+// x86_64 context switch — System V ABI (Linux, macOS, FreeBSD, …)
+// Arguments: rdi = save, rsi = restore
+#[cfg(all(target_arch = "x86_64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rdi + 0], rsp",
+        "mov [rdi + 8], rbp",
+        "mov [rdi + 16], rbx",
+        "mov [rdi + 24], r12",
+        "mov [rdi + 32], r13",
+        "mov [rdi + 40], r14",
+        "mov [rdi + 48], r15",
+        "fxsave [rdi + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rdi + 56], rax",
+        "fxrstor [rsi + 128]",
+        "mov rsp, [rsi + 0]",
+        "mov rbp, [rsi + 8]",
+        "mov rbx, [rsi + 16]",
+        "mov r12, [rsi + 24]",
+        "mov r13, [rsi + 32]",
+        "mov r14, [rsi + 40]",
+        "mov r15, [rsi + 48]",
+        "jmp [rsi + 56]",
+        "1: ret"
+    );
+}
+
+// x86_64 context switch — Microsoft x64 ABI (Windows)
+// Arguments: rcx = save, rdx = restore
+// Additional: rdi/rsi are callee-saved; TIB stack bounds must be swapped.
+//   gprs[8]  = rdi      gprs[9]  = rsi
+//   gprs[10] = TIB StackBase      (gs:[0x08])
+//   gprs[11] = TIB StackLimit     (gs:[0x10])
+//   gprs[12] = TIB DeallocationStack (gs:[0x1478])
+//   gprs[13] = TIB ExceptionList  (gs:[0x00])
+#[cfg(all(target_arch = "x86_64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "mov [rcx + 0], rsp",
+        "mov [rcx + 8], rbp",
+        "mov [rcx + 16], rbx",
+        "mov [rcx + 24], r12",
+        "mov [rcx + 32], r13",
+        "mov [rcx + 40], r14",
+        "mov [rcx + 48], r15",
+        "mov [rcx + 64], rdi",
+        "mov [rcx + 72], rsi",
+        "mov rax, gs:[0x08]",
+        "mov [rcx + 80], rax",
+        "mov rax, gs:[0x10]",
+        "mov [rcx + 88], rax",
+        "mov rax, gs:[0x1478]",
+        "mov [rcx + 96], rax",
+        "mov rax, gs:[0x00]",
+        "mov [rcx + 104], rax",
+        "fxsave [rcx + 128]",
+        "lea rax, [rip + 1f]",
+        "mov [rcx + 56], rax",
+        "fxrstor [rdx + 128]",
+        "mov rax, [rdx + 80]",
+        "mov gs:[0x08], rax",
+        "mov rax, [rdx + 88]",
+        "mov gs:[0x10], rax",
+        "mov rax, [rdx + 96]",
+        "mov gs:[0x1478], rax",
+        "mov rax, [rdx + 104]",
+        "mov gs:[0x00], rax",
+        "mov rsp, [rdx + 0]",
+        "mov rbp, [rdx + 8]",
+        "mov rbx, [rdx + 16]",
+        "mov r12, [rdx + 24]",
+        "mov r13, [rdx + 32]",
+        "mov r14, [rdx + 40]",
+        "mov r15, [rdx + 48]",
+        "mov rdi, [rdx + 64]",
+        "mov rsi, [rdx + 72]",
+        "jmp [rdx + 56]",
+        "1: ret"
+    );
+}
+
+// aarch64 context switch — AAPCS64 (Linux, macOS, FreeBSD)
+// Arguments: x0 = save, x1 = restore
+#[cfg(all(target_arch = "aarch64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ret"
+    );
+}
+
+// aarch64 context switch — Windows ARM64
+// Arguments: x0 = save, x1 = restore
+// Additional: TEB is at x18; must swap stack bounds.
+//   gprs[13] = TEB StackBase      (x18 + 0x08)
+//   gprs[14] = TEB StackLimit     (x18 + 0x10)
+//   gprs[15] = TEB DeallocationStack (x18 + 0x1478)
+#[cfg(all(target_arch = "aarch64", windows))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "stp x19, x20, [x0, 0]",
+        "stp x21, x22, [x0, 16]",
+        "stp x23, x24, [x0, 32]",
+        "stp x25, x26, [x0, 48]",
+        "stp x27, x28, [x0, 64]",
+        "stp x29, x30, [x0, 80]",
+        "mov x9, sp",
+        "str x9, [x0, 96]",
+        "ldr x9, [x18, #0x08]",
+        "str x9, [x0, #104]",
+        "ldr x9, [x18, #0x10]",
+        "str x9, [x0, #112]",
+        "ldr x9, [x18, #0x1478]",
+        "str x9, [x0, #120]",
+        "stp q8, q9, [x0, 128]",
+        "stp q10, q11, [x0, 160]",
+        "stp q12, q13, [x0, 192]",
+        "stp q14, q15, [x0, 224]",
+        "ldp q8, q9, [x1, 128]",
+        "ldp q10, q11, [x1, 160]",
+        "ldp q12, q13, [x1, 192]",
+        "ldp q14, q15, [x1, 224]",
+        "ldr x9, [x1, #104]",
+        "str x9, [x18, #0x08]",
+        "ldr x9, [x1, #112]",
+        "str x9, [x18, #0x10]",
+        "ldr x9, [x1, #120]",
+        "str x9, [x18, #0x1478]",
+        "ldp x19, x20, [x1, 0]",
+        "ldp x21, x22, [x1, 16]",
+        "ldp x23, x24, [x1, 32]",
+        "ldp x25, x26, [x1, 48]",
+        "ldp x27, x28, [x1, 64]",
+        "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 96]",
+        "mov sp, x9",
+        "ret"
+    );
+}
+
+// riscv64 context switch — unix only (no Windows RISC-V target exists)
+#[cfg(all(target_arch = "riscv64", unix))]
+#[unsafe(naked)]
+unsafe extern "C" fn switch_context(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "sd sp, 0(a0)",
+        "sd s0, 8(a0)",
+        "sd s1, 16(a0)",
+        "sd s2, 24(a0)",
+        "sd s3, 32(a0)",
+        "sd s4, 40(a0)",
+        "sd s5, 48(a0)",
+        "sd s6, 56(a0)",
+        "sd s7, 64(a0)",
+        "sd s8, 72(a0)",
+        "sd s9, 80(a0)",
+        "sd s10, 88(a0)",
+        "sd s11, 96(a0)",
+        "sd ra, 104(a0)",
+        "fsd fs0, 128(a0)",
+        "fsd fs1, 136(a0)",
+        "fsd fs2, 144(a0)",
+        "fsd fs3, 152(a0)",
+        "fsd fs4, 160(a0)",
+        "fsd fs5, 168(a0)",
+        "fsd fs6, 176(a0)",
+        "fsd fs7, 184(a0)",
+        "fsd fs8, 192(a0)",
+        "fsd fs9, 200(a0)",
+        "fsd fs10, 208(a0)",
+        "fsd fs11, 216(a0)",
+        "ld sp, 0(a1)",
+        "ld s0, 8(a1)",
+        "ld s1, 16(a1)",
+        "ld s2, 24(a1)",
+        "ld s3, 32(a1)",
+        "ld s4, 40(a1)",
+        "ld s5, 48(a1)",
+        "ld s6, 56(a1)",
+        "ld s7, 64(a1)",
+        "ld s8, 72(a1)",
+        "ld s9, 80(a1)",
+        "ld s10, 88(a1)",
+        "ld s11, 96(a1)",
+        "ld ra, 104(a1)",
+        "fld fs0, 128(a1)",
+        "fld fs1, 136(a1)",
+        "fld fs2, 144(a1)",
+        "fld fs3, 152(a1)",
+        "fld fs4, 160(a1)",
+        "fld fs5, 168(a1)",
+        "fld fs6, 176(a1)",
+        "fld fs7, 184(a1)",
+        "fld fs8, 192(a1)",
+        "fld fs9, 200(a1)",
+        "fld fs10, 208(a1)",
+        "fld fs11, 216(a1)",
+        "ret"
+    );
+}
+
+#[cfg(all(
+    feature = "async-fiber",
+    not(any(
+        all(target_arch = "x86_64", any(unix, windows)),
+        all(target_arch = "aarch64", any(unix, windows)),
+        all(target_arch = "riscv64", unix)
+    ))
+))]
+compile_error!(
+    "Unified Fiber-backed Async (async-fiber) is supported on: x86_64 (unix/windows), aarch64 (unix/windows), riscv64 (unix only)."
+);
