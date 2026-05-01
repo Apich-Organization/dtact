@@ -35,3 +35,14 @@ macro_rules! dtact_error {
         }
     };
 }
+
+dtact_error! {
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    pub enum DtactError {
+        MmapFailed,
+        VirtualAllocFailed,
+        MprotectFailed,
+        VirtualProtectFailed,
+        OutsideFiberContext,
+    }
+}

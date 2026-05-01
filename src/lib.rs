@@ -64,3 +64,24 @@ pub mod memory_management;
 pub mod c_ffi;
 pub mod utils;
 pub mod errors;
+pub mod api;
+
+pub use api::*;
+
+/// Global Singleton for the Runtime Scheduler
+pub(crate) static GLOBAL_SCHEDULER: std::sync::OnceLock<dta_scheduler::DtaScheduler> = std::sync::OnceLock::new();
+
+/// Global Singleton for the Lock-Free Arena Context Pool
+pub(crate) static GLOBAL_CONTEXT_POOL: std::sync::OnceLock<memory_management::ContextPool> = std::sync::OnceLock::new();
+
+/// Awakens a suspended fiber by pushing it onto the DTA-V3 Scheduler mesh.
+#[inline(always)]
+pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
+    if let Some(scheduler) = GLOBAL_SCHEDULER.get() {
+        // Submit the fiber back to the mesh. 
+        // We use fiber_index as a flow_id for deterministic Double-Hashing load distribution.
+        scheduler.enqueue_task(origin_core, fiber_index as u64, fiber_index);
+    } else {
+        panic!("dtact::wake_fiber() invoked before Runtime Initialization");
+    }
+}

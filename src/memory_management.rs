@@ -106,7 +106,7 @@ impl FiberContext {
             closure_ptr: core::ptr::null_mut(),
             result_ptr: core::ptr::null_mut(),
             reader_ptr: core::ptr::null_mut(),
-            buf_ptr: core::ptr::null_mut(),
+            buf_ptr: core::ptr::slice_from_raw_parts_mut(core::ptr::null_mut(), 0),
             read_buffer_ptr: core::ptr::null_mut(),
         }
     }
@@ -131,7 +131,7 @@ unsafe impl Send for ContextPool {}
 unsafe impl Sync for ContextPool {}
 
 impl ContextPool {
-    pub fn new(capacity: usize, stack_size: usize, safety: SafetyLevel, num_numa_nodes: usize) -> Result<Self, crate::error::DecodeError> {
+    pub fn new(capacity: usize, stack_size: usize, safety: SafetyLevel, num_numa_nodes: usize) -> Result<Self, crate::errors::DtactError> {
         let page_size = page_size();
         let align = 64; 
 
@@ -195,7 +195,7 @@ impl ContextPool {
         }
     }
 
-    unsafe fn allocate_arena(size: usize, safety: SafetyLevel) -> Result<*mut u8, crate::error::DecodeError> {
+    unsafe fn allocate_arena(size: usize, safety: SafetyLevel) -> Result<*mut u8, crate::errors::DtactError> {
         #[cfg(unix)]
         {
             let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
@@ -210,7 +210,7 @@ impl ContextPool {
                 ptr = unsafe { libc::mmap(core::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
             }
             if ptr == libc::MAP_FAILED {
-                return crate::error::cold_decode_error_other("ContextPool mmap failed");
+                return crate::errors::cold_dtact_error_mmap_failed();
             }
             Ok(ptr as *mut u8)
         }
@@ -223,12 +223,12 @@ impl ContextPool {
             if ptr.is_null() && safety == SafetyLevel::Safety0 {
                 ptr = winapi_shim::VirtualAlloc(core::ptr::null_mut(), size, winapi_shim::MEM_COMMIT | winapi_shim::MEM_RESERVE, winapi_shim::PAGE_READWRITE);
             }
-            if ptr.is_null() { return crate::error::cold_decode_error_other("ContextPool VirtualAlloc failed"); }
+            if ptr.is_null() { return crate::errors::cold_dtact_error_virtual_alloc_failed(); }
             Ok(ptr as *mut u8)
         }
     }
 
-    unsafe fn apply_numa_mbind(base: *mut u8, capacity: usize, slot_size: usize, num_numa_nodes: usize) -> Result<(), crate::error::DecodeError> {
+    unsafe fn apply_numa_mbind(base: *mut u8, capacity: usize, slot_size: usize, num_numa_nodes: usize) -> Result<(), crate::errors::DtactError> {
         #[cfg(target_os = "linux")]
         {
             if num_numa_nodes > 1 {
@@ -256,7 +256,7 @@ impl ContextPool {
         Ok(())
     }
 
-    unsafe fn apply_guards(base: *mut u8, capacity: usize, slot_size: usize, page_size: usize, safety: SafetyLevel) -> Result<(), crate::error::DecodeError> {
+    unsafe fn apply_guards(base: *mut u8, capacity: usize, slot_size: usize, page_size: usize, safety: SafetyLevel) -> Result<(), crate::errors::DtactError> {
         if safety == SafetyLevel::Safety0 { return Ok(()); }
         for i in 0..capacity {
             if safety == SafetyLevel::Safety1 && (i % 32) != 31 { continue; }
@@ -265,14 +265,14 @@ impl ContextPool {
             #[cfg(unix)]
             {
                 if unsafe { libc::mprotect(guard_ptr as *mut libc::c_void, page_size, libc::PROT_NONE) } != 0 {
-                    return crate::error::cold_decode_error_other("mprotect failed");
+                    return crate::errors::cold_dtact_error_mprotect_failed();
                 }
             }
             #[cfg(windows)]
             {
                 let mut old_protect = 0;
                 if winapi_shim::VirtualProtect(guard_ptr as *mut core::ffi::c_void, page_size, winapi_shim::PAGE_NOACCESS, &mut old_protect) == 0 {
-                    return crate::error::cold_decode_error_other("VirtualProtect failed");
+                    return crate::errors::cold_dtact_error_virtual_protect_failed();
                 }
             }
         }
