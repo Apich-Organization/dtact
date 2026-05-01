@@ -1,5 +1,4 @@
 #![allow(unsafe_code)]
-#![allow(clippy::vec_box)]
 #![allow(non_snake_case)]
 
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
