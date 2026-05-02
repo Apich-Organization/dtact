@@ -586,20 +586,18 @@ impl DtaScheduler {
                     {
                         unsafe {
                             let tail_ptr = &worker.local_tail as *const _ as *mut core::ffi::c_void;
+                            let control = 1u32; // C0.1 (Fast wakeup)
                             core::arch::asm!(
                                 "umonitor {0}",
                                 "test {1}, {1}", 
                                 "jnz 2f",
-                                "mov eax, 1",    
-                                "xor edx, edx",  
-                                "mov ebx, 0xFFFFFFFF", 
-                                "umwait eax",
+                                "umwait {2}",
                                 "2:",
                                 in(reg) tail_ptr,
                                 in(reg) worker.local_queue_len(),
-                                out("eax") _,
-                                out("edx") _,
-                                out("ebx") _,
+                                in(reg) control,
+                                inout("eax") 0xFFFFFFFFu32 => _,
+                                inout("edx") 0xFFFFFFFFu32 => _,
                                 options(nostack, preserves_flags)
                             );
                         }
