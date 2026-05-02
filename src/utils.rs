@@ -61,9 +61,7 @@ pub fn get_cpu_fast() -> u32 {
     }
     #[cfg(all(not(target_arch = "x86_64"), target_os = "linux"))]
     unsafe {
-        let mut cpu: u32 = 0;
-        libc::getcpu(&raw mut cpu, core::ptr::null_mut());
-        cpu
+        libc::sched_getcpu() as u32
     }
     #[cfg(not(any(target_arch = "x86_64", target_os = "linux")))]
     {
