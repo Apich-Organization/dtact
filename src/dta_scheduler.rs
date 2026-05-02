@@ -50,9 +50,9 @@ impl Default for TaskChunk {
 /// (where supported by the OS) to maximize memory throughput.
 pub struct HugeBuffer<T> {
     /// Pointer to the allocated memory.
-    pub ptr: *mut T,
-    /// Total size of the buffer in bytes.
-    pub size_bytes: usize,
+    ptr: *mut T,
+    size_bytes: usize,
+    is_mmap: bool,
 }
 
 unsafe impl<T> Send for HugeBuffer<T> {}
@@ -69,7 +69,7 @@ impl<T> HugeBuffer<T> {
     /// Allocates a new `HugeBuffer` using OS-specific huge page primitives.
     ///
     /// # Panics
-    /// Panics if the OS fails to allocate memory (even after fallback to 4KB pages).
+    /// Panics if the OS fails to allocate memory.
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -78,7 +78,7 @@ impl<T> HugeBuffer<T> {
         #[cfg(unix)]
         unsafe {
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | 0x40000; // MAP_HUGETLB
-            let mut ptr = libc::mmap(
+            let ptr = libc::mmap(
                 core::ptr::null_mut(),
                 size_bytes,
                 libc::PROT_READ | libc::PROT_WRITE,
@@ -87,21 +87,22 @@ impl<T> HugeBuffer<T> {
                 0,
             );
             if ptr == libc::MAP_FAILED {
-                // Fallback to 4KB pages
-                ptr = libc::mmap(
-                    core::ptr::null_mut(),
+                // Fallback to aligned std::alloc to prevent mmap exhaustion on QEMU/aarch64
+                let layout = std::alloc::Layout::from_size_align(size_bytes, 64).unwrap();
+                let alloc_ptr = std::alloc::alloc_zeroed(layout);
+                assert!(!alloc_ptr.is_null(), "HugeBuffer std::alloc failed");
+                Self {
+                    ptr: alloc_ptr.cast::<T>(),
                     size_bytes,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                );
-                assert!(ptr != libc::MAP_FAILED, "HugeBuffer mmap failed");
-            }
-            core::ptr::write_bytes(ptr, 0, size_bytes);
-            Self {
-                ptr: ptr.cast::<T>(),
-                size_bytes,
+                    is_mmap: false,
+                }
+            } else {
+                core::ptr::write_bytes(ptr, 0, size_bytes);
+                Self {
+                    ptr: ptr.cast::<T>(),
+                    size_bytes,
+                    is_mmap: true,
+                }
             }
         }
 
@@ -128,6 +129,7 @@ impl<T> HugeBuffer<T> {
                 Self {
                     ptr: ptr as *mut T,
                     size_bytes,
+                    is_mmap: false,
                 }
             }
             #[cfg(not(feature = "windows-root"))]
@@ -142,6 +144,7 @@ impl<T> HugeBuffer<T> {
                 Self {
                     ptr: ptr as *mut T,
                     size_bytes,
+                    is_mmap: false,
                 }
             }
         }
@@ -153,7 +156,12 @@ impl<T> Drop for HugeBuffer<T> {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
-            libc::munmap(self.ptr.cast::<libc::c_void>(), self.size_bytes);
+            if self.is_mmap {
+                libc::munmap(self.ptr.cast::<libc::c_void>(), self.size_bytes);
+            } else {
+                let layout = std::alloc::Layout::from_size_align(self.size_bytes, 64).unwrap();
+                std::alloc::dealloc(self.ptr.cast::<u8>(), layout);
+            }
         }
         #[cfg(windows)]
         unsafe {

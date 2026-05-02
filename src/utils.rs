@@ -38,6 +38,7 @@ pub fn rdtsc() -> u64 {
 /// non-serializing hardware instruction (e.g. RDPID on `x86_64`).
 #[inline(always)]
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn get_cpu_fast() -> u32 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
