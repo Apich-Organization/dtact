@@ -12,6 +12,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prefetcht0 [rsi]", // Prefetch restore context
+        "mov rax, [rsi]",   // Get target stack top
+        "prefetcht0 [rax]", // Prefetch target stack
         "mov [rdi + 0], rsp",
         "mov [rdi + 8], rbp",
         "mov [rdi + 16], rbx",
@@ -42,6 +45,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prefetcht0 [rdx]", // Prefetch restore context (rdx is restore on Windows)
+        "mov rax, [rdx]",
+        "prefetcht0 [rax]",
         "mov [rcx + 0], rsp",
         "mov [rcx + 8], rbp",
         "mov [rcx + 16], rbx",
@@ -92,6 +98,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prfm pldl1keep, [x1]", // Prefetch restore context
+        "ldr x9, [x1, 96]",     // Get target SP
+        "prfm pldl1keep, [x9]", // Prefetch target stack
         "stp x19, x20, [x0, 0]",
         "stp x21, x22, [x0, 16]",
         "stp x23, x24, [x0, 32]",
@@ -127,6 +136,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prfm pldl1keep, [x1]", 
+        "ldr x9, [x1, 96]",
+        "prfm pldl1keep, [x9]",
         "stp x19, x20, [x0, 0]",
         "stp x21, x22, [x0, 16]",
         "stp x23, x24, [x0, 32]",
@@ -167,7 +179,73 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     );
 }
 
-#[cfg(all(target_arch = "riscv64", unix))]
+#[cfg(all(target_arch = "riscv64", unix, feature = "hw-acceleration"))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context_cross_thread_float(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "prefetch.r 0(a1)", // Prefetch restore context
+        "ld a2, 0(a1)",     // Get target SP
+        "prefetch.r 0(a2)", // Prefetch target stack
+        "sd sp, 0(a0)",
+        "sd s0, 8(a0)",
+        "sd s1, 16(a0)",
+        "sd s2, 24(a0)",
+        "sd s3, 32(a0)",
+        "sd s4, 40(a0)",
+        "sd s5, 48(a0)",
+        "sd s6, 56(a0)",
+        "sd s7, 64(a0)",
+        "sd s8, 72(a0)",
+        "sd s9, 80(a0)",
+        "sd s10, 88(a0)",
+        "sd s11, 96(a0)",
+        "sd ra, 104(a0)",
+        "fsd fs0, 128(a0)",
+        "fsd fs1, 136(a0)",
+        "fsd fs2, 144(a0)",
+        "fsd fs3, 152(a0)",
+        "fsd fs4, 160(a0)",
+        "fsd fs5, 168(a0)",
+        "fsd fs6, 176(a0)",
+        "fsd fs7, 184(a0)",
+        "fsd fs8, 192(a0)",
+        "fsd fs9, 200(a0)",
+        "fsd fs10, 208(a0)",
+        "fsd fs11, 216(a0)",
+        "ld sp, 0(a1)",
+        "ld s0, 8(a1)",
+        "ld s1, 16(a1)",
+        "ld s2, 24(a1)",
+        "ld s3, 32(a1)",
+        "ld s4, 40(a1)",
+        "ld s5, 48(a1)",
+        "ld s6, 56(a1)",
+        "ld s7, 64(a1)",
+        "ld s8, 72(a1)",
+        "ld s9, 80(a1)",
+        "ld s10, 88(a1)",
+        "ld s11, 96(a1)",
+        "ld ra, 104(a1)",
+        "fld fs0, 128(a1)",
+        "fld fs1, 136(a1)",
+        "fld fs2, 144(a1)",
+        "fld fs3, 152(a1)",
+        "fld fs4, 160(a1)",
+        "fld fs5, 168(a1)",
+        "fld fs6, 176(a1)",
+        "fld fs7, 184(a1)",
+        "fld fs8, 192(a1)",
+        "fld fs9, 200(a1)",
+        "fld fs10, 208(a1)",
+        "fld fs11, 216(a1)",
+        "ret"
+    );
+}
+
+#[cfg(all(target_arch = "riscv64", unix, not(feature = "hw-acceleration")))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_cross_thread_float(
     save: *mut Registers,
@@ -627,6 +705,9 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prefetcht0 [rsi]", 
+        "mov rax, [rsi]",
+        "prefetcht0 [rax]",
         "mov [rdi + 0], rsp",
         "mov [rdi + 8], rbp",
         "mov [rdi + 16], rbx",
@@ -655,6 +736,9 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prefetcht0 [rdx]", 
+        "mov rax, [rdx]",
+        "prefetcht0 [rax]",
         "mov [rcx + 0], rsp",
         "mov [rcx + 8], rbp",
         "mov [rcx + 16], rbx",
@@ -687,6 +771,9 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prfm pldl1keep, [x1]", 
+        "ldr x9, [x1, 96]",
+        "prfm pldl1keep, [x9]",
         "stp x19, x20, [x0, 0]",
         "stp x21, x22, [x0, 16]",
         "stp x23, x24, [x0, 32]",
@@ -714,6 +801,9 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
+        "prfm pldl1keep, [x1]", 
+        "ldr x9, [x1, 96]",
+        "prfm pldl1keep, [x9]",
         "stp x19, x20, [x0, 0]",
         "stp x21, x22, [x0, 16]",
         "stp x23, x24, [x0, 32]",
@@ -734,7 +824,49 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     );
 }
 
-#[cfg(all(target_arch = "riscv64", unix))]
+#[cfg(all(target_arch = "riscv64", unix, feature = "hw-acceleration"))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context_same_thread_no_float(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "prefetch.r 0(a1)", // Prefetch restore context
+        "ld a2, 0(a1)",     // Get target SP
+        "prefetch.r 0(a2)", // Prefetch target stack
+        "sd sp, 0(a0)",
+        "sd s0, 8(a0)",
+        "sd s1, 16(a0)",
+        "sd s2, 24(a0)",
+        "sd s3, 32(a0)",
+        "sd s4, 40(a0)",
+        "sd s5, 48(a0)",
+        "sd s6, 56(a0)",
+        "sd s7, 64(a0)",
+        "sd s8, 72(a0)",
+        "sd s9, 80(a0)",
+        "sd s10, 88(a0)",
+        "sd s11, 96(a0)",
+        "sd ra, 104(a0)",
+        "ld sp, 0(a1)",
+        "ld s0, 8(a1)",
+        "ld s1, 16(a1)",
+        "ld s2, 24(a1)",
+        "ld s3, 32(a1)",
+        "ld s4, 40(a1)",
+        "ld s5, 48(a1)",
+        "ld s6, 56(a1)",
+        "ld s7, 64(a1)",
+        "ld s8, 72(a1)",
+        "ld s9, 80(a1)",
+        "ld s10, 88(a1)",
+        "ld s11, 96(a1)",
+        "ld ra, 104(a1)",
+        "ret"
+    );
+}
+
+#[cfg(all(target_arch = "riscv64", unix, not(feature = "hw-acceleration")))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_same_thread_no_float(
     save: *mut Registers,
