@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::cell::UnsafeCell;
+use core::cell::UnsafeCell;
 #[allow(unused_imports)]
 use core::arch::asm;
 
