@@ -40,7 +40,7 @@ jobs:
       - name: Install strace
         run: sudo apt-get install -y strace
       - name: cargo test
-        run: strace -e mprotect cargo test --all-features
+        run: strace -e mprotect cargo test
 
   lints:
     name: Lints
