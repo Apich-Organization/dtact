@@ -477,6 +477,19 @@ impl Worker {
             }
 
             crate::future_bridge::CURRENT_FIBER.with(|c| c.set(core::ptr::null_mut()));
+
+            // Lifecycle Management: If the fiber terminated, return it to the pool.
+            // We do this here, on the scheduler's stack, to avoid use-after-free
+            // races where a fiber context is reused while the previous fiber
+            // is still executing its final instructions.
+            let state = unsafe {
+                (*target_ptr)
+                    .state
+                    .load(core::sync::atomic::Ordering::Acquire)
+            };
+            if state == crate::memory_management::FiberStatus::Finished as u8 {
+                pool.free_context(task);
+            }
         }
     }
 }

@@ -179,7 +179,77 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             .get()
             .expect("Dtact Runtime not initialized");
         let pool = &runtime.pool;
-        let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
+        let mut fixed_spins: u32 = 0;
+
+        let ctx_id = loop {
+            if let Some(id) = pool.alloc_context() {
+                // If we are in a fiber, reward the success
+                let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
+                if !ctx_ptr.is_null() {
+                    unsafe {
+                        let ctx = &mut *ctx_ptr;
+                        ctx.adaptive_spin_count = (ctx.adaptive_spin_count + 1).min(2000);
+                        ctx.spin_failure_count = ctx.spin_failure_count.saturating_sub(1);
+                    }
+                }
+                break id;
+            }
+
+            let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
+            if !ctx_ptr.is_null() {
+                // FIBER-AWARE ADAPTIVE SPINNING
+                unsafe {
+                    let ctx = &mut *ctx_ptr;
+                    let current_spin = ctx.adaptive_spin_count;
+                    let failure_count = ctx.spin_failure_count;
+
+                    // Only spin if failure count is low
+                    if failure_count < 20 {
+                        for i in 0..current_spin {
+                            core::hint::spin_loop();
+
+                            // Sparse Polling: only check the pool every 8 iterations to reduce L1 pressure
+                            if i.trailing_zeros() >= 3 {
+                                if let Some(id) = pool.alloc_context() {
+                                    ctx.adaptive_spin_count = (current_spin + 2).min(2000);
+                                    ctx.spin_failure_count = failure_count.saturating_sub(1);
+                                    return dtact_handle_t(
+                                        u64::from(id)
+                                            | ((topology::current().core_id as u64) << 32),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Spin failed: Penalize budget and yield
+                    ctx.spin_failure_count = failure_count.saturating_add(1);
+                    ctx.adaptive_spin_count = current_spin.saturating_sub(100).max(200);
+
+                    ctx.state.store(
+                        crate::memory_management::FiberStatus::Yielded as u8,
+                        core::sync::atomic::Ordering::Release,
+                    );
+                    (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
+                }
+            } else {
+                // HOST-THREAD SPINNING
+                if fixed_spins < 2000 {
+                    core::hint::spin_loop();
+                    fixed_spins += 1;
+
+                    // Sparse Polling for host threads too
+                    if fixed_spins.trailing_zeros() >= 3 {
+                        if let Some(id) = pool.alloc_context() {
+                            break id;
+                        }
+                    }
+                } else {
+                    std::thread::yield_now();
+                    fixed_spins = 0; // Reset after yield
+                }
+            }
+        };
 
         let ctx_ptr = pool.get_context_ptr(ctx_id);
         #[allow(clippy::cast_possible_truncation)]
@@ -309,11 +379,11 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         unsafe { invoke(arg) };
     }));
 
-    // Return context to pool (marks as Initial, wakes futex waiters, returns to free list)
-    let ctx_id = ctx.fiber_index;
-    if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
-        runtime.pool.free_context(ctx_id);
-    }
+    // Mark as finished. The scheduler will return this context to the pool.
+    ctx.state.store(
+        crate::memory_management::FiberStatus::Finished as u8,
+        core::sync::atomic::Ordering::Release,
+    );
 
     // Wake up any fiber waiting for this one (FFI join)
     let waiter = ctx
@@ -333,6 +403,10 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
     unsafe {
         (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
     }
+
+    // We should NEVER reach here because the context was swapped back to the scheduler.
+    // If we do, it means the scheduler incorrectly resumed a finished fiber.
+    crate::c_ffi::dtact_abort();
 }
 
 /// Global epoch counter for hardware topology changes.
@@ -587,8 +661,6 @@ pub mod fiber {
         dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
     }
 
-    /// Yields execution directly to another fiber.
-    /// Note: This is a hint to the scheduler.
     #[inline(always)]
     pub fn yield_to(handle: dtact_handle_t) {
         let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);

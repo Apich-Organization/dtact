@@ -21,6 +21,7 @@ windows-sys = { version = "0.61", features = [
 loom = "0.7"
 proptest = "1.6"
 criterion = { version = "0.8", features = ["async_tokio"] }
+tokio = { version = "1", features = ["full"] }
 
 [profile.bench]
 codegen-units = 1
@@ -62,3 +63,7 @@ crate-type = ["cdylib", "rlib", "staticlib"]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 dtact-macros = { path = "dtact-macros" }
+
+[[bench]]
+name = "scheduler_efficiency"
+harness = false

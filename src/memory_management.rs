@@ -349,20 +349,37 @@ impl ContextPool {
         unsafe {
             #[cfg(unix)]
             {
-                let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+                let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+                let mut ptr = libc::MAP_FAILED;
+
+                // Try with HugeTLB if Safety0 is requested
                 if safety == SafetyLevel::Safety0 {
-                    flags |= 0x40000;
-                } // MAP_HUGETLB
-                let ptr = unsafe {
-                    libc::mmap(
-                        core::ptr::null_mut(),
-                        size,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        flags,
-                        -1,
-                        0,
-                    )
-                };
+                    ptr = unsafe {
+                        libc::mmap(
+                            core::ptr::null_mut(),
+                            size,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            flags | 0x40000, // MAP_HUGETLB
+                            -1,
+                            0,
+                        )
+                    };
+                }
+
+                // Fallback to standard pages if HugeTLB failed or wasn't requested
+                if ptr == libc::MAP_FAILED {
+                    ptr = unsafe {
+                        libc::mmap(
+                            core::ptr::null_mut(),
+                            size,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            flags,
+                            -1,
+                            0,
+                        )
+                    };
+                }
+
                 if ptr == libc::MAP_FAILED {
                     return Err("mmap failed");
                 }
