@@ -42,6 +42,7 @@ pub struct HugeBuffer<T> {
 }
 
 impl<T> HugeBuffer<T> {
+    #[inline]
     pub fn new() -> Self {
         let size_bytes = core::mem::size_of::<T>();
         
@@ -110,6 +111,7 @@ impl<T> HugeBuffer<T> {
 }
 
 impl<T> Drop for HugeBuffer<T> {
+    #[inline(always)]
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
@@ -142,6 +144,7 @@ unsafe impl Sync for Mailbox {}
 unsafe impl Send for Mailbox {}
 
 impl Mailbox {
+    #[inline(always)]
     pub fn new() -> Self {
         Self {
             head: AtomicUsize::new(0),
@@ -245,6 +248,7 @@ unsafe impl Sync for Worker {}
 unsafe impl Send for Worker {}
 
 impl Worker {
+    #[inline(always)]
     pub fn new(cpu: CpuLevel, total_cores: usize) -> Self {
         let mut polling_order = Vec::with_capacity(total_cores - 1);
         let my_core = cpu.core_id as usize;
@@ -347,6 +351,7 @@ impl Worker {
     
     /// Dispatch Loop
     /// Executed by the worker thread until the local queue is empty.
+    #[inline(always)]
     pub fn dispatch_loop(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         while self.local_head != self.local_tail {
             let task = (unsafe { *self.local_queue.ptr })[self.local_head];
@@ -373,6 +378,9 @@ impl Worker {
                 core::arch::asm!("prefetch.r 0({0})", in(reg) target_ptr, options(nostack, preserves_flags));
             }
 
+            // Maintain Thread-Local Context for .wait() bridge
+            crate::future_bridge::CURRENT_FIBER.with(|c| c.set(target_ptr));
+
             // Safe Context Switch: Call the dynamic switcher defined in `FiberContext`.
             // This allows per-task configuration of float-saving and thread-affinity logic.
             unsafe {
@@ -381,6 +389,9 @@ impl Worker {
                     &(*target_ptr).regs,
                 );
             }
+
+            // Clear context after fiber yields or terminates
+            crate::future_bridge::CURRENT_FIBER.with(|c| c.set(core::ptr::null_mut()));
         }
     }
 }
@@ -396,6 +407,7 @@ unsafe impl Sync for DtaScheduler {}
 unsafe impl Send for DtaScheduler {}
 
 impl DtaScheduler {
+    #[inline(always)]
     pub fn new(num_workers: usize, topology: TopologyMode) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
         let mut mailboxes = Vec::with_capacity(num_workers);
@@ -511,6 +523,7 @@ impl DtaScheduler {
 
     /// The Main Scheduler Heartbeat Loop
     /// Executes the dispatch assembly and seamlessly manages the mailbox topology when exhausted.
+    #[inline]
     pub fn run_worker(&self, current_core: usize, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         loop {
             // 1. Drain the local SPSC queue natively

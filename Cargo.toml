@@ -41,6 +41,7 @@ debug = true
 [features]
 default = []
 hw-acceleration = []
+hypervisor = []
 windows-root = []
 
 [lib]

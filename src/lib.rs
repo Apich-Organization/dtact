@@ -68,19 +68,25 @@ pub mod api;
 
 pub use api::*;
 
-/// Global Singleton for the Runtime Scheduler
-pub(crate) static GLOBAL_SCHEDULER: std::sync::OnceLock<dta_scheduler::DtaScheduler> = std::sync::OnceLock::new();
+/// DTA-V3 Runtime Environment
+pub struct Runtime {
+    pub(crate) scheduler: dta_scheduler::DtaScheduler,
+    pub(crate) pool: memory_management::ContextPool,
+}
 
-/// Global Singleton for the Lock-Free Arena Context Pool
-pub(crate) static GLOBAL_CONTEXT_POOL: std::sync::OnceLock<memory_management::ContextPool> = std::sync::OnceLock::new();
+/// Global Singleton for the Runtime Environment
+pub(crate) static GLOBAL_RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+
+/// Telemetry: Tracks fibers that failed the 8KB zero-copy check and fell back to heap allocation.
+pub static HEAP_ESCAPED_SPAWNS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Awakens a suspended fiber by pushing it onto the DTA-V3 Scheduler mesh.
 #[inline(always)]
 pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
-    if let Some(scheduler) = GLOBAL_SCHEDULER.get() {
+    if let Some(runtime) = GLOBAL_RUNTIME.get() {
         // Submit the fiber back to the mesh. 
         // We use fiber_index as a flow_id for deterministic Double-Hashing load distribution.
-        scheduler.enqueue_task(origin_core, fiber_index as u64, fiber_index);
+        runtime.scheduler.enqueue_task(origin_core, fiber_index as u64, fiber_index);
     } else {
         panic!("dtact::wake_fiber() invoked before Runtime Initialization");
     }

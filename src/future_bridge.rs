@@ -16,14 +16,17 @@ static DTACT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     drop_waker,
 );
 
+#[inline(always)]
 unsafe fn clone_waker(data: *const ()) -> RawWaker {
     RawWaker::new(data, &DTACT_WAKER_VTABLE)
 }
 
+#[inline(always)]
 unsafe fn wake_impl(data: *const ()) {
     unsafe { wake_by_ref_impl(data) }
 }
 
+#[inline(always)]
 unsafe fn wake_by_ref_impl(data: *const ()) {
     let ctx = unsafe { &*(data as *const FiberContext) };
 
@@ -36,6 +39,7 @@ unsafe fn wake_by_ref_impl(data: *const ()) {
     crate::wake_fiber(ctx.origin_core as usize, ctx.fiber_index);
 }
 
+#[inline(always)]
 unsafe fn drop_waker(_data: *const ()) {
     // No-op. The FiberContext is persistently managed by the lock-free ContextPool.
 }
@@ -70,6 +74,16 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
 
     let ctx = unsafe { &mut *ctx_ptr };
     
+    // 3. Thread Migration Guard
+    // Since we pin the future to the fiber's stack, we MUST ensure the OS hasn't 
+    // moved us to a different thread/core, which would invalidate the stack address.
+    let tid = crate::utils::get_thread_id();
+    if ctx.last_os_thread_id == 0 {
+        ctx.last_os_thread_id = tid;
+    } else if ctx.last_os_thread_id != tid {
+        panic!("DTA-V3 Critical: Illegal OS Thread Migration detected for Fiber {}. Stack-pinned invariants violated.", ctx.fiber_index);
+    }
+    
     // Construct the Lock-Free, Zero-Cost Waker
     let raw_waker = RawWaker::new(ctx_ptr as *const (), &DTACT_WAKER_VTABLE);
     let waker = unsafe { Waker::from_raw(raw_waker) };
@@ -80,17 +94,47 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
 
     loop {
         match fut_pinned.as_mut().poll(&mut cx) {
-            Poll::Ready(output) => return output,
+            Poll::Ready(output) => {
+                // Adaptive Reward: Dampened
+                // We increment conservatively to prevent "spinning too much" on a fluke.
+                ctx.adaptive_spin_count = (ctx.adaptive_spin_count + 1).min(200);
+                // Slowly decay the failure count to preserve "memory" of recent contention.
+                ctx.spin_failure_count = ctx.spin_failure_count.saturating_sub(1);
+                return output;
+            },
             Poll::Pending => {
+                // 4. Adaptive Short-Circuit Check with Sparse Polling & Cool-Down
+                let current_spin = ctx.adaptive_spin_count;
+                let failure_count = ctx.spin_failure_count;
+
+                // Cooldown: If we've failed 10+ times, yield immediately to avoid L1 thrashing.
+                if failure_count < 10 {
+                    for i in 0..current_spin {
+                        core::hint::spin_loop();
+                        
+                        // Sparse Polling: Only poll every 8 hints to reduce L1 pressure and 
+                        // memory bus traffic (cache coherency storm prevention).
+                        if i & 7 == 0 {
+                            if let Poll::Ready(output) = fut_pinned.as_mut().poll(&mut cx) {
+                                // Task resolved! Reward slightly.
+                                ctx.adaptive_spin_count = (current_spin + 2).min(200);
+                                ctx.spin_failure_count = failure_count.saturating_sub(1);
+                                return output;
+                            }
+                        }
+                    }
+                }
+
+                // Spin failed. Increment failure count and decrease budget.
+                ctx.spin_failure_count = failure_count.saturating_add(1);
+                ctx.adaptive_spin_count = current_spin.saturating_sub(5).max(5);
+
                 // Future is waiting on I/O or an external event.
                 // Yield the physical CPU core to the next fiber in the mailbox.
                 ctx.state.store(FiberStatus::Yielded as u8, Ordering::Release);
                 
                 // Jump out to `dispatch_loop_asm`
                 unsafe { dtact_asm_fiber_suspend(ctx_ptr) };
-                
-                // The fiber has been resumed! The Wake impl fired and the Scheduler popped us.
-                // Loop around and rapidly poll the future again.
             }
         }
     }

@@ -1,67 +1,179 @@
-extern crate proc_macro;
-
 use proc_macro::TokenStream;
+use quote::quote;
+use syn::{parse_macro_input, ItemFn, Meta, Lit, parse::Parse, parse::ParseStream, Token, punctuated::Punctuated, FnArg};
 
-/// Dtact V3 Entry Point Macro
-/// Initializes the DTA-V3 scheduling grid at the start of the application.
-/// It dynamically binds the `GLOBAL_SCHEDULER` and `GLOBAL_CONTEXT_POOL` before user logic executes.
-#[proc_macro_attribute]
-pub fn main(_args: TokenStream, item: TokenStream) -> TokenStream {
-    let item_str = item.to_string();
-    let mut out = String::new();
-    
-    // Simple block injection leveraging virtue's zero-dependency philosophy.
-    // We locate the opening brace of the main function and inject the initialization.
-    if let Some(pos) = item_str.find('{') {
-        out.push_str(&item_str[..=pos]);
-        out.push_str(r#"
-            // [DTA-V3 Injected Runtime Initialization]
-            dtact::GLOBAL_SCHEDULER.get_or_init(|| {
-                dtact::dta_scheduler::DtaScheduler::new(
-                    128, // Max logical cores supported by P2P Mesh
-                    dtact::dta_scheduler::TopologyMode::P2PMesh
-                )
-            });
-            
-            dtact::GLOBAL_CONTEXT_POOL.get_or_init(|| {
-                dtact::memory_management::ContextPool::new(
-                    16384, // 16k Maximum active fibers
-                    2 * 1024 * 1024, // 2MB Native Stack per fiber
-                    dtact::memory_management::SafetyLevel::Safety0, 
-                    4 // NUMA node domains
-                ).expect("DTA-V3 Hardware Initialization Failed: OOM or MAP_HUGETLB rejected")
-            });
-        "#);
-        out.push_str(&item_str[pos + 1..]);
-    } else {
-        out.push_str(&item_str);
+struct TaskArgs {
+    priority: String,
+    affinity: String,
+    kind: String,
+    stack: String,
+}
+
+impl Parse for TaskArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let vars = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
+        let mut priority = "Normal".to_string();
+        let mut affinity = "SameCore".to_string();
+        let mut kind = "Compute".to_string();
+        let mut stack = "2M".to_string();
+
+        for var in vars {
+            if let Meta::NameValue(nv) = var {
+                if nv.path.is_ident("priority") {
+                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                        priority = s.value();
+                    }
+                } else if nv.path.is_ident("affinity") {
+                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                        affinity = s.value();
+                    }
+                } else if nv.path.is_ident("kind") {
+                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                        kind = s.value();
+                    }
+                } else if nv.path.is_ident("stack") {
+                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                        stack = s.value();
+                    }
+                }
+            }
+        }
+
+        Ok(TaskArgs { priority, affinity, kind, stack })
     }
-
-    out.parse().expect("Dtact Macro Generation Failed")
 }
 
-/// Task Trait Tagging Macro
-/// Configures metadata such as hardware affinity, execution priority, and compute/io kind.
 #[proc_macro_attribute]
-pub fn task(_args: TokenStream, item: TokenStream) -> TokenStream {
-    // In a full implementation, we would extract the function name and inject a static 
-    // registration block into the `.init_array` section.
-    item
+pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as TaskArgs);
+    let input = parse_macro_input!(item as ItemFn);
+    
+    let fn_name = &input.sig.ident;
+    let priority = &args.priority;
+    let affinity = &args.affinity;
+    let kind = &args.kind;
+    let stack = &args.stack;
+    
+    let metadata_mod = syn::Ident::new(&format!("dtact_metadata_{}", fn_name), fn_name.span());
+    let priority_ident = syn::Ident::new(priority, fn_name.span());
+    let affinity_ident = syn::Ident::new(affinity, fn_name.span());
+    let kind_ident = syn::Ident::new(kind, fn_name.span());
+
+    let expanded = quote! {
+        #input
+        
+        pub mod #metadata_mod {
+            pub const PRIORITY: dtact::Priority = dtact::Priority::#priority_ident;
+            pub const AFFINITY: dtact::topology::Affinity = dtact::topology::Affinity::#affinity_ident;
+            pub const KIND: dtact::WorkloadKind = dtact::WorkloadKind::#kind_ident;
+            pub const STACK_SIZE: &'static str = #stack;
+        }
+    };
+
+    TokenStream::from(expanded)
 }
 
-/// Cross-Language Async Export Macro
-/// Automatically generates the C-compatible `dtact_handle_t` FFI boundary.
-/// This translates a Rust stackless `Future` into a C-awaitable handle.
 #[proc_macro_attribute]
 pub fn export_async(_args: TokenStream, item: TokenStream) -> TokenStream {
-    // The `virtue` logic would traverse the fn signature and generate the `extern "C"` wrapper here.
-    item
+    let input = parse_macro_input!(item as ItemFn);
+    let fn_name = &input.sig.ident;
+    let wrapper_name = syn::Ident::new(&format!("dtact_export_{}", fn_name), fn_name.span());
+    
+    let mut c_params = Vec::new();
+    let mut call_args = Vec::new();
+    
+    for input in &input.sig.inputs {
+        if let FnArg::Typed(pat_type) = input {
+            let pat = &pat_type.pat;
+            let ty = &pat_type.ty;
+            c_params.push(quote! { #pat: #ty });
+            call_args.push(quote! { #pat });
+        } else {
+            panic!("export_async does not support 'self' parameters");
+        }
+    }
+    
+    let expanded = quote! {
+        #input
+        
+        #[unsafe(no_mangle)]
+        pub extern "C" fn #wrapper_name(#(#c_params),*) -> dtact::dtact_handle_t {
+            dtact::spawn(#fn_name(#(#call_args),*))
+        }
+    };
+    
+    TokenStream::from(expanded)
 }
 
-/// Cross-Language Fiber Export Macro
-/// Generates a stackful C-compatible coroutine interface.
 #[proc_macro_attribute]
 pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
-    // The `virtue` logic would traverse the fn signature and generate the `extern "C"` wrapper here.
-    item
+    let input = parse_macro_input!(item as ItemFn);
+    let fn_name = &input.sig.ident;
+    let wrapper_name = syn::Ident::new(&format!("dtact_export_fiber_{}", fn_name), fn_name.span());
+
+    let mut c_params = Vec::new();
+    let mut call_args = Vec::new();
+    
+    for input in &input.sig.inputs {
+        if let FnArg::Typed(pat_type) = input {
+            let pat = &pat_type.pat;
+            let ty = &pat_type.ty;
+            c_params.push(quote! { #pat: #ty });
+            call_args.push(quote! { #pat });
+        } else {
+            panic!("export_fiber does not support 'self' parameters");
+        }
+    }
+
+    let expanded = quote! {
+        #input
+        
+        #[unsafe(no_mangle)]
+        pub extern "C" fn #wrapper_name(#(#c_params),*) -> dtact::dtact_handle_t {
+            dtact::api::fiber::spawn_with_stack("2M", move || {
+                #fn_name(#(#call_args),*);
+            })
+        }
+    };
+    
+    TokenStream::from(expanded)
+}
+
+#[proc_macro_attribute]
+pub fn dtact_init(args: TokenStream, item: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(item as ItemFn);
+    let args_str = args.to_string();
+    
+    let topology = if args_str.contains("Global") { "Global" } else { "P2PMesh" };
+    let safety = if args_str.contains("Safety2") { "Safety2" } else if args_str.contains("Safety0") { "Safety0" } else { "Safety1" };
+    
+    let topology_ident = syn::Ident::new(topology, input.sig.ident.span());
+    let safety_ident = syn::Ident::new(safety, input.sig.ident.span());
+
+    let expanded = quote! {
+        #input
+        
+        const _: () = {
+            #[unsafe(no_mangle)]
+            extern "C" fn dtact_autostart() {
+                dtact::GLOBAL_RUNTIME.get_or_init(|| {
+                    let scheduler = dtact::dta_scheduler::DtaScheduler::new(
+                        128, 
+                        dtact::dta_scheduler::TopologyMode::#topology_ident
+                    );
+                    
+                    let pool = dtact::memory_management::ContextPool::new(
+                        16384, 
+                        2 * 1024 * 1024,
+                        dtact::memory_management::SafetyLevel::#safety_ident, 
+                        4 
+                    ).expect("DTA-V3 Hardware Initialization Failed");
+                    
+                    dtact::Runtime { scheduler, pool }
+                });
+            }
+        };
+    };
+
+    TokenStream::from(expanded)
 }
