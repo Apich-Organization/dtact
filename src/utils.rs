@@ -150,7 +150,6 @@ pub fn futex_wait(_addr: *const core::sync::atomic::AtomicU8, _val: u8) {
 #[inline(always)]
 pub fn futex_wake(_addr: *const core::sync::atomic::AtomicU8) {}
 
-#[inline(always)]
 std::thread_local! {
     static CACHED_TID: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }

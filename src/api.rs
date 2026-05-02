@@ -1,5 +1,4 @@
 use core::future::Future;
-use crate::memory_management::FiberContext;
 use crate::memory_management::{TopologyMode, WorkloadKind};
 
 pub use crate::c_ffi::dtact_handle_t;
@@ -184,18 +183,18 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             }
             
             // Windows ABI Compliance (Shadow Space) & Stack Alignment
-            let mut stack_top = (buffer_start as usize & !0xF) - 64;
+            let stack_top = (buffer_start as usize & !0xF) - 64;
             let stack_top_ptr = stack_top as *mut u64;
             
             // Poison return address (dtact_abort)
-            core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as u64);
+            core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
             
             let stack_top = stack_top as *mut u8;
 
             #[cfg(target_arch = "x86_64")]
             {
                 (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
-                (*ctx_ptr).regs.gprs[7] = fiber_entry_point as u64; // RIP
+                (*ctx_ptr).regs.gprs[7] = fiber_entry_point as *const () as u64; // RIP
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -312,7 +311,7 @@ pub mod topology {
     pub fn current_raw() -> CpuLevel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            let (mut x2apic_id, mut core_shift, mut package_shift): (u32, u32, u32);
+            let (x2apic_id, core_shift, package_shift): (u32, u32, u32);
             
             unsafe {
                 let (mut eax, mut _ebx, mut _ecx, mut edx): (u32, u32, u32, u32);
@@ -431,18 +430,18 @@ pub mod fiber {
             
             // Point 1: Shadow Space Separation (Stack MUST start BELOW the 8KB Future buffer)
             let buffer_start = (*ctx_ptr).read_buffer_ptr as usize;
-            let mut stack_top = (buffer_start as usize & !0xF) - 64;
+            let stack_top = (buffer_start as usize & !0xF) - 64;
             let stack_top_ptr = stack_top as *mut u64;
             
             // Point 4: "Return-to-Nowhere" Protection
-            core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as u64);
+            core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
             
             let stack_top = stack_top as *mut u8;
             
             #[cfg(target_arch = "x86_64")]
             {
                 (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
-                (*ctx_ptr).regs.gprs[7] = super::fiber_entry_point as u64; // RIP
+                (*ctx_ptr).regs.gprs[7] = super::fiber_entry_point as *const () as u64; // RIP
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -574,7 +573,7 @@ pub trait DtactWaitExt {
     /// The type of value produced by the future.
     type Output;
     /// Blocks the current fiber until the future resolves.
-    #[inline(always)]
+    
     fn wait(self) -> Self::Output;
 }
 

@@ -126,19 +126,19 @@ pub extern "C" fn dtact_fiber_launch(
         
         // 3. ABI-Compliant Stack Alignment & Poisoning
         // We leave 64 bytes for Shadow Space (Windows) and Future safety.
-        let mut stack_top = (ctx_ptr as usize & !0xF) - 64;
+        let stack_top = (ctx_ptr as usize & !0xF) - 64;
         let stack_top_ptr = stack_top as *mut u64;
         
         // Place a "poison" return address on the stack.
         // If the fiber function ever attempts to 'ret', it will jump here and abort.
-        core::ptr::write(stack_top_ptr, dtact_abort as u64);
+        core::ptr::write(stack_top_ptr, dtact_abort as *const () as u64);
         
         let stack_top = stack_top as *mut u8;
 
         #[cfg(target_arch = "x86_64")]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
-            (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as u64; // RIP
+            (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as *const () as u64; // RIP
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -193,16 +193,16 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
         };
         
         // ABI-Compliant Stack Alignment & Poisoning
-        let mut stack_top = (ctx_ptr as usize & !0xF) - 64;
+        let stack_top = (ctx_ptr as usize & !0xF) - 64;
         let stack_top_ptr = stack_top as *mut u64;
-        core::ptr::write(stack_top_ptr, dtact_abort as u64);
+        core::ptr::write(stack_top_ptr, dtact_abort as *const () as u64);
         
         let stack_top = stack_top as *mut u8;
 
         #[cfg(target_arch = "x86_64")]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
-            (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as u64; // RIP
+            (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as *const () as u64; // RIP
         }
         #[cfg(target_arch = "aarch64")]
         {

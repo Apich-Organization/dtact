@@ -62,6 +62,8 @@
 // -------------------------------------------------------------------------
 #![allow(
     unsafe_code,
+    unused_unsafe,
+    private_interfaces,
     clippy::restriction,
     clippy::inline_always,
     unused_doc_comments,
