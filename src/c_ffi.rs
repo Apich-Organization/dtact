@@ -58,8 +58,8 @@ pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
     };
 
     crate::GLOBAL_RUNTIME.get_or_init(|| {
-        let scheduler = crate::dta_scheduler::DtaScheduler::new(128, topology);
-        let pool = crate::memory_management::ContextPool::new(16384, 2 * 1024 * 1024, safety, 4)
+        let scheduler = crate::dta_scheduler::DtaScheduler::new(_workers, topology);
+        let pool = crate::memory_management::ContextPool::new(16384, 2 * 1024 * 1024, safety, 0)
             .expect("DTA-V3 FFI Initialization Failed");
         crate::Runtime {
             scheduler,
@@ -351,9 +351,9 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
         }
 
         // 1. Register the current fiber as a waiter for the target fiber
-        let current_core = crate::api::topology::current().core_id as u64;
+        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
         let current_ctx_id = unsafe { (*ctx_ptr).fiber_index as u64 };
-        let my_handle = current_ctx_id | (current_core << 32);
+        let my_handle = current_ctx_id | ((current_worker as u64) << 32);
 
         unsafe {
             (*target_ctx)
