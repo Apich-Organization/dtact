@@ -309,28 +309,38 @@ impl Worker {
     }
     
     /// Pure ASM Dispatch Loop to completely bypass compiler stack ABI
-    /// Executed by the worker thread infinitely.
-    #[cfg(target_arch = "x86_64")]
-    pub unsafe fn dispatch_loop_asm(&mut self, context_base: *mut u8, context_size: usize) -> ! {
-        loop {
-            if self.local_head != self.local_tail {
-                let task = (unsafe { *self.local_queue.ptr })[self.local_head];
-                self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
-                
-                let target_ptr = unsafe {
-                    context_base.add((task as usize) * context_size)
-                };
-                
-                // Hardware Prefetch: Bring FiberContext to L1 using T0 hint immediately
-                unsafe {
-                    core::arch::x86_64::_mm_prefetch::<0>(target_ptr as *const i8);
-                }
-                
-                // Inline Assembly Fast-Path Context Switch (Minimal Registers)
-                // rcx holds target_ptr (FiberContext pointer)
-                // rdi holds scheduler state pointer
-                asm!(
-                    // 1. Save critical caller-saved state (FPU/AVX skipped)
+    /// Executed by the worker thread until the local queue is empty.
+    pub unsafe fn dispatch_loop_asm(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
+        while self.local_head != self.local_tail {
+            let task = (unsafe { *self.local_queue.ptr })[self.local_head];
+            self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
+            
+            // O(1) alignment calculation with Safety1 GroupGuard spacing natively supported
+            let group_offset = (task as usize >> 5) * group_guard_size;
+            let target_ptr = unsafe {
+                context_base.add((task as usize) * context_size + group_offset)
+            };
+            
+            // Hardware Prefetch: Bring FiberContext to L1 using T0 hint immediately
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::x86_64::_mm_prefetch::<0>(target_ptr as *const i8);
+            }
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) target_ptr, options(nostack, preserves_flags));
+            }
+            #[cfg(all(target_arch = "riscv64", feature = "hw-acceleration"))]
+            unsafe {
+                // RISC-V Zicbop extension: prefetch for read into L1 cache
+                core::arch::asm!("prefetch.r 0({0})", in(reg) target_ptr, options(nostack, preserves_flags));
+            }
+
+            // Inline Assembly Fast-Path Context Switch (Minimal Registers)
+            #[cfg(all(target_arch = "x86_64", unix))]
+            unsafe {
+                core::arch::asm!(
+                    // SysV ABI: Save critical caller-saved state (FPU/AVX skipped)
                     "push rbp",
                     "push rbx",
                     "push r12",
@@ -338,12 +348,11 @@ impl Worker {
                     "push r14",
                     "push r15",
                     
-                    // 2. Perform Stack Pointer swap (Scheduler -> Fiber)
-                    // rcx points to FiberContext. offset 0 = fiber_rsp, offset 8 = sched_rsp
+                    // Perform Stack Pointer swap (Scheduler -> Fiber)
                     "mov [rcx + 8], rsp",    // ctx.scheduler_stack_ptr = rsp
                     "mov rsp, [rcx + 0]",    // rsp = ctx.stack_ptr
                     
-                    // 3. Pop Fiber's caller-saved registers and execute
+                    // Pop Fiber's caller-saved registers and execute
                     "pop r15",
                     "pop r14",
                     "pop r13",
@@ -353,9 +362,103 @@ impl Worker {
                     "ret", // Jumps exactly to where Fiber yielded or starts
                     in("rcx") target_ptr,
                 );
-            } else {
-                // Queue is empty, yield to poll mailboxes (simplified loop)
-                core::hint::spin_loop();
+            }
+
+            #[cfg(all(target_arch = "x86_64", windows))]
+            unsafe {
+                core::arch::asm!(
+                    // Windows ABI requires preserving rdi and rsi in addition to the SysV registers.
+                    "push rbp",
+                    "push rbx",
+                    "push rdi",
+                    "push rsi",
+                    "push r12",
+                    "push r13",
+                    "push r14",
+                    "push r15",
+                    
+                    "mov [rcx + 8], rsp",
+                    "mov rsp, [rcx + 0]",
+                    
+                    "pop r15",
+                    "pop r14",
+                    "pop r13",
+                    "pop r12",
+                    "pop rsi",
+                    "pop rdi",
+                    "pop rbx",
+                    "pop rbp",
+                    "ret",
+                    in("rcx") target_ptr,
+                );
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            unsafe {
+                core::arch::asm!(
+                    // ARM64 AAPCS: Callee-saved registers are x19-x29, plus x30 (LR)
+                    "stp x19, x20, [sp, #-16]!",
+                    "stp x21, x22, [sp, #-16]!",
+                    "stp x23, x24, [sp, #-16]!",
+                    "stp x25, x26, [sp, #-16]!",
+                    "stp x27, x28, [sp, #-16]!",
+                    "stp x29, x30, [sp, #-16]!",
+                    
+                    "mov x1, sp",
+                    "str x1, [{0}, #8]", // ctx.scheduler_stack_ptr = sp
+                    "ldr x1, [{0}, #0]", // sp = ctx.stack_ptr
+                    "mov sp, x1",
+                    
+                    "ldp x29, x30, [sp], #16",
+                    "ldp x27, x28, [sp], #16",
+                    "ldp x25, x26, [sp], #16",
+                    "ldp x23, x24, [sp], #16",
+                    "ldp x21, x22, [sp], #16",
+                    "ldp x19, x20, [sp], #16",
+                    "ret",
+                    in(reg) target_ptr,
+                );
+            }
+
+            #[cfg(target_arch = "riscv64")]
+            unsafe {
+                core::arch::asm!(
+                    // RISC-V 64: Callee-saved registers are s0-s11 and ra (return address)
+                    "addi sp, sp, -112",
+                    "sd s0, 0(sp)",
+                    "sd s1, 8(sp)",
+                    "sd s2, 16(sp)",
+                    "sd s3, 24(sp)",
+                    "sd s4, 32(sp)",
+                    "sd s5, 40(sp)",
+                    "sd s6, 48(sp)",
+                    "sd s7, 56(sp)",
+                    "sd s8, 64(sp)",
+                    "sd s9, 72(sp)",
+                    "sd s10, 80(sp)",
+                    "sd s11, 88(sp)",
+                    "sd ra, 96(sp)",
+                    
+                    "sd sp, 8({0})", // ctx.scheduler_stack_ptr = sp
+                    "ld sp, 0({0})", // sp = ctx.stack_ptr
+                    
+                    "ld ra, 96(sp)",
+                    "ld s11, 88(sp)",
+                    "ld s10, 80(sp)",
+                    "ld s9, 72(sp)",
+                    "ld s8, 64(sp)",
+                    "ld s7, 56(sp)",
+                    "ld s6, 48(sp)",
+                    "ld s5, 40(sp)",
+                    "ld s4, 32(sp)",
+                    "ld s3, 24(sp)",
+                    "ld s2, 16(sp)",
+                    "ld s1, 8(sp)",
+                    "ld s0, 0(sp)",
+                    "addi sp, sp, 112",
+                    "ret",
+                    in(reg) target_ptr,
+                );
             }
         }
     }
@@ -452,12 +555,16 @@ impl DtaScheduler {
         let threshold = worker_ref.deflection_threshold.load(Ordering::Relaxed);
         let load = worker_ref.load_level.load(Ordering::Relaxed);
 
+        // Branchless Double Hash for Spatial Smoothing
         let deflect_mask = if load > threshold { usize::MAX } else { 0 };
-        let offset = ((flow_id & 7) as usize) | 1; 
+        let h1 = (flow_id & 7) as usize; 
+        let h2 = ((flow_id >> 3) & 7 | 1) as usize; 
 
         let ccx_base = source_core & !7;
         let local_idx = source_core & 7;
-        let target_idx = local_idx ^ (offset & deflect_mask);
+        
+        let deflect_target = (local_idx + h1 + h2) & 7;
+        let target_idx = local_idx ^ ((local_idx ^ deflect_target) & deflect_mask);
         let target_core = ccx_base | target_idx;
 
         let jump_idx = (target_core != source_core) as usize;
@@ -479,5 +586,31 @@ impl DtaScheduler {
         
         worker.update_load();
         worker.tick();
+    }
+
+    /// The Main Scheduler Heartbeat Loop
+    /// Executes the dispatch assembly and seamlessly manages the mailbox topology when exhausted.
+    pub fn run_worker(&self, current_core: usize, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
+        loop {
+            // 1. Drain the local SPSC queue natively
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let worker = &mut *self.workers[current_core].get();
+                worker.dispatch_loop_asm(context_base, context_size, group_guard_size);
+            }
+            
+            // 2. Local queue exhausted. Pull from P2P Mailbox Mesh.
+            self.poll_mailboxes(current_core);
+            
+            // 3. Affinity Controls & Backoff
+            unsafe {
+                let worker = &*self.workers[current_core].get();
+                if worker.local_queue_len() == 0 {
+                    // Active spinning or UMWAIT if queue remains completely dry.
+                    // This implements the dev-doc requirement for topology affinity controls.
+                    core::hint::spin_loop();
+                }
+            }
+        }
     }
 }

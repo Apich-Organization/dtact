@@ -140,11 +140,14 @@ impl ContextPool {
         let mut slot_size = stack_size + context_sz + 8192; // 8KB read buffer included in slot
         slot_size = (slot_size + page_size - 1) & !(page_size - 1);
         
-        if safety == SafetyLevel::Safety2 || safety == SafetyLevel::Safety1 {
+        if safety == SafetyLevel::Safety2 {
             slot_size += page_size;
         }
 
-        let total_size = slot_size * capacity;
+        let mut total_size = slot_size * capacity;
+        if safety == SafetyLevel::Safety1 {
+            total_size += (capacity / 32) * page_size;
+        }
 
         unsafe {
             let base_ptr = Self::allocate_arena(total_size, safety)?;
@@ -258,9 +261,16 @@ impl ContextPool {
 
     unsafe fn apply_guards(base: *mut u8, capacity: usize, slot_size: usize, page_size: usize, safety: SafetyLevel) -> Result<(), crate::errors::DtactError> {
         if safety == SafetyLevel::Safety0 { return Ok(()); }
+        
         for i in 0..capacity {
-            if safety == SafetyLevel::Safety1 && (i % 32) != 31 { continue; }
-            let guard_ptr = unsafe { base.add(i * slot_size) };
+            let guard_ptr = if safety == SafetyLevel::Safety1 {
+                if (i % 32) != 31 { continue; }
+                // Safety1: Group Guard placed after every 32 slots.
+                unsafe { base.add((i + 1) * slot_size + (i / 32) * page_size) }
+            } else {
+                // Safety2: Individual Guard placed at the end of each slot.
+                unsafe { base.add(i * slot_size + slot_size - page_size) }
+            };
             
             #[cfg(unix)]
             {

@@ -45,7 +45,7 @@ unsafe fn drop_waker(_data: *const ()) {
 /// Saves ONLY callee-saved registers and swaps the stack pointer to return to the scheduler.
 #[inline(always)]
 unsafe fn dtact_asm_fiber_suspend(ctx: *mut FiberContext) {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", unix))]
     core::arch::asm!(
         "push rbp",
         "push rbx",
@@ -59,6 +59,32 @@ unsafe fn dtact_asm_fiber_suspend(ctx: *mut FiberContext) {
         "pop r14",
         "pop r13",
         "pop r12",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+        in("rcx") ctx,
+        options(preserves_flags)
+    );
+
+    #[cfg(all(target_arch = "x86_64", windows))]
+    core::arch::asm!(
+        // Windows ABI additionally requires preserving rdi and rsi
+        "push rbp",
+        "push rbx",
+        "push rdi",
+        "push rsi",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov [rcx + 0], rsp",    // ctx.stack_ptr = rsp
+        "mov rsp, [rcx + 8]",    // rsp = ctx.scheduler_stack_ptr
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rsi",
+        "pop rdi",
         "pop rbx",
         "pop rbp",
         "ret",
