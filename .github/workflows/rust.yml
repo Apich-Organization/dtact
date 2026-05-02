@@ -37,10 +37,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install strace
-        run: sudo apt-get install -y strace
       - name: cargo test
-        run: strace -e mprotect cargo test
+        run: cargo test
 
   lints:
     name: Lints
