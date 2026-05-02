@@ -10,19 +10,46 @@ pub enum Priority {
     Critical,
 }
 
-pub struct SpawnBuilder {
+pub trait ContextSwitcher: Send + Sync + 'static {
+    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers);
+}
+
+pub struct CrossThreadFloat;
+impl ContextSwitcher for CrossThreadFloat {
+    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_cross_thread_float;
+}
+
+pub struct CrossThreadNoFloat;
+impl ContextSwitcher for CrossThreadNoFloat {
+    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_cross_thread_no_float;
+}
+
+pub struct SameThreadFloat;
+impl ContextSwitcher for SameThreadFloat {
+    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_same_thread_float;
+}
+
+pub struct SameThreadNoFloat;
+impl ContextSwitcher for SameThreadNoFloat {
+    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_same_thread_no_float;
+}
+
+pub struct SpawnBuilder<S: ContextSwitcher = CrossThreadFloat> {
     name: Option<&'static str>,
     affinity: topology::Affinity,
     priority: Priority,
+    safety: crate::memory_management::SafetyLevel,
+    _marker: core::marker::PhantomData<S>,
 }
 
-impl SpawnBuilder {
+impl<S: ContextSwitcher> SpawnBuilder<S> {
     pub fn new() -> Self {
         Self {
             name: None,
             affinity: topology::Affinity::SameCore,
             priority: Priority::Normal,
             safety: crate::memory_management::SafetyLevel::Safety0,
+            _marker: core::marker::PhantomData,
         }
     }
 
@@ -51,15 +78,23 @@ impl SpawnBuilder {
         let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Dtact Runtime not initialized");
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         
-        // TODO: In a full implementation, we'd pin `fut` into the newly allocated context's stack
-        // and set up its trampoline to poll it. For now, we secure the pipeline logic.
-        
+        let ctx_ptr = pool.get_context_ptr(ctx_id);
         let current_core = topology::current().core_id as usize;
+
+        unsafe {
+            (*ctx_ptr).state.store(crate::memory_management::FiberStatus::Running as u8, core::sync::atomic::Ordering::Release);
+            (*ctx_ptr).origin_core = current_core as u16;
+            (*ctx_ptr).fiber_index = ctx_id;
+            (*ctx_ptr).switch_fn = S::SWITCH_FN;
+            
+            // In a full implementation, `_fut` would be Boxed or placed directly into `buf_ptr`
+            // and the `trampoline` would be set to a polling loop that calls `.wait()`.
+        }
         
         // Push directly to the scheduler's lock-free SPSC mesh (< 80ns penetration)
         crate::wake_fiber(current_core, ctx_id);
         
-        ctx_id as dtact_handle_t
+        crate::c_ffi::dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
     }
 }
 
@@ -78,10 +113,23 @@ pub mod fiber {
         let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Dtact Runtime not initialized");
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         
+        let ctx_ptr = pool.get_context_ptr(ctx_id);
+        let current_core = crate::topology::current().core_id as usize;
+
+        unsafe {
+            (*ctx_ptr).state.store(crate::memory_management::FiberStatus::Running as u8, core::sync::atomic::Ordering::Release);
+            (*ctx_ptr).origin_core = current_core as u16;
+            (*ctx_ptr).fiber_index = ctx_id;
+            
+            // Calculate Top of Stack natively based on Context address
+            let stack_top = (ctx_ptr as *mut u8).sub(64);
+            (*ctx_ptr).stack_ptr = stack_top as usize;
+        }
+
         // Push the fiber to the execution mesh immediately
-        crate::wake_fiber(crate::topology::current().core_id as usize, ctx_id);
+        crate::wake_fiber(current_core, ctx_id);
         
-        ctx_id as dtact_handle_t
+        dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
     }
 }
 
@@ -199,6 +247,24 @@ pub async fn yield_to(_affinity: topology::Affinity) {
     // Hot-migrates the current task to a specified topology level by signaling the scheduler
     // before yielding.
     yield_now().await
+}
+
+pub mod config {
+    use core::sync::atomic::Ordering;
+
+    /// Refines Topology Affinity dynamically. 
+    /// Allows the user to manually lower or raise the deflection threshold of a specific core.
+    /// Lowering it forces the core to push tasks to neighbors within the CCX earlier.
+    pub fn set_deflection_threshold(core_id: usize, threshold: u8) {
+        if let Some(scheduler) = crate::GLOBAL_SCHEDULER.get() {
+            if core_id < scheduler.workers.len() {
+                unsafe {
+                    let worker = &*scheduler.workers[core_id].get();
+                    worker.deflection_threshold.store(threshold, Ordering::Release);
+                }
+            }
+        }
+    }
 }
 
 /// Cross-Modal Wait Interface.

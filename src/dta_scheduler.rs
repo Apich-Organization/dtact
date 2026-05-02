@@ -73,9 +73,37 @@ impl<T> HugeBuffer<T> {
 
         #[cfg(windows)]
         unsafe {
-            // Simplified VirtualAlloc for Windows
-            let ptr = alloc::alloc::alloc_zeroed(core::alloc::Layout::new::<T>()) as *mut T;
-            Self { ptr, size_bytes }
+            use crate::memory_management::winapi_shim;
+            #[cfg(feature = "windows-root")]
+            {
+                let mut ptr = winapi_shim::VirtualAlloc(
+                    core::ptr::null_mut(),
+                    size_bytes,
+                    winapi_shim::MEM_RESERVE | winapi_shim::MEM_COMMIT | winapi_shim::MEM_LARGE_PAGES,
+                    winapi_shim::PAGE_READWRITE,
+                );
+                if ptr.is_null() {
+                    ptr = winapi_shim::VirtualAlloc(
+                        core::ptr::null_mut(),
+                        size_bytes,
+                        winapi_shim::MEM_RESERVE | winapi_shim::MEM_COMMIT,
+                        winapi_shim::PAGE_READWRITE,
+                    );
+                    assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
+                }
+                Self { ptr: ptr as *mut T, size_bytes }
+            }
+            #[cfg(not(feature = "windows-root"))]
+            {
+                let ptr = winapi_shim::VirtualAlloc(
+                    core::ptr::null_mut(),
+                    size_bytes,
+                    winapi_shim::MEM_RESERVE | winapi_shim::MEM_COMMIT,
+                    winapi_shim::PAGE_READWRITE,
+                );
+                assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
+                Self { ptr: ptr as *mut T, size_bytes }
+            }
         }
     }
 }
@@ -85,6 +113,14 @@ impl<T> Drop for HugeBuffer<T> {
         #[cfg(unix)]
         unsafe {
             libc::munmap(self.ptr as *mut libc::c_void, self.size_bytes);
+        }
+        #[cfg(windows)]
+        unsafe {
+            crate::memory_management::winapi_shim::VirtualFree(
+                self.ptr as *mut core::ffi::c_void,
+                0,
+                crate::memory_management::winapi_shim::MEM_RELEASE
+            );
         }
     }
 }
@@ -308,9 +344,9 @@ impl Worker {
         self.local_tail = end_idx & LOCAL_QUEUE_MASK;
     }
     
-    /// Pure ASM Dispatch Loop to completely bypass compiler stack ABI
+    /// Dispatch Loop
     /// Executed by the worker thread until the local queue is empty.
-    pub unsafe fn dispatch_loop_asm(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
+    pub fn dispatch_loop(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         while self.local_head != self.local_tail {
             let task = (unsafe { *self.local_queue.ptr })[self.local_head];
             self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
@@ -318,7 +354,7 @@ impl Worker {
             // O(1) alignment calculation with Safety1 GroupGuard spacing natively supported
             let group_offset = (task as usize >> 5) * group_guard_size;
             let target_ptr = unsafe {
-                context_base.add((task as usize) * context_size + group_offset)
+                context_base.add((task as usize) * context_size + group_offset) as *mut crate::memory_management::FiberContext
             };
             
             // Hardware Prefetch: Bring FiberContext to L1 using T0 hint immediately
@@ -336,128 +372,12 @@ impl Worker {
                 core::arch::asm!("prefetch.r 0({0})", in(reg) target_ptr, options(nostack, preserves_flags));
             }
 
-            // Inline Assembly Fast-Path Context Switch (Minimal Registers)
-            #[cfg(all(target_arch = "x86_64", unix))]
+            // Safe Context Switch: Call the dynamic switcher defined in `FiberContext`.
+            // This allows per-task configuration of float-saving and thread-affinity logic.
             unsafe {
-                core::arch::asm!(
-                    // SysV ABI: Save critical caller-saved state (FPU/AVX skipped)
-                    "push rbp",
-                    "push rbx",
-                    "push r12",
-                    "push r13",
-                    "push r14",
-                    "push r15",
-                    
-                    // Perform Stack Pointer swap (Scheduler -> Fiber)
-                    "mov [rcx + 8], rsp",    // ctx.scheduler_stack_ptr = rsp
-                    "mov rsp, [rcx + 0]",    // rsp = ctx.stack_ptr
-                    
-                    // Pop Fiber's caller-saved registers and execute
-                    "pop r15",
-                    "pop r14",
-                    "pop r13",
-                    "pop r12",
-                    "pop rbx",
-                    "pop rbp",
-                    "ret", // Jumps exactly to where Fiber yielded or starts
-                    in("rcx") target_ptr,
-                );
-            }
-
-            #[cfg(all(target_arch = "x86_64", windows))]
-            unsafe {
-                core::arch::asm!(
-                    // Windows ABI requires preserving rdi and rsi in addition to the SysV registers.
-                    "push rbp",
-                    "push rbx",
-                    "push rdi",
-                    "push rsi",
-                    "push r12",
-                    "push r13",
-                    "push r14",
-                    "push r15",
-                    
-                    "mov [rcx + 8], rsp",
-                    "mov rsp, [rcx + 0]",
-                    
-                    "pop r15",
-                    "pop r14",
-                    "pop r13",
-                    "pop r12",
-                    "pop rsi",
-                    "pop rdi",
-                    "pop rbx",
-                    "pop rbp",
-                    "ret",
-                    in("rcx") target_ptr,
-                );
-            }
-
-            #[cfg(target_arch = "aarch64")]
-            unsafe {
-                core::arch::asm!(
-                    // ARM64 AAPCS: Callee-saved registers are x19-x29, plus x30 (LR)
-                    "stp x19, x20, [sp, #-16]!",
-                    "stp x21, x22, [sp, #-16]!",
-                    "stp x23, x24, [sp, #-16]!",
-                    "stp x25, x26, [sp, #-16]!",
-                    "stp x27, x28, [sp, #-16]!",
-                    "stp x29, x30, [sp, #-16]!",
-                    
-                    "mov x1, sp",
-                    "str x1, [{0}, #8]", // ctx.scheduler_stack_ptr = sp
-                    "ldr x1, [{0}, #0]", // sp = ctx.stack_ptr
-                    "mov sp, x1",
-                    
-                    "ldp x29, x30, [sp], #16",
-                    "ldp x27, x28, [sp], #16",
-                    "ldp x25, x26, [sp], #16",
-                    "ldp x23, x24, [sp], #16",
-                    "ldp x21, x22, [sp], #16",
-                    "ldp x19, x20, [sp], #16",
-                    "ret",
-                    in(reg) target_ptr,
-                );
-            }
-
-            #[cfg(target_arch = "riscv64")]
-            unsafe {
-                core::arch::asm!(
-                    // RISC-V 64: Callee-saved registers are s0-s11 and ra (return address)
-                    "addi sp, sp, -112",
-                    "sd s0, 0(sp)",
-                    "sd s1, 8(sp)",
-                    "sd s2, 16(sp)",
-                    "sd s3, 24(sp)",
-                    "sd s4, 32(sp)",
-                    "sd s5, 40(sp)",
-                    "sd s6, 48(sp)",
-                    "sd s7, 56(sp)",
-                    "sd s8, 64(sp)",
-                    "sd s9, 72(sp)",
-                    "sd s10, 80(sp)",
-                    "sd s11, 88(sp)",
-                    "sd ra, 96(sp)",
-                    
-                    "sd sp, 8({0})", // ctx.scheduler_stack_ptr = sp
-                    "ld sp, 0({0})", // sp = ctx.stack_ptr
-                    
-                    "ld ra, 96(sp)",
-                    "ld s11, 88(sp)",
-                    "ld s10, 80(sp)",
-                    "ld s9, 72(sp)",
-                    "ld s8, 64(sp)",
-                    "ld s7, 56(sp)",
-                    "ld s6, 48(sp)",
-                    "ld s5, 40(sp)",
-                    "ld s4, 32(sp)",
-                    "ld s3, 24(sp)",
-                    "ld s2, 16(sp)",
-                    "ld s1, 8(sp)",
-                    "ld s0, 0(sp)",
-                    "addi sp, sp, 112",
-                    "ret",
-                    in(reg) target_ptr,
+                ((*target_ptr).switch_fn)(
+                    &mut (*target_ptr).executor_regs,
+                    &(*target_ptr).regs,
                 );
             }
         }
@@ -593,10 +513,9 @@ impl DtaScheduler {
     pub fn run_worker(&self, current_core: usize, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         loop {
             // 1. Drain the local SPSC queue natively
-            #[cfg(target_arch = "x86_64")]
             unsafe {
                 let worker = &mut *self.workers[current_core].get();
-                worker.dispatch_loop_asm(context_base, context_size, group_guard_size);
+                worker.dispatch_loop(context_base, context_size, group_guard_size);
             }
             
             // 2. Local queue exhausted. Pull from P2P Mailbox Mesh.
@@ -606,9 +525,24 @@ impl DtaScheduler {
             unsafe {
                 let worker = &*self.workers[current_core].get();
                 if worker.local_queue_len() == 0 {
-                    // Active spinning or UMWAIT if queue remains completely dry.
-                    // This implements the dev-doc requirement for topology affinity controls.
-                    core::hint::spin_loop();
+                    // Active spinning or hardware-assisted sleep if queue remains completely dry.
+                    #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
+                    {
+                        // ARM64 WFE (Wait For Event). Pauses execution until a SEV instruction 
+                        // is executed by another core (which we do in `do_push_remote`).
+                        core::arch::asm!("wfe", options(nostack, preserves_flags));
+                    }
+                    #[cfg(all(feature = "hw-acceleration", target_arch = "riscv64"))]
+                    {
+                        // RISC-V PAUSE (Zihintpause extension). Reduces energy consumption 
+                        // while spinning, awaiting UIPI.
+                        core::arch::asm!("pause", options(nostack, preserves_flags));
+                    }
+                    #[cfg(any(not(feature = "hw-acceleration"), target_arch = "x86_64", target_arch = "x86"))]
+                    {
+                        // x86_64: `spin_loop` emits `pause`. UINTR will interrupt this.
+                        core::hint::spin_loop();
+                    }
                 }
             }
         }

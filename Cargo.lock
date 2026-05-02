@@ -13,6 +13,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dtact-macros"
+version = "0.1.0"
+dependencies = [
+ "virtue-next",
+]
+
+[[package]]
 name = "futures-io"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -44,3 +51,7 @@ checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
 dependencies = [
  "pin-project-lite",
 ]
+
+[[package]]
+name = "virtue-next"
+version = "0.1.3"

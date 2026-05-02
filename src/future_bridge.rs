@@ -45,110 +45,12 @@ unsafe fn drop_waker(_data: *const ()) {
 /// Saves ONLY callee-saved registers and swaps the stack pointer to return to the scheduler.
 #[inline(always)]
 unsafe fn dtact_asm_fiber_suspend(ctx: *mut FiberContext) {
-    #[cfg(all(target_arch = "x86_64", unix))]
-    core::arch::asm!(
-        "push rbp",
-        "push rbx",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov [rcx + 0], rsp",    // ctx.stack_ptr = rsp
-        "mov rsp, [rcx + 8]",    // rsp = ctx.scheduler_stack_ptr
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
-        "ret",
-        in("rcx") ctx,
-        options(preserves_flags)
-    );
-
-    #[cfg(all(target_arch = "x86_64", windows))]
-    core::arch::asm!(
-        // Windows ABI additionally requires preserving rdi and rsi
-        "push rbp",
-        "push rbx",
-        "push rdi",
-        "push rsi",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov [rcx + 0], rsp",    // ctx.stack_ptr = rsp
-        "mov rsp, [rcx + 8]",    // rsp = ctx.scheduler_stack_ptr
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rsi",
-        "pop rdi",
-        "pop rbx",
-        "pop rbp",
-        "ret",
-        in("rcx") ctx,
-        options(preserves_flags)
-    );
-
-    #[cfg(target_arch = "aarch64")]
-    core::arch::asm!(
-        "stp x19, x20, [sp, #-16]!",
-        "stp x21, x22, [sp, #-16]!",
-        "stp x23, x24, [sp, #-16]!",
-        "stp x25, x26, [sp, #-16]!",
-        "stp x27, x28, [sp, #-16]!",
-        "stp x29, x30, [sp, #-16]!",
-        "mov x1, sp",
-        "str x1, [{0}]", // ctx.stack_ptr = sp
-        "ldr x1, [{0}, #8]", // sp = ctx.scheduler_stack_ptr
-        "mov sp, x1",
-        "ldp x29, x30, [sp], #16",
-        "ldp x27, x28, [sp], #16",
-        "ldp x25, x26, [sp], #16",
-        "ldp x23, x24, [sp], #16",
-        "ldp x21, x22, [sp], #16",
-        "ldp x19, x20, [sp], #16",
-        "ret",
-        in(reg) ctx,
-    );
-
-    #[cfg(target_arch = "riscv64")]
-    core::arch::asm!(
-        "addi sp, sp, -112",
-        "sd s0, 0(sp)",
-        "sd s1, 8(sp)",
-        "sd s2, 16(sp)",
-        "sd s3, 24(sp)",
-        "sd s4, 32(sp)",
-        "sd s5, 40(sp)",
-        "sd s6, 48(sp)",
-        "sd s7, 56(sp)",
-        "sd s8, 64(sp)",
-        "sd s9, 72(sp)",
-        "sd s10, 80(sp)",
-        "sd s11, 88(sp)",
-        "sd ra, 96(sp)",
-        "sd sp, 0({0})", // ctx.stack_ptr = sp
-        "ld sp, 8({0})", // sp = ctx.scheduler_stack_ptr
-        "ld ra, 96(sp)",
-        "ld s11, 88(sp)",
-        "ld s10, 80(sp)",
-        "ld s9, 72(sp)",
-        "ld s8, 64(sp)",
-        "ld s7, 56(sp)",
-        "ld s6, 48(sp)",
-        "ld s5, 40(sp)",
-        "ld s4, 32(sp)",
-        "ld s3, 24(sp)",
-        "ld s2, 16(sp)",
-        "ld s1, 8(sp)",
-        "ld s0, 0(sp)",
-        "addi sp, sp, 112",
-        "ret",
-        in(reg) ctx,
-    );
+    unsafe {
+        ((*ctx).switch_fn)(
+            &mut (*ctx).regs,
+            &(*ctx).executor_regs,
+        )
+    };
 }
 
 thread_local! {

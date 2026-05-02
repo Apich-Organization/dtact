@@ -84,6 +84,9 @@ pub(crate) struct FiberContext {
     // Pre-allocated IO buffer within the stack space
     pub(crate) buf_ptr: *mut [u8],
     pub(crate) read_buffer_ptr: *mut u8,
+
+    // The context switch function pointer (determined at spawn time)
+    pub(crate) switch_fn: unsafe extern "C" fn(*mut Registers, *const Registers),
 }
 
 impl FiberContext {
@@ -108,6 +111,7 @@ impl FiberContext {
             reader_ptr: core::ptr::null_mut(),
             buf_ptr: core::ptr::slice_from_raw_parts_mut(core::ptr::null_mut(), 0),
             read_buffer_ptr: core::ptr::null_mut(),
+            switch_fn: crate::context_switch::switch_context_cross_thread_float,
         }
     }
 }
@@ -290,11 +294,21 @@ impl ContextPool {
     }
 
     #[inline(always)]
-    pub fn get_dispatch_layout(&self) -> (*mut u8, usize) {
+    pub fn get_dispatch_layout(&self) -> (*mut u8, usize, usize) {
         let align = 64;
         let context_sz = (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
         let first_ctx_ptr = unsafe { self.base_ptr.add(self.slot_size - context_sz) };
-        (first_ctx_ptr, self.slot_size)
+        
+        let group_guard_size = if self.safety == SafetyLevel::Safety1 { 4096 } else { 0 };
+        (first_ctx_ptr, self.slot_size, group_guard_size)
+    }
+
+    /// O(1) translation from TaskIndex to FiberContext pointer
+    #[inline(always)]
+    pub fn get_context_ptr(&self, index: TaskIndex) -> *mut FiberContext {
+        let (base, sz, guard_sz) = self.get_dispatch_layout();
+        let offset = (index as usize >> 5) * guard_sz;
+        unsafe { base.add((index as usize) * sz + offset) as *mut FiberContext }
     }
 
     /// Lock-Free Allocation (O(1) Pop with ABA protection)
@@ -375,7 +389,7 @@ fn page_size() -> usize {
 }
 
 #[cfg(windows)]
-mod winapi_shim {
+pub(crate) mod winapi_shim {
     #[repr(C)]
     pub(crate) struct SYSTEM_INFO {
         pub(crate) wProcessorArchitecture: u16, pub(crate) wReserved: u16, pub(crate) dwPageSize: u32,
@@ -385,6 +399,7 @@ mod winapi_shim {
     }
     pub(crate) const MEM_COMMIT: u32 = 0x00001000; pub(crate) const MEM_RESERVE: u32 = 0x00002000; pub(crate) const MEM_RELEASE: u32 = 0x00008000;
     pub(crate) const PAGE_NOACCESS: u32 = 0x01; pub(crate) const PAGE_READWRITE: u32 = 0x04;
+    pub(crate) const MEM_LARGE_PAGES: u32 = 0x20000000;
     unsafe extern "system" {
         pub(crate) fn VirtualAlloc(lpAddress: *mut core::ffi::c_void, dwSize: usize, flAllocationType: u32, flProtect: u32) -> *mut core::ffi::c_void;
         pub(crate) fn VirtualFree(lpAddress: *mut core::ffi::c_void, dwSize: usize, dwFreeType: u32) -> i32;

@@ -7,4 +7,4 @@ edition = "2024"
 proc-macro = true
 
 [dependencies]
-virtue = { path = "../../virtue" }
+virtue = { package = "virtue-next", path = "../../virtue" }
