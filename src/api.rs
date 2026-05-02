@@ -179,7 +179,81 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             .get()
             .expect("Dtact Runtime not initialized");
         let pool = &runtime.pool;
-        let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
+        let mut fixed_spins: u32 = 0;
+
+        let ctx_id = 'alloc: loop {
+            if let Some(id) = pool.alloc_context() {
+                // If we are in a fiber, reward the success
+                let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
+                if !ctx_ptr.is_null() {
+                    unsafe {
+                        let ctx = &mut *ctx_ptr;
+                        ctx.adaptive_spin_count = (ctx.adaptive_spin_count + 1).min(2000);
+                        ctx.spin_failure_count = ctx.spin_failure_count.saturating_sub(1);
+                    }
+                }
+                break 'alloc id;
+            }
+
+            let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
+            if !ctx_ptr.is_null() {
+                // FIBER-AWARE ADAPTIVE SPINNING
+                unsafe {
+                    let ctx = &mut *ctx_ptr;
+                    let current_spin = ctx.adaptive_spin_count;
+                    let failure_count = ctx.spin_failure_count;
+
+                    // Only spin if failure count is low
+                    if failure_count < 20 {
+                        for i in 0..current_spin {
+                            core::hint::spin_loop();
+
+                            // Sparse Polling: only check the pool every 8 iterations to reduce L1 pressure
+                            if i.trailing_zeros() >= 3 {
+                                if let Some(id) = pool.alloc_context() {
+                                    ctx.adaptive_spin_count = (current_spin + 2).min(2000);
+                                    ctx.spin_failure_count = failure_count.saturating_sub(1);
+                                    break 'alloc id;
+                                }
+                            }
+                        }
+                    }
+
+                    // Spin failed: Penalize budget and yield
+                    ctx.spin_failure_count = failure_count.saturating_add(1);
+                    ctx.adaptive_spin_count = current_spin.saturating_sub(100).max(200);
+
+                    ctx.state.store(
+                        crate::memory_management::FiberStatus::Yielded as u8,
+                        core::sync::atomic::Ordering::Release,
+                    );
+
+                    // RE-ENQUEUE the fiber before swapping so the scheduler runs it again
+                    let ctx_id = ctx.fiber_index;
+                    let current_core =
+                        topology::current().core_id as usize % runtime.scheduler.workers.len();
+                    crate::wake_fiber(current_core, ctx_id);
+
+                    (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
+                }
+            } else {
+                // HOST-THREAD SPINNING
+                if fixed_spins < 2000 {
+                    core::hint::spin_loop();
+                    fixed_spins += 1;
+
+                    // Sparse Polling for host threads too
+                    if fixed_spins.trailing_zeros() >= 3 {
+                        if let Some(id) = pool.alloc_context() {
+                            break 'alloc id;
+                        }
+                    }
+                } else {
+                    std::thread::yield_now();
+                    fixed_spins = 0; // Reset after yield
+                }
+            }
+        };
 
         let ctx_ptr = pool.get_context_ptr(ctx_id);
         #[allow(clippy::cast_possible_truncation)]

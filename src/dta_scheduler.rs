@@ -688,6 +688,9 @@ impl DtaScheduler {
                         unsafe {
                             let tail_ptr = &raw const worker.local_tail as *mut core::ffi::c_void;
                             let control = 1u32; // C0.1 (Fast wakeup)
+                            // 1ms timeout @ 2GHz (approx 2,000,000 ticks)
+                            let timeout_low = 2_000_000u32;
+                            let timeout_high = 0u32;
                             core::arch::asm!(
                                 "umonitor {0}",
                                 "test {1}, {1}",
@@ -697,8 +700,8 @@ impl DtaScheduler {
                                 in(reg) tail_ptr,
                                 in(reg) worker.local_queue_len(),
                                 in(reg) control,
-                                inout("eax") 0xFFFF_FFFF_u32 => _,
-                                inout("edx") 0xFFFF_FFFF_u32 => _,
+                                inout("eax") timeout_low => _,
+                                inout("edx") timeout_high => _,
                                 options(nostack, preserves_flags)
                             );
                         }
