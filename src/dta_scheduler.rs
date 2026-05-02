@@ -552,8 +552,11 @@ impl DtaScheduler {
 
     /// Enqueues a task into the mesh, applying work-deflection if necessary.
     /// 
-    /// Uses a branchless Double-Hash strategy to distribute tasks across the
-    /// CCX neighbors if the local core is under heavy load.
+    /// Enqueues a task into the mesh, applying work-deflection if necessary.
+    /// 
+    /// If `TopologyMode::P2PMesh` is active, deflection is restricted to 
+    /// local CCX neighbors. If `TopologyMode::Global` is active, tasks can 
+    /// be deflected to any available core in the runtime.
     #[inline(always)]
     pub fn enqueue_task(&self, source_core: usize, flow_id: u64, task: TaskIndex) {
         let worker_ref = unsafe { &*self.workers[source_core].get() };
@@ -566,12 +569,18 @@ impl DtaScheduler {
         #[allow(clippy::cast_possible_truncation)]
         let h2 = ((flow_id >> 3) & 7 | 1) as usize; 
 
-        let ccx_base = source_core & !7;
-        let local_idx = source_core & 7;
-        
-        let deflect_target = (local_idx + h1 + h2) & 7;
-        let target_idx = local_idx ^ ((local_idx ^ deflect_target) & deflect_mask);
-        let target_core = ccx_base | target_idx;
+        let target_core = if self.topology == TopologyMode::Global {
+            // Global mode: Hash across all workers
+            let num_workers = self.workers.len();
+            (source_core + h1 + h2) % num_workers
+        } else {
+            // P2P Mesh mode: Restricted to CCX (8-core boundary)
+            let ccx_base = source_core & !7;
+            let local_idx = source_core & 7;
+            let deflect_target = (local_idx + h1 + h2) & 7;
+            let target_idx = local_idx ^ ((local_idx ^ deflect_target) & deflect_mask);
+            ccx_base | target_idx
+        };
 
         let jump_idx = usize::from(target_core != source_core);
         (self.enqueue_jmp[jump_idx])(self, source_core, target_core, task);

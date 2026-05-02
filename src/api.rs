@@ -159,6 +159,13 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             (*ctx_ptr).fiber_index = ctx_id;
             (*ctx_ptr).switch_fn = S::SWITCH_FN;
             
+            // Set adaptive spin count based on workload kind
+            (*ctx_ptr).adaptive_spin_count = match self.kind {
+                WorkloadKind::Compute => 1000,
+                WorkloadKind::Memory => 500,
+                WorkloadKind::IO => 100,
+            };
+            
             // Aligned Zero-Copy Future Migration
             let align = core::mem::align_of::<F>();
             let fut_size = core::mem::size_of::<F>();
