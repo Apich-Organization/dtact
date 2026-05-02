@@ -1,8 +1,8 @@
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use arbitrary::Arbitrary;
 use dtact::dta_scheduler::{DtaScheduler, TopologyMode};
+use libfuzzer_sys::fuzz_target;
 use std::sync::atomic::Ordering;
 
 #[derive(Arbitrary, Debug)]
@@ -28,7 +28,9 @@ fuzz_target!(|data: FuzzInput| {
     unsafe {
         let worker = &mut *scheduler.workers[source_core].get();
         worker.load_level.store(data.local_load, Ordering::SeqCst);
-        worker.deflection_threshold.store(data.deflection_threshold, Ordering::SeqCst);
+        worker
+            .deflection_threshold
+            .store(data.deflection_threshold, Ordering::SeqCst);
     }
 
     scheduler.enqueue_task(source_core, data.flow_id as u64, data.priority as u32);
