@@ -112,7 +112,7 @@ jobs:
 
             case "${{ matrix.qemu_arch }}" in
               riscv64)
-                RUNNER_CMD="$RUNNER_CMD -cpu rv64"
+                RUNNER_CMD="$RUNNER_CMD -cpu rv64gc"
                 ;;
               aarch64)
                 RUNNER_CMD="$RUNNER_CMD -cpu max"
