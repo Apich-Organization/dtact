@@ -477,6 +477,20 @@ impl Worker {
             }
 
             crate::future_bridge::CURRENT_FIBER.with(|c| c.set(core::ptr::null_mut()));
+
+            // Post-switch lifecycle: if the fiber finished, return its context to the pool.
+            // This MUST happen here (on the scheduler's stack) rather than inside
+            // fiber_entry_point, because calling free_context from the fiber's own
+            // stack creates a use-after-free race: the context could be reallocated
+            // by another thread while the fiber is still executing its final instructions.
+            let state = unsafe {
+                (*target_ptr)
+                    .state
+                    .load(core::sync::atomic::Ordering::Acquire)
+            };
+            if state == crate::memory_management::FiberStatus::Finished as u8 {
+                pool.free_context(task);
+            }
         }
     }
 }

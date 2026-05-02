@@ -289,8 +289,16 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             }
         }
 
+        let r#gen = unsafe {
+            (*ctx_ptr)
+                .generation
+                .load(core::sync::atomic::Ordering::Acquire)
+        } as u64;
+
         crate::wake_fiber(current_core, ctx_id);
-        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
+
+        // Handle Layout: [16-bit Generation | 16-bit CoreID | 32-bit ContextID]
+        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32) | ((r#gen & 0xFFFF) << 48))
     }
 }
 
@@ -309,27 +317,35 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         unsafe { invoke(arg) };
     }));
 
-    // Return context to pool (marks as Initial, wakes futex waiters, returns to free list)
-    let ctx_id = ctx.fiber_index;
-    if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
-        runtime.pool.free_context(ctx_id);
+    // Execute cleanup if present (e.g. FFI arg free) — MUST happen before we lose the context
+    if let Some(cleanup) = ctx.cleanup_fn.take() {
+        unsafe { cleanup(ctx.closure_ptr) };
     }
 
-    // Wake up any fiber waiting for this one (FFI join)
+    // Mark as Finished. The scheduler will return this context to the pool
+    // AFTER we switch back, preventing use-after-free races.
+    ctx.state.store(
+        crate::memory_management::FiberStatus::Finished as u8,
+        core::sync::atomic::Ordering::Release,
+    );
+
+    // Wake up any fiber waiting for this one (FFI join).
+    // MUST happen BEFORE free_context, otherwise the context could be reallocated
+    // and the waiter_handle overwritten before we read it.
     let waiter = ctx
         .waiter_handle
-        .swap(0, core::sync::atomic::Ordering::Acquire);
+        .swap(0, core::sync::atomic::Ordering::AcqRel);
     if waiter != 0 {
         let waiter_ctx_id = (waiter & 0xFFFF_FFFF) as u32;
         let waiter_core_id = (waiter >> 32) as usize;
         crate::wake_fiber(waiter_core_id, waiter_ctx_id);
     }
 
-    // Execute cleanup if present (e.g. FFI arg free)
-    if let Some(cleanup) = ctx.cleanup_fn.take() {
-        unsafe { cleanup(ctx.closure_ptr) };
-    }
+    // Also wake any non-fiber thread blocked on futex_wait
+    unsafe { crate::utils::futex_wake(&raw const ctx.state) };
 
+    // Switch back to the scheduler. The scheduler's dispatch_loop will see
+    // state == Finished and call free_context on our behalf.
     unsafe {
         (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
     }
