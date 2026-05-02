@@ -591,7 +591,7 @@ impl DtaScheduler {
                                 "umonitor {0}",
                                 "test {1}, {1}", 
                                 "jnz 2f",
-                                "umwait {2}",
+                                "umwait {2:e}",
                                 "2:",
                                 in(reg) tail_ptr,
                                 in(reg) worker.local_queue_len(),

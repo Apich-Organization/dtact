@@ -2,7 +2,6 @@
 #![allow(non_snake_case)]
 
 use core::sync::atomic::{AtomicU32, AtomicU8, AtomicU64, Ordering};
-use std::task::RawWaker;
 
 /// Safety policies for context pool memory layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +77,10 @@ pub(crate) enum FiberStatus {
     /// Voluntarily yielded to another fiber.
     Yielded = 2,
     /// Execution finished successfully.
+    #[allow(dead_code)]
     Finished = 3,
     /// Terminated due to an unhandled panic.
+    #[allow(dead_code)]
     Panicked = 4,
 }
 
@@ -107,11 +108,9 @@ pub(crate) struct FiberContext {
     pub(crate) origin_core: u16,
     /// Unique index in the `ContextPool`.
     pub(crate) fiber_index: u32,
-    /// Thread ID of the host awaiting this fiber.
+    /// Thread ID of a non-fiber waiter (for C-FFI join).
     pub(crate) waiter_thread_id: AtomicU64,
-    /// Standard Rust waker for future compatibility.
-    pub(crate) static_raw_waker: RawWaker,
-    /// Saved fiber register state.
+    /// Reserved GPR state.
     pub(crate) regs: Registers,
     /// Saved executor register state.
     pub(crate) executor_regs: Registers,
@@ -159,7 +158,6 @@ impl FiberContext {
             origin_core: 0,
             fiber_index: 0,
             waiter_thread_id: AtomicU64::new(0),
-            static_raw_waker: RawWaker::new(core::ptr::null(), unsafe { core::mem::transmute(0usize) }),
             regs: Registers::new(),
             executor_regs: Registers::new(),
             next_free: AtomicU32::new(u32::MAX),
@@ -192,6 +190,7 @@ pub struct ContextPool {
     total_size: usize,
     /// Size of each context slot in bytes.
     pub slot_size: usize,
+    #[allow(dead_code)]
     capacity: u32,
     safety: SafetyLevel,
     free_head: AtomicU64,
