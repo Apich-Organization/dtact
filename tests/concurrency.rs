@@ -1,6 +1,5 @@
-use dtact::{ContextPool, FiberStatus, SafetyLevel};
+use dtact::{ContextPool, SafetyLevel};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::thread;
 
 #[test]

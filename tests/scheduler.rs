@@ -1,4 +1,3 @@
-use dtact::FiberStatus;
 use dtact::dta_scheduler::{DtaScheduler, TopologyMode};
 use proptest::prelude::*;
 use std::sync::atomic::Ordering;

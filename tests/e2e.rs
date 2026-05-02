@@ -1,10 +1,7 @@
-use dtact::{
-    ContextPool, DtactWaitExt, FiberStatus, Priority, SafetyLevel, WorkloadKind, spawn, spawn_with,
-    yield_now,
-};
+#![allow(dead_code)]
+use dtact::{DtactWaitExt, Priority, WorkloadKind, spawn, spawn_with, yield_now};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::thread;
 
 #[dtact::dtact_init(workers = 4, capacity = 2048, safety = "Safety1")]
 #[test]
