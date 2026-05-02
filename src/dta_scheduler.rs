@@ -18,7 +18,7 @@ pub const MAILBOX_MASK: usize = MAILBOX_CAPACITY - 1;
 
 /// Capacity of a worker's local execution queue.
 /// Sized to exactly hold the max queue without global locks.
-pub const LOCAL_QUEUE_CAPACITY: usize = 8192;
+pub const LOCAL_QUEUE_CAPACITY: usize = 1048576;
 /// Mask for local queue index wrap-around.
 pub const LOCAL_QUEUE_MASK: usize = LOCAL_QUEUE_CAPACITY - 1;
 

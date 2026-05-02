@@ -181,7 +181,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
         let pool = &runtime.pool;
         let mut fixed_spins: u32 = 0;
 
-        let ctx_id = loop {
+        let ctx_id = 'alloc: loop {
             if let Some(id) = pool.alloc_context() {
                 // If we are in a fiber, reward the success
                 let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
@@ -192,7 +192,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                         ctx.spin_failure_count = ctx.spin_failure_count.saturating_sub(1);
                     }
                 }
-                break id;
+                break 'alloc id;
             }
 
             let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
@@ -213,10 +213,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                                 if let Some(id) = pool.alloc_context() {
                                     ctx.adaptive_spin_count = (current_spin + 2).min(2000);
                                     ctx.spin_failure_count = failure_count.saturating_sub(1);
-                                    return dtact_handle_t(
-                                        u64::from(id)
-                                            | ((topology::current().core_id as u64) << 32),
-                                    );
+                                    break 'alloc id;
                                 }
                             }
                         }
@@ -230,6 +227,13 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                         crate::memory_management::FiberStatus::Yielded as u8,
                         core::sync::atomic::Ordering::Release,
                     );
+
+                    // RE-ENQUEUE the fiber before swapping so the scheduler runs it again
+                    let ctx_id = ctx.fiber_index;
+                    let current_core =
+                        topology::current().core_id as usize % runtime.scheduler.workers.len();
+                    crate::wake_fiber(current_core, ctx_id);
+
                     (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
                 }
             } else {
@@ -241,7 +245,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                     // Sparse Polling for host threads too
                     if fixed_spins.trailing_zeros() >= 3 {
                         if let Some(id) = pool.alloc_context() {
-                            break id;
+                            break 'alloc id;
                         }
                     }
                 } else {
