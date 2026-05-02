@@ -118,6 +118,10 @@ pub struct FiberContext {
     pub(crate) tib_stack_base: usize,
     /// Thread ID of a non-fiber waiter (for C-FFI join).
     pub(crate) waiter_thread_id: AtomicU64,
+    /// Handle of a fiber waiter (for C-FFI join).
+    pub(crate) waiter_handle: AtomicU64,
+    /// Generation counter to prevent ABA in handles.
+    pub(crate) generation: AtomicU32,
     /// Link to the next available context in the free list.
     pub(crate) next_free: AtomicU32,
     /// Pointer to panic payload if the fiber crashed.
@@ -144,6 +148,8 @@ impl FiberContext {
             origin_core: 0,
             fiber_index: 0,
             waiter_thread_id: AtomicU64::new(0),
+            waiter_handle: AtomicU64::new(0),
+            generation: AtomicU32::new(0),
             regs: Registers::new(),
             executor_regs: Registers::new(),
             next_free: AtomicU32::new(u32::MAX),
@@ -465,6 +471,7 @@ impl ContextPool {
             (*ctx)
                 .state
                 .store(FiberStatus::Initial as u8, Ordering::Release);
+            (*ctx).generation.fetch_add(1, Ordering::SeqCst);
             crate::utils::futex_wake(&raw const (*ctx).state);
         };
 

@@ -309,11 +309,21 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         unsafe { invoke(arg) };
     }));
 
-    // Mark context as free for the lock-free pool
-    ctx.state.store(
-        crate::memory_management::FiberStatus::Initial as u8,
-        core::sync::atomic::Ordering::Release,
-    );
+    // Return context to pool (marks as Initial, wakes futex waiters, returns to free list)
+    let ctx_id = ctx.fiber_index;
+    if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
+        runtime.pool.free_context(ctx_id);
+    }
+
+    // Wake up any fiber waiting for this one (FFI join)
+    let waiter = ctx
+        .waiter_handle
+        .swap(0, core::sync::atomic::Ordering::SeqCst);
+    if waiter != 0 {
+        let waiter_ctx_id = (waiter & 0xFFFF_FFFF) as u32;
+        let waiter_core_id = (waiter >> 32) as usize;
+        crate::wake_fiber(waiter_core_id, waiter_ctx_id);
+    }
 
     // Execute cleanup if present (e.g. FFI arg free)
     if let Some(cleanup) = ctx.cleanup_fn.take() {
