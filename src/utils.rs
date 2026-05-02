@@ -41,16 +41,19 @@ pub fn rdtsc() -> u64 {
 pub fn get_cpu_fast() -> u32 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        #[allow(unused_assignments)]
         let mut aux: u32 = 0;
         #[cfg(feature = "hw-acceleration")]
         {
             // RDPID is non-serializing and unprivileged (fast-path).
             // Requires relatively new CPU (Haswell/Broadwell+ or newer).
+            let mut out: u64;
             core::arch::asm!(
-                "rdpid {0:e}",
-                out(reg) aux,
+                "rdpid {}",
+                out(reg) out,
                 options(nostack, preserves_flags),
             );
+            aux = out as u32;
         }
         #[cfg(not(feature = "hw-acceleration"))]
         {
