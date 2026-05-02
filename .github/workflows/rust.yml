@@ -25,8 +25,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (all-features)
         run: cargo check --all-features
-      - name: Install strace
-        run: sudo apt-get install -y strace
 
   test:
     name: Test
@@ -39,6 +37,8 @@ jobs:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install strace
+        run: sudo apt-get install -y strace
       - name: cargo test
         run: strace -e mprotect cargo test --all-features
 
