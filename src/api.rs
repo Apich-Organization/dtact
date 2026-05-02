@@ -1,7 +1,10 @@
-use crate::memory_management::{TopologyMode, WorkloadKind};
 use core::future::Future;
-
+use core::pin::Pin;
 pub use crate::c_ffi::dtact_handle_t;
+pub use crate::common_types::{TopologyMode, WorkloadKind};
+pub use crate::memory_management::{
+    ContextPool, FiberContext, FiberStatus, SafetyLevel,
+};
 pub use topology::Affinity;
 
 /// Scheduling Priority for fibers.
@@ -170,9 +173,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     /// # Panics
     /// * Panics if the runtime is not initialized.
     /// * Panics if the context pool is exhausted.
-    #[inline]
+    #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(self, fut: F) -> dtact_handle_t {
+    pub fn spawn<F: Future + Send + 'static>(self, fut: F) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME
             .get()
             .expect("Dtact Runtime not initialized");
@@ -197,8 +200,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             // Set adaptive spin count based on workload kind
             (*ctx_ptr).adaptive_spin_count = match self.kind {
                 WorkloadKind::Compute => 1000,
-                WorkloadKind::Memory => 500,
                 WorkloadKind::IO => 100,
+                WorkloadKind::Memory => 500,
+                WorkloadKind::System => 200,
             };
 
             // Aligned Zero-Copy Future Migration
@@ -228,7 +232,8 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 (*ctx_ptr).closure_ptr = fut_ptr.cast::<()>();
                 (*ctx_ptr).invoke_closure = |ptr| unsafe {
                     let mut f = Box::from_raw(ptr.cast::<F>());
-                    crate::future_bridge::wait(&mut *f);
+                    let f_pinned = Pin::new_unchecked(&mut *f);
+                    crate::future_bridge::wait_pinned(f_pinned);
                 };
                 (*ctx_ptr).cleanup_fn = None;
             } else {
@@ -238,7 +243,8 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 (*ctx_ptr).invoke_closure = |ptr| {
                     let f_ptr = ptr.cast::<F>();
                     unsafe {
-                        crate::future_bridge::wait(&mut *f_ptr);
+                        let f_pinned = Pin::new_unchecked(&mut *f_ptr);
+                        crate::future_bridge::wait_pinned(f_pinned);
                         core::ptr::drop_in_place(f_ptr);
                     }
                 };
@@ -464,8 +470,15 @@ pub mod topology {
 
 /// Spawns a new fiber and returns a handle for synchronization.
 #[inline(always)]
-pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(fut: F) -> dtact_handle_t {
+pub fn spawn<F: Future + Send + 'static>(fut: F) -> dtact_handle_t {
     SpawnBuilder::<CrossThreadFloat>::new().spawn(fut)
+}
+
+/// Returns a new `SpawnBuilder` for configuring a fiber.
+#[inline(always)]
+#[must_use] 
+pub const fn spawn_with() -> SpawnBuilder<CrossThreadFloat> {
+    SpawnBuilder::new()
 }
 
 /// Fiber configuration and construction utilities.

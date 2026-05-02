@@ -14,25 +14,7 @@ pub enum SafetyLevel {
     Safety2,
 }
 
-/// Hints to the scheduler about the expected behavior of a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkloadKind {
-    /// CPU-bound logic (default).
-    Compute,
-    /// Heavily blocked on external I/O.
-    IO,
-    /// Memory-intensive scanning or bulk transfers.
-    Memory,
-}
-
-/// Topology Strategy for the scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopologyMode {
-    /// Peer-to-Peer Mesh: Tasks are deflected to neighbors based on load.
-    P2PMesh,
-    /// Global: Tasks are shared across all cores via a common pool.
-    Global,
-}
+pub use crate::common_types::{TopologyMode, WorkloadKind};
 
 /// Machine-specific registers for context switching.
 ///
@@ -67,29 +49,63 @@ impl Default for Registers {
 }
 
 /// Lifecycle state of a fiber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum FiberStatus {
-    /// Not currently allocated.
+#[doc(hidden)]
+pub enum FiberStatus {
+    /// The fiber is initialized but has not yet started.
     Initial = 0,
-    /// Actively scheduled or running.
+    /// The fiber is currently executing on a physical core.
     Running = 1,
-    /// Voluntarily yielded to another fiber.
+    /// The fiber is suspended and waiting for an event (e.g. I/O or Mutex).
     Yielded = 2,
-    /// Execution finished successfully.
-    #[allow(dead_code)]
+    /// The fiber has successfully completed its execution.
     Finished = 3,
     /// Terminated due to an unhandled panic.
-    #[allow(dead_code)]
     Panicked = 4,
 }
 
-/// The control block and metadata for a single Dtact Fiber.
+/// The hardware-level execution context for a stackful fiber.
 ///
-/// This struct is placed at the top of each context slot, immediately
-/// below the 8KB zero-copy buffer.
+/// This structure is strictly aligned to 64 bytes to ensure that all
+/// register state and future data reside within a single cache line (or contiguous lines)
+/// to minimize L1/L2 misses during context switches.
 #[repr(C, align(64))]
-pub(crate) struct FiberContext {
+#[doc(hidden)]
+pub struct FiberContext {
+    /// Standard CPU registers (rax, rbx, etc.)
+    pub regs: Registers,
+    /// Return address for the scheduler dispatch loop.
+    pub executor_regs: Registers,
+    /// Fiber identification index.
+    pub fiber_index: u32,
+    /// The OS thread ID where this fiber was last executed.
+    pub last_os_thread_id: u64,
+    /// The hardware core ID where this fiber was originally spawned.
+    pub origin_core: u16,
+    /// Current execution state.
+    pub state: AtomicU8,
+    /// Pointer to the assembly context-switch function.
+    pub switch_fn: unsafe extern "C" fn(*mut Registers, *const Registers),
+    /// Pointer to the fiber's entry-point closure or future.
+    pub closure_ptr: *mut (),
+    /// Trampoline address for C-FFI or Rust closure invocation.
+    pub trampoline: unsafe extern "C" fn(),
+    /// Internal wrapper to drive the closure or poll the future.
+    pub invoke_closure: fn(*mut ()),
+    /// Optional cleanup callback (used for C-FFI ownership management).
+    pub cleanup_fn: Option<unsafe extern "C" fn(*mut ())>,
+    /// Pointer to the fiber's 8KB read/stack buffer.
+    pub read_buffer_ptr: *mut u8,
+    /// Metadata: Workload Hint.
+    pub kind: WorkloadKind,
+    /// Metadata: Topology Strategy.
+    pub mode: TopologyMode,
+    /// Statistics: Adaptive Spin Budget.
+    pub adaptive_spin_count: u32,
+    /// Statistics: Recent Spin Failures.
+    pub spin_failure_count: u32,
+
     /// Current stack pointer for this fiber.
     pub(crate) stack_ptr: usize,
     /// Saved stack pointer of the executor thread.
@@ -98,50 +114,18 @@ pub(crate) struct FiberContext {
     pub(crate) tib_stack_limit: usize,
     /// OS-specific TIB stack base (Windows).
     pub(crate) tib_stack_base: usize,
-    /// Current execution state.
-    pub(crate) state: AtomicU8,
-    /// Configured workload kind.
-    pub(crate) kind: WorkloadKind,
-    /// Configured topology mode.
-    pub(crate) mode: TopologyMode,
-    /// Core ID where this fiber was originally spawned.
-    pub(crate) origin_core: u16,
-    /// Unique index in the `ContextPool`.
-    pub(crate) fiber_index: u32,
     /// Thread ID of a non-fiber waiter (for C-FFI join).
     pub(crate) waiter_thread_id: AtomicU64,
-    /// Reserved GPR state.
-    pub(crate) regs: Registers,
-    /// Saved executor register state.
-    pub(crate) executor_regs: Registers,
     /// Link to the next available context in the free list.
     pub(crate) next_free: AtomicU32,
     /// Pointer to panic payload if the fiber crashed.
     pub(crate) panic_payload_ptr: *mut (),
-    /// Assembly entry point.
-    pub(crate) trampoline: unsafe extern "C" fn(),
-    /// Closure/Future invocation wrapper.
-    pub(crate) invoke_closure: unsafe fn(*mut ()),
-    /// Pointer to the closure or future.
-    pub(crate) closure_ptr: *mut (),
     /// Pointer to the result of the fiber.
     pub(crate) result_ptr: *mut (),
     /// Opaque pointer for reader bridge.
     pub(crate) reader_ptr: *mut (),
     /// Reference to a shared buffer.
     pub(crate) buf_ptr: *mut [u8],
-    /// The 8KB Zero-Copy buffer located just below this struct.
-    pub(crate) read_buffer_ptr: *mut u8,
-    /// Target assembly function for context switching.
-    pub(crate) switch_fn: unsafe extern "C" fn(*mut Registers, *const Registers),
-    /// Cleanup logic called when the fiber is destroyed.
-    pub(crate) cleanup_fn: Option<unsafe extern "C" fn(*mut ())>,
-    /// Adaptive spin count for futex synchronization.
-    pub(crate) adaptive_spin_count: u32,
-    /// Number of consecutive spin failures.
-    pub(crate) spin_failure_count: u32,
-    /// Last OS thread ID that executed this fiber.
-    pub(crate) last_os_thread_id: u64,
 }
 
 impl FiberContext {
@@ -179,7 +163,7 @@ impl FiberContext {
 }
 
 const unsafe extern "C" fn dummy_trampoline() {}
-const unsafe fn dummy_invoke(_: *mut ()) {}
+const fn dummy_invoke(_: *mut ()) {}
 
 /// A page-aligned arena for managing fiber stacks and control blocks.
 ///

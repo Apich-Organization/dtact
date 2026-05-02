@@ -282,14 +282,7 @@ pub struct CpuLevel {
     pub numa_id: u16,
 }
 
-/// Topology Strategy for the scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TopologyMode {
-    /// Peer-to-Peer Mesh: Tasks are deflected to neighbors based on load.
-    P2PMesh,
-    /// Global: Tasks are shared across all cores via a common pool (unsupported in V3).
-    Global,
-}
+pub use crate::common_types::TopologyMode;
 
 /// Execution unit managed by a single OS thread.
 ///
@@ -392,7 +385,8 @@ impl Worker {
     #[inline(always)]
     pub fn push_local(&mut self, task: TaskIndex) {
         unsafe {
-            (*self.local_queue.ptr)[self.local_tail] = task;
+            let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
+            *buffer_ptr.add(self.local_tail) = task;
         }
         self.local_tail = (self.local_tail + 1) & LOCAL_QUEUE_MASK;
     }
@@ -447,7 +441,10 @@ impl Worker {
         group_guard_size: usize,
     ) {
         while self.local_head != self.local_tail {
-            let task = (unsafe { *self.local_queue.ptr })[self.local_head];
+            let task = unsafe {
+                let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
+                *buffer_ptr.add(self.local_head)
+            };
             self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
 
             let group_offset = (task as usize >> 5) * group_guard_size;
@@ -632,23 +629,27 @@ impl DtaScheduler {
         worker.tick();
     }
 
-    /// Main heartbeat loop for a worker thread.
+    /// Main heartbeat loop for a worker thread with cooperative shutdown.
     ///
-    /// Manages the full lifecycle of fiber execution: local dispatch,
-    /// P2P polling, and hardware-assisted backoff (UMWAIT, WFE, PAUSE).
+    /// Same as `run_worker`, but periodically checks a shutdown flag to enable
+    /// clean thread termination (critical for test harnesses and process exit).
     ///
     /// # Safety
-    /// This function performs raw stack-swapping and memory-access-guard manipulation.
-    /// * `context_base` must be a valid pointer to the runtime's context arena.
+    /// Same safety requirements as `run_worker`.
     #[inline]
-    pub unsafe fn run_worker(
+    pub unsafe fn run_worker_with_shutdown(
         &self,
         current_core: usize,
         context_base: *mut u8,
         context_size: usize,
         group_guard_size: usize,
+        shutdown: &core::sync::atomic::AtomicBool,
     ) {
         loop {
+            if shutdown.load(core::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+
             unsafe {
                 let worker = &mut *self.workers[current_core].get();
                 worker.dispatch_loop(context_base, context_size, group_guard_size);
@@ -690,10 +691,7 @@ impl DtaScheduler {
                             );
                         }
                     }
-                    #[cfg(all(
-                        not(feature = "hw-acceleration"),
-                        any(target_arch = "x86_64", target_arch = "x86")
-                    ))]
+                    #[cfg(not(feature = "hw-acceleration"))]
                     {
                         core::hint::spin_loop();
                     }

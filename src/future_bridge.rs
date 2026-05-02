@@ -98,13 +98,25 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
         );
     }
 
+    let _ = ctx;
+    let _ = tid;
+
+    // Pin the future to the local fiber stack footprint safely.
+    let fut_pinned = unsafe { Pin::new_unchecked(&mut fut) };
+    wait_pinned(fut_pinned)
+}
+
+/// Drives a pinned future to completion within the current fiber context.
+#[doc(hidden)]
+#[inline(always)]
+pub fn wait_pinned<F: Future>(mut fut_pinned: Pin<&mut F>) -> F::Output {
+    let ctx_ptr = CURRENT_FIBER.with(std::cell::Cell::get);
+    let ctx = unsafe { &mut *ctx_ptr };
+
     // Construct the Lock-Free, Zero-Cost Waker
     let raw_waker = RawWaker::new(ctx_ptr as *const (), &DTACT_WAKER_VTABLE);
     let waker = unsafe { Waker::from_raw(raw_waker) };
     let mut cx = Context::from_waker(&waker);
-
-    // Pin the future to the local fiber stack footprint safely.
-    let mut fut_pinned = unsafe { Pin::new_unchecked(&mut fut) };
 
     loop {
         match fut_pinned.as_mut().poll(&mut cx) {

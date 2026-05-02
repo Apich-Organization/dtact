@@ -13,6 +13,9 @@ libc = "0.2"
 tokio = { version = "1.50", default-features = false }
 dtact-macros = { path = "./dtact-macros", version = "0.1.0" }
 
+[dev-dependencies]
+proptest = "1.6"
+
 [profile.bench]
 codegen-units = 1
 debug = 1

@@ -103,6 +103,8 @@ pub use dtact_macros::export_fiber;
 /// Attribute macro for defining a Dtact task.
 pub use dtact_macros::task;
 
+/// Common types used across the Dtact runtime.
+pub mod common_types;
 /// Public user-facing API for spawning and managing fibers.
 #[doc(hidden)]
 pub mod api;
@@ -137,16 +139,53 @@ pub use api::*;
 #[doc(hidden)]
 pub struct Runtime {
     /// The distributed P2P work-deflection scheduler.
-    pub(crate) scheduler: dta_scheduler::DtaScheduler,
+    pub scheduler: dta_scheduler::DtaScheduler,
     /// The lock-free arena for managing fiber stacks and contexts.
-    pub(crate) pool: memory_management::ContextPool,
+    pub pool: memory_management::ContextPool,
+    /// Flag indicating if the worker threads have been started.
+    pub started: core::sync::atomic::AtomicBool,
+    /// Cooperative shutdown signal for worker threads.
+    pub shutdown: core::sync::atomic::AtomicBool,
+}
+
+impl Runtime {
+    /// Spawns the OS worker threads for the scheduler.
+    pub fn start(&'static self) {
+        if self
+            .started
+            .swap(true, core::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+
+        let workers_count = self.scheduler.workers.len();
+        let (base_ptr, slot_sz, guard_sz) = self.pool.get_dispatch_layout();
+        let base_addr = base_ptr as usize;
+
+        for i in 0..workers_count {
+            // Each closure must capture its own copy of these values.
+            let sched: &'static dta_scheduler::DtaScheduler = &self.scheduler;
+            let shutdown: &'static core::sync::atomic::AtomicBool = &self.shutdown;
+            let my_base = base_addr;
+            let my_slot = slot_sz;
+            let my_guard = guard_sz;
+            let my_id = i;
+
+            std::thread::Builder::new()
+                .name(format!("dtact-worker-{}", my_id))
+                .spawn(move || unsafe {
+                    sched.run_worker_with_shutdown(my_id, my_base as *mut u8, my_slot, my_guard, shutdown);
+                })
+                .expect("Failed to spawn Dtact worker thread");
+        }
+    }
 }
 
 /// Global Singleton for the Runtime Environment.
 ///
 /// This is initialized exactly once per process via `dtact_init` or
 /// implicit autostart triggers in the proc-macro layer.
-pub(crate) static GLOBAL_RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+pub static GLOBAL_RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
 
 /// Telemetry: Tracks fibers that failed the 8KB zero-copy check and fell back to heap allocation.
 ///

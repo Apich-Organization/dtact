@@ -261,35 +261,48 @@ pub fn dtact_init(args: TokenStream, item: TokenStream) -> TokenStream {
 
     let topology_ident = syn::Ident::new(topology, input.sig.ident.span());
     let safety_ident = syn::Ident::new(safety, input.sig.ident.span());
+    let autostart_fn_name = syn::Ident::new("dtact_autostart", input.sig.ident.span());
+
+    let attrs = &input.attrs;
+    let vis = &input.vis;
+    let sig = &input.sig;
+    let block = &input.block;
 
     let expanded = quote! {
-        #input
+        #[unsafe(no_mangle)]
+        extern "C" fn #autostart_fn_name() {
+            let runtime = dtact::GLOBAL_RUNTIME.get_or_init(|| {
+                let mut workers_count = #workers;
+                if workers_count == 0 {
+                    workers_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+                }
 
-        const _: () = {
-            #[unsafe(no_mangle)]
-            extern "C" fn dtact_autostart() {
-                dtact::GLOBAL_RUNTIME.get_or_init(|| {
-                    let mut workers_count = #workers;
-                    if workers_count == 0 {
-                        workers_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-                    }
+                let scheduler = dtact::dta_scheduler::DtaScheduler::new(
+                    workers_count,
+                    dtact::dta_scheduler::TopologyMode::#topology_ident
+                );
 
-                    let scheduler = dtact::dta_scheduler::DtaScheduler::new(
-                        workers_count,
-                        dtact::dta_scheduler::TopologyMode::#topology_ident
-                    );
+                let pool = dtact::memory_management::ContextPool::new(
+                    #capacity,
+                    #stack,
+                    dtact::memory_management::SafetyLevel::#safety_ident,
+                    #numa
+                ).expect("DTA-V3 Hardware Initialization Failed");
 
-                    let pool = dtact::memory_management::ContextPool::new(
-                        #capacity,
-                        #stack,
-                        dtact::memory_management::SafetyLevel::#safety_ident,
-                        #numa
-                    ).expect("DTA-V3 Hardware Initialization Failed");
+                dtact::Runtime { 
+                    scheduler, 
+                    pool,
+                    started: core::sync::atomic::AtomicBool::new(false),
+                    shutdown: core::sync::atomic::AtomicBool::new(false),
+                }
+            });
+            runtime.start();
+        }
 
-                    dtact::Runtime { scheduler, pool }
-                });
-            }
-        };
+        #(#attrs)* #vis #sig {
+            #autostart_fn_name();
+            #block
+        }
     };
 
     TokenStream::from(expanded)
