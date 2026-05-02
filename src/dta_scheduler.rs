@@ -55,8 +55,21 @@ pub struct HugeBuffer<T> {
     pub size_bytes: usize,
 }
 
+unsafe impl<T> Send for HugeBuffer<T> {}
+unsafe impl<T> Sync for HugeBuffer<T> {}
+
+impl<T> Default for HugeBuffer<T> {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> HugeBuffer<T> {
     /// Allocates a new `HugeBuffer` using OS-specific huge page primitives.
+    /// 
+    /// # Panics
+    /// Panics if the OS fails to allocate memory (even after fallback to 4KB pages).
     #[inline]
     #[must_use] 
     pub fn new() -> Self {
@@ -161,6 +174,13 @@ pub struct Mailbox {
 unsafe impl Sync for Mailbox {}
 unsafe impl Send for Mailbox {}
 
+impl Default for Mailbox {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Mailbox {
     /// Creates a new, empty Mailbox.
     #[inline(always)]
@@ -179,7 +199,11 @@ impl Mailbox {
     /// 
     /// Utilizes hardware-specific demote/clean instructions to accelerate
     /// visibility of the updated tail pointer to the consumer core.
+    /// 
+    /// # Errors
+    /// Returns the `TaskChunk` back to the caller if the mailbox is full.
     #[inline(always)]
+    #[allow(clippy::result_large_err)]
     pub fn push(&self, chunk: TaskChunk) -> Result<(), TaskChunk> {
         let current_tail = self.tail.load(Ordering::Relaxed);
         let next_tail = (current_tail + 1) & MAILBOX_MASK;
@@ -285,6 +309,7 @@ impl Worker {
     /// Creates a new `Worker` and calculates its CCX-aware polling order.
     #[inline(always)]
     #[must_use] 
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(cpu: CpuLevel, total_cores: usize) -> Self {
         let mut polling_order = Vec::with_capacity(total_cores - 1);
         let my_core = cpu.core_id as usize;
@@ -323,6 +348,7 @@ impl Worker {
     #[inline(always)]
     pub fn update_load(&self) {
         let queue_len = self.local_queue_len();
+        #[allow(clippy::cast_possible_truncation)]
         let load = core::cmp::min((queue_len * 100) >> 13, 100) as u8;
         self.load_level.store(load, Ordering::Relaxed);
     }
@@ -331,7 +357,7 @@ impl Worker {
     #[inline(always)]
     pub fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
-        if (self.ticks & 1023) == 0 {
+        if self.ticks.trailing_zeros() >= 10 {
             let load = self.load_level.load(Ordering::Relaxed);
             let current_thresh = self.deflection_threshold.load(Ordering::Relaxed);
             
@@ -394,14 +420,19 @@ impl Worker {
     /// 
     /// Drains the local queue, performs O(1) context alignment, and executes
     /// the context switch to the fiber.
+    /// 
+    /// # Safety
+    /// * `context_base` must point to the start of the `ContextPool` memory region.
+    /// * `context_size` and `group_guard_size` must match the pool's initialized layout.
     #[inline(always)]
-    pub fn dispatch_loop(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
+    pub unsafe fn dispatch_loop(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         while self.local_head != self.local_tail {
             let task = (unsafe { *self.local_queue.ptr })[self.local_head];
             self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
             
             let group_offset = (task as usize >> 5) * group_guard_size;
             let target_ptr = unsafe {
+                #[allow(clippy::cast_ptr_alignment)]
                 context_base.add((task as usize) * context_size + group_offset).cast::<crate::memory_management::FiberContext>()
             };
             
@@ -460,6 +491,7 @@ impl DtaScheduler {
         let mut mailboxes = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
+            #[allow(clippy::cast_possible_truncation)]
             workers.push(UnsafeCell::new(Worker::new(CpuLevel {
                 core_id: i as u16,
                 ccx_id: (i / 8) as u16,
@@ -529,7 +561,9 @@ impl DtaScheduler {
         let load = worker_ref.load_level.load(Ordering::Relaxed);
 
         let deflect_mask = if load > threshold { usize::MAX } else { 0 };
+        #[allow(clippy::cast_possible_truncation)]
         let h1 = (flow_id & 7) as usize; 
+        #[allow(clippy::cast_possible_truncation)]
         let h2 = ((flow_id >> 3) & 7 | 1) as usize; 
 
         let ccx_base = source_core & !7;
@@ -565,8 +599,12 @@ impl DtaScheduler {
     /// 
     /// Manages the full lifecycle of fiber execution: local dispatch,
     /// P2P polling, and hardware-assisted backoff (UMWAIT, WFE, PAUSE).
+    /// 
+    /// # Safety
+    /// This function performs raw stack-swapping and memory-access-guard manipulation.
+    /// * `context_base` must be a valid pointer to the runtime's context arena.
     #[inline]
-    pub fn run_worker(&self, current_core: usize, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
+    pub unsafe fn run_worker(&self, current_core: usize, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         loop {
             unsafe {
                 let worker = &mut *self.workers[current_core].get();
@@ -600,8 +638,8 @@ impl DtaScheduler {
                                 in(reg) tail_ptr,
                                 in(reg) worker.local_queue_len(),
                                 in(reg) control,
-                                inout("eax") 0xFFFFFFFFu32 => _,
-                                inout("edx") 0xFFFFFFFFu32 => _,
+                                inout("eax") 0xFFFF_FFFF_u32 => _,
+                                inout("edx") 0xFFFF_FFFF_u32 => _,
                                 options(nostack, preserves_flags)
                             );
                         }

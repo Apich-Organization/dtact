@@ -79,6 +79,10 @@ thread_local! {
 ///   historical resolution latency.
 /// - **Thread-Migration Guard**: Detects and panics if the OS migrates the 
 ///   fiber's thread while it's executing a stack-pinned future.
+/// 
+/// # Panics
+/// - Panics if called outside of a DTA-V3 Fiber context.
+/// - Panics if illegal OS thread migration is detected, as it would violate stack-pinned invariants.
 #[inline(always)]
 pub fn wait<F: Future>(mut fut: F) -> F::Output {
     let ctx_ptr = CURRENT_FIBER.with(std::cell::Cell::get);
@@ -120,7 +124,7 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
                         core::hint::spin_loop();
                         
                         // Sparse Polling: Reduce L1 pressure by only polling every 8 hints.
-                        if i & 7 == 0
+                        if i.trailing_zeros() >= 3
                             && let Poll::Ready(output) = fut_pinned.as_mut().poll(&mut cx) {
                                 ctx.adaptive_spin_count = (current_spin + 2).min(200);
                                 ctx.spin_failure_count = failure_count.saturating_sub(1);

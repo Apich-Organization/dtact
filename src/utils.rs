@@ -108,9 +108,12 @@ pub fn get_tick_with_cpu() -> (u64, u32) {
 /// 
 /// Utilizes the Linux `FUTEX_WAIT` system call for efficient, zero-CPU
 /// blocking of host threads awaiting fiber completion.
+/// 
+/// # Safety
+/// * `addr` must point to a valid `AtomicU8`.
 #[cfg(target_os = "linux")]
 #[inline(always)]
-pub fn futex_wait(addr: *const core::sync::atomic::AtomicU8, val: u8) {
+pub unsafe fn futex_wait(addr: *const core::sync::atomic::AtomicU8, val: u8) {
     unsafe {
         loop {
             let ret = libc::syscall(
@@ -122,16 +125,19 @@ pub fn futex_wait(addr: *const core::sync::atomic::AtomicU8, val: u8) {
             );
             if ret == 0 { break; }
             let err = *libc::__errno_location();
-            if err == libc::EAGAIN || err == libc::EINTR { break; }
+            if err == libc::EAGAIN || err == libc::EINTR { continue; }
             break; // Other errors
         }
     }
 }
 
 /// Wakes all OS threads currently blocked on the specified address.
+/// 
+/// # Safety
+/// * `addr` must point to a valid `AtomicU8`.
 #[cfg(target_os = "linux")]
 #[inline(always)]
-pub fn futex_wake(addr: *const core::sync::atomic::AtomicU8) {
+pub unsafe fn futex_wake(addr: *const core::sync::atomic::AtomicU8) {
     unsafe {
         libc::syscall(
             libc::SYS_futex, 
@@ -169,9 +175,9 @@ pub fn get_thread_id() -> u64 {
         let mut tid = c.get();
         if tid == 0 {
             #[cfg(target_os = "linux")]
-            unsafe { tid = libc::syscall(libc::SYS_gettid) as u64; }
+            unsafe { tid = libc::syscall(libc::SYS_gettid).cast_unsigned(); }
             #[cfg(target_os = "windows")]
-            unsafe { tid = windows_sys::Win32::System::Threading::GetCurrentThreadId() as u64; }
+            unsafe { tid = windows_sys::Win32::System::Threading::GetCurrentThreadId().cast_unsigned(); }
             c.set(tid);
         }
         tid

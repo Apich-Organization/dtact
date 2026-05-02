@@ -32,9 +32,13 @@ pub const extern "C" fn dtact_default_config() -> dtact_config_t {
 /// Initializes the global Dtact runtime singleton.
 /// 
 /// # Safety
-/// This function should be called once at application startup.
+/// * This function should be called once at application startup.
+/// * `cfg` must be a valid, non-null pointer to a `dtact_config_t` structure.
+/// 
+/// # Panics
+/// * Panics if the runtime is already initialized or if memory allocation fails.
 #[unsafe(no_mangle)]
-pub extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
+pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
     let cfg = unsafe { &*cfg };
     let _workers = if cfg.workers == 0 { 
         crate::api::topology::current().core_id as usize + 1 
@@ -44,13 +48,11 @@ pub extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
 
     let safety = match cfg.safety_level {
         0 => SafetyLevel::Safety0,
-        1 => SafetyLevel::Safety1,
         2 => SafetyLevel::Safety2,
         _ => SafetyLevel::Safety1,
     };
 
     let topology = match cfg.topology_mode {
-        0 => TopologyMode::P2PMesh,
         1 => TopologyMode::Global,
         _ => TopologyMode::P2PMesh,
     };
@@ -79,8 +81,11 @@ pub extern "C" fn dtact_abort() -> ! {
 }
 
 /// Frees an argument pointer previously allocated for a fiber.
+/// 
+/// # Safety
+/// * `arg` must be a valid pointer previously allocated by the C allocator (e.g. `malloc`).
 #[unsafe(no_mangle)]
-pub extern "C" fn dtact_free_arg(arg: *mut c_void) {
+pub unsafe extern "C" fn dtact_free_arg(arg: *mut c_void) {
     if !arg.is_null() {
         unsafe {
             // Assumes standard C allocator (malloc/free)
@@ -96,8 +101,13 @@ pub extern "C" fn dtact_free_arg(arg: *mut c_void) {
 /// * `arg` must point to memory that remains valid for the entire duration of the fiber's execution.
 ///   Since the fiber is launched asynchronously, the caller's stack may return before the fiber starts.
 ///   **Critical**: `arg` must be heap-allocated (and freed within the fiber) or static.
+/// 
+/// # Panics
+/// * Panics if the runtime is not initialized.
+/// * Panics if the context pool is exhausted.
 #[unsafe(no_mangle)]
-pub extern "C" fn dtact_fiber_launch(
+#[allow(clippy::cast_possible_truncation)]
+pub unsafe extern "C" fn dtact_fiber_launch(
     func: extern "C" fn(*mut c_void),
     arg: *mut c_void,
 ) -> dtact_handle_t {
@@ -106,6 +116,7 @@ pub extern "C" fn dtact_fiber_launch(
     let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
     
     let ctx_ptr = pool.get_context_ptr(ctx_id);
+    #[allow(clippy::cast_possible_truncation)]
     let current_core = crate::api::topology::current().core_id as usize;
 
     unsafe {
@@ -115,7 +126,7 @@ pub extern "C" fn dtact_fiber_launch(
         (*ctx_ptr).switch_fn = crate::context_switch::switch_context_cross_thread_float;
         
         (*ctx_ptr).closure_ptr = arg.cast::<()>();
-        (*ctx_ptr).trampoline = core::mem::transmute(func);
+        (*ctx_ptr).trampoline = core::mem::transmute::<extern "C" fn(*mut c_void), unsafe extern "C" fn()>(func);
         
         // Unified Trampoline for C-Functions
         (*ctx_ptr).invoke_closure = |ptr| {
@@ -162,8 +173,13 @@ pub extern "C" fn dtact_fiber_launch(
 /// # Safety
 /// * `func` and `cleanup` must be valid function pointers.
 /// * `cleanup` will be called with `arg` once the fiber has finished execution.
+/// 
+/// # Panics
+/// * Panics if the runtime is not initialized.
+/// * Panics if the context pool is exhausted.
 #[unsafe(no_mangle)]
-pub extern "C" fn dtact_fiber_launch_with_cleanup(
+#[allow(clippy::cast_possible_truncation)]
+pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
     func: extern "C" fn(*mut c_void),
     arg: *mut c_void,
     cleanup: unsafe extern "C" fn(*mut c_void),
@@ -173,6 +189,7 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
     let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
     
     let ctx_ptr = pool.get_context_ptr(ctx_id);
+    #[allow(clippy::cast_possible_truncation)]
     let current_core = crate::api::topology::current().core_id as usize;
 
     unsafe {
@@ -182,13 +199,13 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
         (*ctx_ptr).switch_fn = crate::context_switch::switch_context_cross_thread_float;
         
         (*ctx_ptr).closure_ptr = arg.cast::<()>();
-        (*ctx_ptr).trampoline = core::mem::transmute(func);
-        (*ctx_ptr).cleanup_fn = Some(core::mem::transmute(cleanup));
+        (*ctx_ptr).trampoline = core::mem::transmute::<extern "C" fn(*mut c_void), unsafe extern "C" fn()>(func);
+        (*ctx_ptr).cleanup_fn = Some(core::mem::transmute::<unsafe extern "C" fn(*mut c_void), unsafe extern "C" fn(*mut ())>(cleanup));
         
         // Unified Trampoline for C-Functions
         (*ctx_ptr).invoke_closure = |ptr| {
             let ctx = &mut *ptr.cast::<crate::memory_management::FiberContext>();
-            let f: extern "C" fn(*mut c_void) = core::mem::transmute(ctx.trampoline);
+            let f: extern "C" fn(*mut c_void) = core::mem::transmute::<unsafe extern "C" fn(), extern "C" fn(*mut c_void)>(ctx.trampoline);
             f(ctx.closure_ptr.cast::<c_void>());
         };
         
@@ -225,13 +242,16 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
 /// If called from a Dtact fiber, this will natively yield the physical core.
 /// If called from a non-managed thread (e.g., C main), this uses a tiered
 /// spin-loop and futex-wait strategy for zero-CPU idling.
+/// 
+/// # Panics
+/// * Panics if the runtime is not initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
     if ctx_ptr.is_null() {
         // UNIVERSAL WAIT: If called from a non-Fiber thread (e.g., C++ main), 
         // we use a tiered strategy: spin-loop -> futex_wait.
-        let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
+        let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
         let runtime = crate::GLOBAL_RUNTIME.get().expect("Runtime not initialized");
         let pool = &runtime.pool;
         let target_ctx = pool.get_context_ptr(target_ctx_id);
@@ -253,7 +273,7 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
         return;
     }
 
-    let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
+    let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
     let runtime = crate::GLOBAL_RUNTIME.get().expect("Runtime not initialized");
     let pool = &runtime.pool;
     let target_ctx = pool.get_context_ptr(target_ctx_id);
@@ -280,6 +300,9 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
 
 /// Spawns the hardware worker threads and starts the Dtact runtime.
 /// This call blocks until all worker threads terminate.
+/// 
+/// # Panics
+/// * Panics if the runtime is not initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_run(_rt: *mut c_void) {
     let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
@@ -298,7 +321,7 @@ pub extern "C" fn dtact_run(_rt: *mut c_void) {
         let handle = std::thread::spawn(move || {
             let s = unsafe { &*(scheduler_ptr as *const crate::dta_scheduler::DtaScheduler) };
             let b = base_ptr as *mut u8;
-            s.run_worker(i, b, sz, guard_sz);
+            unsafe { s.run_worker(i, b, sz, guard_sz) };
         });
         handles.push(handle);
     }

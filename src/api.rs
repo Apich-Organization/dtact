@@ -58,6 +58,13 @@ pub struct SpawnBuilder<S: ContextSwitcher = CrossThreadFloat> {
     _marker: core::marker::PhantomData<S>,
 }
 
+impl<S: ContextSwitcher> Default for SpawnBuilder<S> {
+    #[inline(always)]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<S: ContextSwitcher> SpawnBuilder<S> {
     /// Creates a new builder with default settings:
     /// Normal priority, Compute kind, P2P Mesh mode, and Safety0 (raw performance).
@@ -129,13 +136,19 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     /// 1. Attempts to place the Future directly at the top of the fiber stack.
     /// 2. If the Future is too large (>8KB), falls back to heap allocation.
     /// 3. Configures the assembly trampoline for the selected `ContextSwitcher`.
+    /// 
+    /// # Panics
+    /// * Panics if the runtime is not initialized.
+    /// * Panics if the context pool is exhausted.
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(self, fut: F) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
         let pool = &runtime.pool;
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         
         let ctx_ptr = pool.get_context_ptr(ctx_id);
+        #[allow(clippy::cast_possible_truncation)]
         let current_core = topology::current().core_id as usize;
 
         unsafe {
@@ -323,30 +336,30 @@ pub mod topology {
             let (x2apic_id, core_shift, package_shift): (u32, u32, u32);
             
             unsafe {
-                let (mut eax, mut _ebx, mut _ecx, mut edx): (u32, u32, u32, u32);
+                let (mut eax, mut edx_v): (u32, u32);
                 core::arch::asm!(
                     "push rbx",
                     "cpuid",
                     "mov {ebx_out:e}, rbx",
                     "pop rbx",
-                    ebx_out = out(reg) _ebx,
+                    ebx_out = out(reg) _,
                     inout("eax") 0x0B => eax,
-                    inout("ecx") 0 => _ecx,
-                    out("edx") edx,
+                    inout("ecx") 0 => _,
+                    out("edx") edx_v,
                 );
                 core_shift = eax;
-                x2apic_id = edx;
+                x2apic_id = edx_v;
                 
-                let (mut eax_p, mut _ebx_p, mut _ecx_p, mut _edx_p): (u32, u32, u32, u32);
+                let eax_p: u32;
                 core::arch::asm!(
                     "push rbx",
                     "cpuid",
                     "mov {ebx_out:e}, rbx",
                     "pop rbx",
-                    ebx_out = out(reg) _ebx_p,
+                    ebx_out = out(reg) _,
                     inout("eax") 0x0B => eax_p,
-                    inout("ecx") 1 => _ecx_p,
-                    out("edx") _edx_p,
+                    inout("ecx") 1 => _,
+                    out("edx") _,
                 );
                 package_shift = eax_p;
             }
@@ -356,9 +369,9 @@ pub mod topology {
             let numa_id = x2apic_id >> package_shift;
 
             CpuLevel {
-                core_id: core_id as u16,
-                ccx_id: ccx_id as u16,
-                numa_id: numa_id as u16,
+                core_id: (core_id & 0xFFFF) as u16,
+                ccx_id: (ccx_id & 0xFFFF) as u16,
+                numa_id: (numa_id & 0xFFFF) as u16,
             }
         }
 
@@ -416,12 +429,18 @@ pub mod spawn {
 pub mod fiber {
     use super::{dtact_handle_t, topology};
     /// Spawns a fiber from a closure with a specific stack configuration.
+    /// 
+    /// # Panics
+    /// * Panics if the runtime is not initialized.
+    /// * Panics if the context pool is exhausted.
     #[inline]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(_stack_size_str: &str, f: F) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
         let pool = &runtime.pool;
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         let ctx_ptr = pool.get_context_ptr(ctx_id);
+        #[allow(clippy::cast_possible_truncation)]
         let current_core = topology::current().core_id as usize;
 
         unsafe {
@@ -476,7 +495,7 @@ pub mod fiber {
         let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
         if ctx_ptr.is_null() { return; } 
         
-        let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
+        let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
         let target_core_id = (handle.0 >> 32) as usize;
         
         crate::wake_fiber(target_core_id, target_ctx_id);
@@ -555,7 +574,7 @@ pub async fn yield_now() {
 /// Yields execution to another fiber handle asynchronously.
 #[inline(always)]
 pub async fn yield_to(handle: dtact_handle_t) {
-    let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
+    let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
     let target_core_id = (handle.0 >> 32) as usize;
     crate::wake_fiber(target_core_id, target_ctx_id);
     yield_now().await;

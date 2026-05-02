@@ -204,6 +204,10 @@ impl ContextPool {
     /// 
     /// This function performs the initial bulk allocation (via mmap or 
     /// `VirtualAlloc`) and configures any requested hardware guard pages.
+    /// 
+    /// # Errors
+    /// Returns an error if the OS fails to allocate the requested memory region 
+    /// or if hardware protection cannot be applied to the guard pages.
     pub fn new(capacity: u32, stack_size: usize, safety: SafetyLevel, _numa: usize) -> Result<Self, &'static str> {
         let page_size = 4096;
         let align = 64;
@@ -352,12 +356,14 @@ impl ContextPool {
 
         unsafe {
             let slot_base = self.base_ptr.add(index as usize * self.slot_size + guard_offset);
+            #[allow(clippy::cast_ptr_alignment)]
             slot_base.add(self.slot_size - context_sz).cast::<FiberContext>()
         }
     }
 
     /// O(1) Pop from the free list with ABA protection.
     #[inline(always)]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn alloc_context(&self) -> Option<u32> {
         let mut head = self.free_head.load(Ordering::Acquire);
         loop {
@@ -379,6 +385,7 @@ impl ContextPool {
 
     /// Returns a context to the free list.
     #[inline(always)]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn free_context(&self, index: u32) {
         let ctx = self.get_context_ptr(index);
         

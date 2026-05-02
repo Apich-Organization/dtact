@@ -22,6 +22,10 @@ use core::arch::naked_asm;
 /// 
 /// Supports cross-thread migration by saving/restoring the full callee-saved
 /// register set and extended SIMD state (FXSAVE/FXRSTOR).
+/// 
+/// # Safety
+/// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
+/// * The stack pointer in `restore` must point to a valid stack region.
 #[cfg(all(target_arch = "x86_64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_cross_thread_float(
@@ -339,6 +343,10 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 /// 
 /// Optimized for non-numerical tasks, significantly reducing the memory
 /// footprint of each switch by ignoring the extended SIMD context.
+/// 
+/// # Safety
+/// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
+/// * The stack pointer in `restore` must point to a valid stack region.
 #[cfg(all(target_arch = "x86_64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_cross_thread_no_float(
@@ -528,6 +536,10 @@ pub unsafe extern "C" fn switch_context_cross_thread_no_float(
 /// 
 /// Skips the preservation of OS-specific TIB/TEB metadata, assuming the
 /// target fiber will always execute on the same physical host thread.
+/// 
+/// # Safety
+/// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
+/// * The stack pointer in `restore` must point to a valid stack region.
 #[cfg(all(target_arch = "x86_64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_same_thread_float(
@@ -733,6 +745,10 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 /// 
 /// Utilizes aggressive hardware prefetching (`prefetcht0` / `prfm`) to 
 /// eliminate memory stalls during local fiber handoffs.
+/// 
+/// # Safety
+/// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
+/// * The stack pointer in `restore` must point to a valid stack region.
 #[cfg(all(target_arch = "x86_64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_same_thread_no_float(
