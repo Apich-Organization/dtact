@@ -4,6 +4,7 @@
 /// This is a non-serializing instruction designed for maximum performance 
 /// and minimum pipeline disturbance.
 #[inline(always)]
+#[must_use] 
 pub fn rdtsc() -> u64 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     unsafe {
@@ -28,8 +29,9 @@ pub fn rdtsc() -> u64 {
 /// Fast Core ID hint.
 /// 
 /// Attempts to retrieve the current Core ID using the fastest available
-/// non-serializing hardware instruction (e.g. RDPID on x86_64).
+/// non-serializing hardware instruction (e.g. RDPID on `x86_64`).
 #[inline(always)]
+#[must_use] 
 pub fn get_cpu_fast() -> u32 {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -66,6 +68,7 @@ pub fn get_cpu_fast() -> u32 {
 /// A thin wrapper around `rdtsc` used for microsecond-level latency 
 /// measurements within the scheduler dispatch loop.
 #[inline(always)]
+#[must_use] 
 pub fn get_tick() -> u64 {
     rdtsc()
 }
@@ -76,6 +79,7 @@ pub fn get_tick() -> u64 {
 /// enabled, this function uses serializing instructions (LFENCE) to ensure
 /// timestamp monotonicity even across VM migrations.
 #[inline(always)]
+#[must_use] 
 pub fn get_tick_with_cpu() -> (u64, u32) {
     #[cfg(feature = "hypervisor")]
     {
@@ -113,7 +117,7 @@ pub fn futex_wait(addr: *const core::sync::atomic::AtomicU8, val: u8) {
                 libc::SYS_futex, 
                 addr, 
                 libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG, 
-                val as libc::c_int, 
+                libc::c_int::from(val), 
                 core::ptr::null::<libc::timespec>()
             );
             if ret == 0 { break; }
@@ -159,6 +163,7 @@ std::thread_local! {
 /// Caches the thread ID in thread-local storage after the first lookup 
 /// to avoid repeated system call overhead.
 #[inline(always)]
+#[must_use] 
 pub fn get_thread_id() -> u64 {
     CACHED_TID.with(|c| {
         let mut tid = c.get();

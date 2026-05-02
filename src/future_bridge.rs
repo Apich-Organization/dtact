@@ -7,7 +7,7 @@ use core::sync::atomic::Ordering;
 
 use crate::memory_management::{FiberContext, FiberStatus};
 
-/// VTable for the Zero-Cost Dtact Waker.
+/// `VTable` for the Zero-Cost Dtact Waker.
 /// 
 /// This waker bypasses the standard `Arc` reference counting overhead by
 /// pinning wakes directly to the arena-managed `FiberContext`. Since the
@@ -32,7 +32,7 @@ unsafe fn wake_impl(data: *const ()) {
 
 #[inline(always)]
 unsafe fn wake_by_ref_impl(data: *const ()) {
-    let ctx = unsafe { &*(data as *const FiberContext) };
+    let ctx = unsafe { &*data.cast::<FiberContext>() };
 
     // CAS-free topology resumption:
     // Mark the fiber as ready for execution.
@@ -44,7 +44,7 @@ unsafe fn wake_by_ref_impl(data: *const ()) {
 }
 
 #[inline(always)]
-unsafe fn drop_waker(_data: *const ()) {
+const unsafe fn drop_waker(_data: *const ()) {
     // No-op. The FiberContext is persistently managed by the lock-free ContextPool.
 }
 
@@ -56,9 +56,9 @@ unsafe fn drop_waker(_data: *const ()) {
 unsafe fn dtact_asm_fiber_suspend(ctx: *mut FiberContext) {
     unsafe {
         ((*ctx).switch_fn)(
-            &mut (*ctx).regs,
-            &(*ctx).executor_regs,
-        )
+            &raw mut (*ctx).regs,
+            &raw const (*ctx).executor_regs,
+        );
     };
 }
 
@@ -81,10 +81,8 @@ thread_local! {
 ///   fiber's thread while it's executing a stack-pinned future.
 #[inline(always)]
 pub fn wait<F: Future>(mut fut: F) -> F::Output {
-    let ctx_ptr = CURRENT_FIBER.with(|c| c.get());
-    if ctx_ptr.is_null() {
-        panic!("dtact::wait() invoked outside of a DTA-V3 Fiber Execution Context. Thread migration forbidden.");
-    }
+    let ctx_ptr = CURRENT_FIBER.with(std::cell::Cell::get);
+    assert!(!ctx_ptr.is_null(), "dtact::wait() invoked outside of a DTA-V3 Fiber Execution Context. Thread migration forbidden.");
 
     let ctx = unsafe { &mut *ctx_ptr };
     
@@ -122,13 +120,12 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
                         core::hint::spin_loop();
                         
                         // Sparse Polling: Reduce L1 pressure by only polling every 8 hints.
-                        if i & 7 == 0 {
-                            if let Poll::Ready(output) = fut_pinned.as_mut().poll(&mut cx) {
+                        if i & 7 == 0
+                            && let Poll::Ready(output) = fut_pinned.as_mut().poll(&mut cx) {
                                 ctx.adaptive_spin_count = (current_spin + 2).min(200);
                                 ctx.spin_failure_count = failure_count.saturating_sub(1);
                                 return output;
                             }
-                        }
                     }
                 }
 

@@ -15,13 +15,13 @@ pub struct dtact_config_t {
     pub workers: u32,
     /// Memory safety level (0-2).
     pub safety_level: u8,
-    /// Topology mode (0: P2PMesh, 1: Global).
+    /// Topology mode (0: `P2PMesh`, 1: Global).
     pub topology_mode: u8,
 }
 
 /// Returns the recommended default configuration for the Dtact runtime.
 #[unsafe(no_mangle)]
-pub extern "C" fn dtact_default_config() -> dtact_config_t {
+pub const extern "C" fn dtact_default_config() -> dtact_config_t {
     dtact_config_t {
         workers: 0, // Auto-detect
         safety_level: 1, // Safety1
@@ -114,14 +114,14 @@ pub extern "C" fn dtact_fiber_launch(
         (*ctx_ptr).fiber_index = ctx_id;
         (*ctx_ptr).switch_fn = crate::context_switch::switch_context_cross_thread_float;
         
-        (*ctx_ptr).closure_ptr = arg as *mut ();
+        (*ctx_ptr).closure_ptr = arg.cast::<()>();
         (*ctx_ptr).trampoline = core::mem::transmute(func);
         
         // Unified Trampoline for C-Functions
         (*ctx_ptr).invoke_closure = |ptr| {
-            let ctx = &mut *(ptr as *mut crate::memory_management::FiberContext);
+            let ctx = &mut *ptr.cast::<crate::memory_management::FiberContext>();
             let f: extern "C" fn(*mut c_void) = core::mem::transmute(ctx.trampoline);
-            f(ctx.closure_ptr as *mut c_void);
+            f(ctx.closure_ptr.cast::<c_void>());
         };
         
         // 3. ABI-Compliant Stack Alignment & Poisoning
@@ -154,7 +154,7 @@ pub extern "C" fn dtact_fiber_launch(
     }
 
     crate::wake_fiber(current_core, ctx_id);
-    dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
+    dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
 }
 
 /// Launches a C-function as a DTA-V3 stackful Fiber with an ownership cleanup callback.
@@ -181,15 +181,15 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
         (*ctx_ptr).fiber_index = ctx_id;
         (*ctx_ptr).switch_fn = crate::context_switch::switch_context_cross_thread_float;
         
-        (*ctx_ptr).closure_ptr = arg as *mut ();
+        (*ctx_ptr).closure_ptr = arg.cast::<()>();
         (*ctx_ptr).trampoline = core::mem::transmute(func);
         (*ctx_ptr).cleanup_fn = Some(core::mem::transmute(cleanup));
         
         // Unified Trampoline for C-Functions
         (*ctx_ptr).invoke_closure = |ptr| {
-            let ctx = &mut *(ptr as *mut crate::memory_management::FiberContext);
+            let ctx = &mut *ptr.cast::<crate::memory_management::FiberContext>();
             let f: extern "C" fn(*mut c_void) = core::mem::transmute(ctx.trampoline);
-            f(ctx.closure_ptr as *mut c_void);
+            f(ctx.closure_ptr.cast::<c_void>());
         };
         
         // ABI-Compliant Stack Alignment & Poisoning
@@ -217,7 +217,7 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
     }
 
     crate::wake_fiber(current_core, ctx_id);
-    dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
+    dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
 }
 
 /// Blocks the current thread until the specified fiber terminates.
@@ -227,7 +227,7 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
 /// spin-loop and futex-wait strategy for zero-CPU idling.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_await(handle: dtact_handle_t) {
-    let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(|c| c.get());
+    let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
     if ctx_ptr.is_null() {
         // UNIVERSAL WAIT: If called from a non-Fiber thread (e.g., C++ main), 
         // we use a tiered strategy: spin-loop -> futex_wait.
@@ -247,7 +247,7 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
                 spins += 1;
             } else {
                 // Perform a zero-overhead OS-level wait until the Fiber finishes
-                unsafe { crate::utils::futex_wait(&(*target_ctx).state, status) };
+                unsafe { crate::utils::futex_wait(&raw const (*target_ctx).state, status) };
             }
         }
         return;
@@ -270,9 +270,9 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
             ctx.state.store(crate::memory_management::FiberStatus::Yielded as u8, core::sync::atomic::Ordering::Release);
             
             // Invoke the assembly trampoline to swap stacks back to the scheduler
-            ((*ctx).switch_fn)(
-                &mut (*ctx).regs,
-                &(*ctx).executor_regs,
+            (ctx.switch_fn)(
+                &raw mut ctx.regs,
+                &raw const ctx.executor_regs,
             );
         }
     }
@@ -292,7 +292,7 @@ pub extern "C" fn dtact_run(_rt: *mut c_void) {
     
     for i in 0..workers_count {
         // Capture raw pointers to avoid lifetime issues across thread boundaries
-        let scheduler_ptr = scheduler as *const _ as usize;
+        let scheduler_ptr = std::ptr::from_ref(scheduler) as usize;
         let base_ptr = base as usize;
         
         let handle = std::thread::spawn(move || {

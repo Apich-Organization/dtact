@@ -62,7 +62,8 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     /// Creates a new builder with default settings:
     /// Normal priority, Compute kind, P2P Mesh mode, and Safety0 (raw performance).
     #[inline(always)]
-    pub fn new() -> Self {
+    #[must_use] 
+    pub const fn new() -> Self {
         Self {
             name: None,
             affinity: topology::Affinity::SameCore,
@@ -76,42 +77,48 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     /// Sets the workload kind (Compute or IO).
     #[inline(always)]
-    pub fn kind(mut self, kind: WorkloadKind) -> Self {
+    #[must_use] 
+    pub const fn kind(mut self, kind: WorkloadKind) -> Self {
         self.kind = kind;
         self
     }
 
     /// Sets the topology mode (P2P Mesh or Local Queue).
     #[inline(always)]
-    pub fn topology_mode(mut self, mode: TopologyMode) -> Self {
+    #[must_use] 
+    pub const fn topology_mode(mut self, mode: TopologyMode) -> Self {
         self.mode = mode;
         self
     }
 
     /// Sets the hardware safety level (0-2).
     #[inline(always)]
-    pub fn safety(mut self, safety: crate::memory_management::SafetyLevel) -> Self {
+    #[must_use] 
+    pub const fn safety(mut self, safety: crate::memory_management::SafetyLevel) -> Self {
         self.safety = safety;
         self
     }
 
     /// Sets a descriptive name for the fiber (useful for telemetry).
     #[inline(always)]
-    pub fn name(mut self, name: &'static str) -> Self {
+    #[must_use] 
+    pub const fn name(mut self, name: &'static str) -> Self {
         self.name = Some(name);
         self
     }
 
-    /// Sets the core affinity (SameCore, SameNUMA, etc.).
+    /// Sets the core affinity (`SameCore`, `SameNUMA`, etc.).
     #[inline(always)]
-    pub fn affinity(mut self, affinity: topology::Affinity) -> Self {
+    #[must_use] 
+    pub const fn affinity(mut self, affinity: topology::Affinity) -> Self {
         self.affinity = affinity;
         self
     }
 
     /// Sets the scheduling priority.
     #[inline(always)]
-    pub fn priority(mut self, priority: Priority) -> Self {
+    #[must_use] 
+    pub const fn priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
         self
     }
@@ -160,10 +167,10 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 
                 let boxed = Box::new(fut);
                 let fut_ptr = Box::into_raw(boxed);
-                (*ctx_ptr).closure_ptr = fut_ptr as *mut ();
+                (*ctx_ptr).closure_ptr = fut_ptr.cast::<()>();
                 (*ctx_ptr).invoke_closure = |ptr| {
                     unsafe {
-                        let mut f = Box::from_raw(ptr as *mut F);
+                        let mut f = Box::from_raw(ptr.cast::<F>());
                         crate::future_bridge::wait(&mut *f);
                     }
                 };
@@ -173,17 +180,17 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 core::ptr::write(fut_ptr, fut);
                 
                 (*ctx_ptr).invoke_closure = |ptr| {
-                    let f_ptr = ptr as *mut F;
+                    let f_ptr = ptr.cast::<F>();
                     unsafe {
                         crate::future_bridge::wait(&mut *f_ptr);
                         core::ptr::drop_in_place(f_ptr);
                     }
                 };
-                (*ctx_ptr).closure_ptr = fut_ptr as *mut ();
+                (*ctx_ptr).closure_ptr = fut_ptr.cast::<()>();
             }
             
             // Windows ABI Compliance (Shadow Space) & Stack Alignment
-            let stack_top = (buffer_start as usize & !0xF) - 64;
+            let stack_top = (buffer_start & !0xF) - 64;
             let stack_top_ptr = stack_top as *mut u64;
             
             // Poison return address (dtact_abort)
@@ -209,12 +216,12 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
         }
 
         crate::wake_fiber(current_core, ctx_id);
-        dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
+        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
     }
 }
 
 pub(crate) unsafe extern "C" fn fiber_entry_point() {
-    let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(|c| c.get());
+    let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
     if ctx_ptr.is_null() { return; }
     
     let ctx = unsafe { &mut *ctx_ptr };
@@ -235,9 +242,9 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
     }
     
     unsafe {
-        ((*ctx).switch_fn)(
-            &mut (*ctx).regs,
-            &(*ctx).executor_regs,
+        (ctx.switch_fn)(
+            &raw mut ctx.regs,
+            &raw const ctx.executor_regs,
         );
     }
 }
@@ -263,6 +270,7 @@ pub mod topology {
 
     /// Returns the Core ID of the currently executing hardware thread.
     #[inline(always)]
+    #[must_use] 
     pub fn current_core() -> u16 {
         current().core_id
     }
@@ -290,11 +298,11 @@ pub mod topology {
             };
         }
         
-        let (mut cpu, mut last_refresh) = CACHED.with(|c| c.get());
+        let (mut cpu, mut last_refresh) = CACHED.with(std::cell::Cell::get);
         let (now, cpu_id) = crate::utils::get_tick_with_cpu();
         
         // Refresh every 100k cycles OR if Core ID mismatch (vCPU migration)
-        if now.wrapping_sub(last_refresh) > 100_000 || (cpu.core_id as u32) != cpu_id {
+        if now.wrapping_sub(last_refresh) > 100_000 || u32::from(cpu.core_id) != cpu_id {
             let next_cpu = current_raw();
             if next_cpu != cpu {
                 crate::TOPOLOGY_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -308,6 +316,7 @@ pub mod topology {
 
     /// Performs a raw hardware topology discovery via CPUID/MPIDR.
     #[inline(always)]
+    #[must_use] 
     pub fn current_raw() -> CpuLevel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -346,11 +355,11 @@ pub mod topology {
             let ccx_id = (x2apic_id >> core_shift) & ((1 << (package_shift - core_shift)) - 1);
             let numa_id = x2apic_id >> package_shift;
 
-            return CpuLevel {
+            CpuLevel {
                 core_id: core_id as u16,
                 ccx_id: ccx_id as u16,
                 numa_id: numa_id as u16,
-            };
+            }
         }
 
         #[cfg(target_arch = "aarch64")]
@@ -394,17 +403,18 @@ pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(fut: F) -> dtact_
 
 /// Fiber configuration and construction utilities.
 pub mod spawn {
-    use super::*;
+    use super::{SpawnBuilder, CrossThreadFloat};
     /// Returns a new `SpawnBuilder` with default settings.
     #[inline(always)]
-    pub fn builder() -> SpawnBuilder<CrossThreadFloat> {
+    #[must_use] 
+    pub const fn builder() -> SpawnBuilder<CrossThreadFloat> {
         SpawnBuilder::new()
     }
 }
 
 /// Fiber-local execution and synchronization utilities.
 pub mod fiber {
-    use super::*;
+    use super::{dtact_handle_t, topology};
     /// Spawns a fiber from a closure with a specific stack configuration.
     #[inline]
     pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(_stack_size_str: &str, f: F) -> dtact_handle_t {
@@ -420,17 +430,17 @@ pub mod fiber {
             (*ctx_ptr).fiber_index = ctx_id;
             (*ctx_ptr).switch_fn = crate::context_switch::switch_context_same_thread_no_float;
             
-            let f_ptr = (*ctx_ptr).read_buffer_ptr as *mut F;
+            let f_ptr = (*ctx_ptr).read_buffer_ptr.cast::<F>();
             core::ptr::write(f_ptr, f);
             (*ctx_ptr).invoke_closure = |ptr| {
-                let f = core::ptr::read(ptr as *mut F);
+                let f = core::ptr::read(ptr.cast::<F>());
                 f();
             };
-            (*ctx_ptr).closure_ptr = f_ptr as *mut ();
+            (*ctx_ptr).closure_ptr = f_ptr.cast::<()>();
             
             // Point 1: Shadow Space Separation (Stack MUST start BELOW the 8KB Future buffer)
             let buffer_start = (*ctx_ptr).read_buffer_ptr as usize;
-            let stack_top = (buffer_start as usize & !0xF) - 64;
+            let stack_top = (buffer_start & !0xF) - 64;
             let stack_top_ptr = stack_top as *mut u64;
             
             // Point 4: "Return-to-Nowhere" Protection
@@ -456,14 +466,14 @@ pub mod fiber {
         }
 
         crate::wake_fiber(current_core, ctx_id);
-        dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
+        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
     }
 
     /// Yields execution directly to another fiber.
     /// Note: This is a hint to the scheduler.
     #[inline(always)]
     pub fn yield_to(handle: dtact_handle_t) {
-        let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(|c| c.get());
+        let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
         if ctx_ptr.is_null() { return; } 
         
         let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
@@ -474,7 +484,7 @@ pub mod fiber {
         unsafe {
             let ctx = &mut *ctx_ptr;
             ctx.state.store(crate::memory_management::FiberStatus::Yielded as u8, core::sync::atomic::Ordering::Release);
-            (ctx.switch_fn)(&mut ctx.regs, &ctx.executor_regs);
+            (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
         }
     }
 }
@@ -530,16 +540,16 @@ pub async fn yield_now() {
         type Output = ();
         #[inline(always)]
         fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
-            if !self.0 {
+            if self.0 {
+                core::task::Poll::Ready(())
+            } else {
                 self.0 = true;
                 cx.waker().wake_by_ref();
                 core::task::Poll::Pending
-            } else {
-                core::task::Poll::Ready(())
             }
         }
     }
-    YieldNow(false).await
+    YieldNow(false).await;
 }
 
 /// Yields execution to another fiber handle asynchronously.
@@ -557,14 +567,13 @@ pub mod config {
     /// Sets the work-deflection threshold for a specific hardware worker.
     #[inline(always)]
     pub fn set_deflection_threshold(core_id: usize, threshold: u8) {
-        if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
-            if core_id < runtime.scheduler.workers.len() {
+        if let Some(runtime) = crate::GLOBAL_RUNTIME.get()
+            && core_id < runtime.scheduler.workers.len() {
                 unsafe {
                     let worker = &*runtime.scheduler.workers[core_id].get();
                     worker.deflection_threshold.store(threshold, Ordering::Release);
                 }
             }
-        }
     }
 }
 

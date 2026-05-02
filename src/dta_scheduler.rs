@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 #[allow(unused_imports)]
 use core::arch::asm;
 
-/// Task Index used for Zero-Copy passing within the ContextPool.
+/// Task Index used for Zero-Copy passing within the `ContextPool`.
 pub type TaskIndex = u32;
 
 /// Number of tasks in a single `TaskChunk`.
@@ -58,6 +58,7 @@ pub struct HugeBuffer<T> {
 impl<T> HugeBuffer<T> {
     /// Allocates a new `HugeBuffer` using OS-specific huge page primitives.
     #[inline]
+    #[must_use] 
     pub fn new() -> Self {
         let size_bytes = core::mem::size_of::<T>();
         
@@ -85,7 +86,7 @@ impl<T> HugeBuffer<T> {
                 assert!(ptr != libc::MAP_FAILED, "HugeBuffer mmap failed");
             }
             core::ptr::write_bytes(ptr, 0, size_bytes);
-            Self { ptr: ptr as *mut T, size_bytes }
+            Self { ptr: ptr.cast::<T>(), size_bytes }
         }
 
         #[cfg(windows)]
@@ -130,7 +131,7 @@ impl<T> Drop for HugeBuffer<T> {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
-            libc::munmap(self.ptr as *mut libc::c_void, self.size_bytes);
+            libc::munmap(self.ptr.cast::<libc::c_void>(), self.size_bytes);
         }
         #[cfg(windows)]
         unsafe {
@@ -163,6 +164,7 @@ unsafe impl Send for Mailbox {}
 impl Mailbox {
     /// Creates a new, empty Mailbox.
     #[inline(always)]
+    #[must_use] 
     pub fn new() -> Self {
         Self {
             head: AtomicUsize::new(0),
@@ -187,7 +189,7 @@ impl Mailbox {
         }
 
         unsafe {
-            let buffer_ptr = (*self.buffer.ptr).get() as *mut TaskChunk;
+            let buffer_ptr = (*self.buffer.ptr).get().cast::<TaskChunk>();
             *buffer_ptr.add(current_tail) = chunk;
         }
 
@@ -195,7 +197,7 @@ impl Mailbox {
         
         #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86", target_arch = "x86_64")))]
         unsafe {
-            core::arch::asm!("cldemote [{}]", in(reg) &self.tail);
+            core::arch::asm!("cldemote [{}]", in(reg) &raw const self.tail);
         }
 
         #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
@@ -221,7 +223,7 @@ impl Mailbox {
         }
 
         let chunk = unsafe {
-            let buffer_ptr = (*self.buffer.ptr).get() as *mut TaskChunk;
+            let buffer_ptr = (*self.buffer.ptr).get().cast::<TaskChunk>();
             core::ptr::read(buffer_ptr.add(current_head))
         };
 
@@ -282,6 +284,7 @@ unsafe impl Send for Worker {}
 impl Worker {
     /// Creates a new `Worker` and calculates its CCX-aware polling order.
     #[inline(always)]
+    #[must_use] 
     pub fn new(cpu: CpuLevel, total_cores: usize) -> Self {
         let mut polling_order = Vec::with_capacity(total_cores - 1);
         let my_core = cpu.core_id as usize;
@@ -312,7 +315,7 @@ impl Worker {
     
     /// Returns the current number of tasks in the local queue.
     #[inline(always)]
-    pub fn local_queue_len(&self) -> usize {
+    pub const fn local_queue_len(&self) -> usize {
         self.local_tail.wrapping_sub(self.local_head) & LOCAL_QUEUE_MASK
     }
 
@@ -399,7 +402,7 @@ impl Worker {
             
             let group_offset = (task as usize >> 5) * group_guard_size;
             let target_ptr = unsafe {
-                context_base.add((task as usize) * context_size + group_offset) as *mut crate::memory_management::FiberContext
+                context_base.add((task as usize) * context_size + group_offset).cast::<crate::memory_management::FiberContext>()
             };
             
             // Hardware Prefetch: Bring FiberContext to L1 using T0 hint immediately
@@ -420,8 +423,8 @@ impl Worker {
 
             unsafe {
                 ((*target_ptr).switch_fn)(
-                    &mut (*target_ptr).executor_regs,
-                    &(*target_ptr).regs,
+                    &raw mut (*target_ptr).executor_regs,
+                    &raw const (*target_ptr).regs,
                 );
             }
 
@@ -442,7 +445,7 @@ pub struct DtaScheduler {
     /// Active topology mode.
     pub topology: TopologyMode,
     /// Branchless jump table for task enqueuing.
-    pub enqueue_jmp: [fn(&DtaScheduler, usize, usize, TaskIndex); 2],
+    pub enqueue_jmp: [fn(&Self, usize, usize, TaskIndex); 2],
 }
 
 unsafe impl Sync for DtaScheduler {}
@@ -451,6 +454,7 @@ unsafe impl Send for DtaScheduler {}
 impl DtaScheduler {
     /// Creates a new `DtaScheduler` for the specified number of workers.
     #[inline(always)]
+    #[must_use] 
     pub fn new(num_workers: usize, topology: TopologyMode) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
         let mut mailboxes = Vec::with_capacity(num_workers);
@@ -535,7 +539,7 @@ impl DtaScheduler {
         let target_idx = local_idx ^ ((local_idx ^ deflect_target) & deflect_mask);
         let target_core = ccx_base | target_idx;
 
-        let jump_idx = (target_core != source_core) as usize;
+        let jump_idx = usize::from(target_core != source_core);
         (self.enqueue_jmp[jump_idx])(self, source_core, target_core, task);
     }
 
@@ -585,7 +589,7 @@ impl DtaScheduler {
                     #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86_64", target_arch = "x86")))]
                     {
                         unsafe {
-                            let tail_ptr = &worker.local_tail as *const _ as *mut core::ffi::c_void;
+                            let tail_ptr = &raw const worker.local_tail as *mut core::ffi::c_void;
                             let control = 1u32; // C0.1 (Fast wakeup)
                             core::arch::asm!(
                                 "umonitor {0}",

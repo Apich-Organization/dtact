@@ -1,7 +1,7 @@
 //! # Dtact-V3: Distributed Task-Aware Coroutine Toolkit
 //! 
 //! Dtact is a high-performance, low-latency asynchronous runtime designed for systems-level
-//! programming across heterogeneous architectures (x86_64, AArch64, RISC-V).
+//! programming across heterogeneous architectures (`x86_64`, `AArch64`, RISC-V).
 //! 
 //! ## Core Architecture
 //! 1. **Lock-Free Arena**: A page-aligned memory pool for fiber contexts, providing O(1) allocation
@@ -73,7 +73,7 @@
 
 extern crate alloc;
 
-/// Bridge for polling futures within a FiberContext.
+/// Bridge for polling futures within a `FiberContext`.
 pub mod future_bridge;
 /// Low-level assembly-based context switching primitives.
 pub mod context_switch;
@@ -128,7 +128,7 @@ pub static HEAP_ESCAPED_SPAWNS: core::sync::atomic::AtomicU64 = core::sync::atom
 pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
     if let Some(runtime) = GLOBAL_RUNTIME.get() {
         // Submit the fiber back to the mesh. 
-        runtime.scheduler.enqueue_task(origin_core, fiber_index as u64, fiber_index);
+        runtime.scheduler.enqueue_task(origin_core, u64::from(fiber_index), fiber_index);
     } else {
         panic!("dtact::wake_fiber() invoked before Runtime Initialization");
     }
