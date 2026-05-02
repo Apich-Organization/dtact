@@ -471,7 +471,7 @@ impl ContextPool {
             (*ctx)
                 .state
                 .store(FiberStatus::Initial as u8, Ordering::Release);
-            (*ctx).generation.fetch_add(1, Ordering::SeqCst);
+            (*ctx).generation.fetch_add(1, Ordering::AcqRel);
             crate::utils::futex_wake(&raw const (*ctx).state);
         };
 

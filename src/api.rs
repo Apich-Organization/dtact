@@ -318,7 +318,7 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
     // Wake up any fiber waiting for this one (FFI join)
     let waiter = ctx
         .waiter_handle
-        .swap(0, core::sync::atomic::Ordering::SeqCst);
+        .swap(0, core::sync::atomic::Ordering::Acquire);
     if waiter != 0 {
         let waiter_ctx_id = (waiter & 0xFFFF_FFFF) as u32;
         let waiter_core_id = (waiter >> 32) as usize;
