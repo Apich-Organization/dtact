@@ -200,8 +200,7 @@ impl ContextPool {
         safety: SafetyLevel,
         numa: usize,
     ) -> Result<Self, &'static str> {
-        // Use 64KB page size to encompass all architectures safely (4KB, 16KB, 64KB)
-        let page_size = 65536;
+        let page_size = 4096;
         let align = 64;
         let context_sz = (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
 
@@ -482,7 +481,7 @@ impl ContextPool {
     /// Returns the base pointer and layout metadata for direct dispatcher access.
     #[inline(always)]
     pub fn get_dispatch_layout(&self) -> (*mut u8, usize, usize, usize) {
-        let page_size = 65536;
+        let page_size = 4096;
         let align = 64;
         let context_sz = (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
         let guard_size = if self.safety == SafetyLevel::Safety0 {
