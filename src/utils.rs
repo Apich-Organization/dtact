@@ -1,4 +1,8 @@
-/// Raw Hardware Timestamp (Non-serializing for maximum performance)
+/// Raw Hardware Timestamp.
+/// 
+/// Returns a monotonically increasing cycle count from the CPU.
+/// This is a non-serializing instruction designed for maximum performance 
+/// and minimum pipeline disturbance.
 #[inline(always)]
 pub fn rdtsc() -> u64 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -21,7 +25,10 @@ pub fn rdtsc() -> u64 {
     { 0 }
 }
 
-/// Fast Core ID hint (Non-serializing)
+/// Fast Core ID hint.
+/// 
+/// Attempts to retrieve the current Core ID using the fastest available
+/// non-serializing hardware instruction (e.g. RDPID on x86_64).
 #[inline(always)]
 pub fn get_cpu_fast() -> u32 {
     #[cfg(target_arch = "x86_64")]
@@ -54,20 +61,26 @@ pub fn get_cpu_fast() -> u32 {
     { 0 }
 }
 
-/// Ultra-fast tick for local execution. Hardware monotonic.
+/// Ultra-fast tick for local execution.
+/// 
+/// A thin wrapper around `rdtsc` used for microsecond-level latency 
+/// measurements within the scheduler dispatch loop.
 #[inline(always)]
 pub fn get_tick() -> u64 {
     rdtsc()
 }
 
-/// Atomic Timestamp + Core ID (protects against Hypervisor migration)
+/// Atomic Timestamp + Core ID.
+/// 
+/// Returns a tuple of (Timestamp, Core ID). If the `hypervisor` feature is
+/// enabled, this function uses serializing instructions (LFENCE) to ensure
+/// timestamp monotonicity even across VM migrations.
 #[inline(always)]
 pub fn get_tick_with_cpu() -> (u64, u32) {
     #[cfg(feature = "hypervisor")]
     {
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            let mut aux: u32 = 0;
             // Fully serializing version for cloud stability (LFENCE + RDTSC + Core ID)
             core::arch::asm!("lfence", options(nostack, preserves_flags));
             let tsc = core::arch::x86_64::_rdtsc();
@@ -87,6 +100,10 @@ pub fn get_tick_with_cpu() -> (u64, u32) {
 }
 
 
+/// Blocks the current OS thread until notified via `futex_wake`.
+/// 
+/// Utilizes the Linux `FUTEX_WAIT` system call for efficient, zero-CPU
+/// blocking of host threads awaiting fiber completion.
 #[cfg(target_os = "linux")]
 #[inline(always)]
 pub fn futex_wait(addr: *const core::sync::atomic::AtomicU8, val: u8) {
@@ -107,6 +124,7 @@ pub fn futex_wait(addr: *const core::sync::atomic::AtomicU8, val: u8) {
     }
 }
 
+/// Wakes all OS threads currently blocked on the specified address.
 #[cfg(target_os = "linux")]
 #[inline(always)]
 pub fn futex_wake(addr: *const core::sync::atomic::AtomicU8) {
@@ -120,12 +138,14 @@ pub fn futex_wake(addr: *const core::sync::atomic::AtomicU8) {
     }
 }
 
+/// Cross-platform fallback for `futex_wait`.
 #[cfg(not(target_os = "linux"))]
 #[inline(always)]
 pub fn futex_wait(_addr: *const core::sync::atomic::AtomicU8, _val: u8) {
     std::thread::yield_now();
 }
 
+/// Cross-platform fallback for `futex_wake`.
 #[cfg(not(target_os = "linux"))]
 #[inline(always)]
 pub fn futex_wake(_addr: *const core::sync::atomic::AtomicU8) {}
@@ -135,6 +155,10 @@ std::thread_local! {
     static CACHED_TID: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
 }
 
+/// Returns a unique identifier for the current OS thread.
+/// 
+/// Caches the thread ID in thread-local storage after the first lookup 
+/// to avoid repeated system call overhead.
 #[inline(always)]
 pub fn get_thread_id() -> u64 {
     CACHED_TID.with(|c| {

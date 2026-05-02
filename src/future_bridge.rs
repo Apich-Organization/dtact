@@ -8,7 +8,11 @@ use core::sync::atomic::Ordering;
 use crate::memory_management::{FiberContext, FiberStatus};
 
 /// VTable for the Zero-Cost Dtact Waker.
-/// Bypasses `Arc` counting overhead by pinning wakes directly to the Arena-managed `FiberContext`.
+/// 
+/// This waker bypasses the standard `Arc` reference counting overhead by
+/// pinning wakes directly to the arena-managed `FiberContext`. Since the
+/// context is persistent until the fiber terminates, the waker pointer
+/// is always valid.
 static DTACT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     clone_waker,
     wake_impl,
@@ -31,11 +35,11 @@ unsafe fn wake_by_ref_impl(data: *const ()) {
     let ctx = unsafe { &*(data as *const FiberContext) };
 
     // CAS-free topology resumption:
-    // Mark as ready.
+    // Mark the fiber as ready for execution.
     ctx.state.store(FiberStatus::Running as u8, Ordering::Release);
 
-    // Inject into the P2P Mailbox Mesh via the global scheduler interface.
-    // The scheduler will handle whether this is a local push or a cross-core CLDEMOTE push.
+    // Inject the fiber back into the P2P Mailbox Mesh.
+    // The scheduler will handle whether this is a local push or a cross-core signal.
     crate::wake_fiber(ctx.origin_core as usize, ctx.fiber_index);
 }
 
@@ -44,9 +48,10 @@ unsafe fn drop_waker(_data: *const ()) {
     // No-op. The FiberContext is persistently managed by the lock-free ContextPool.
 }
 
-/// The Trampoline: Assembly Switch
-/// Suspends the current fiber natively without `mprotect` or Heavy OS intervention.
-/// Saves ONLY callee-saved registers and swaps the stack pointer to return to the scheduler.
+/// The Trampoline: Assembly Switch.
+/// 
+/// Suspends the current fiber natively, saving its state and returning
+/// execution to the scheduler's dispatch loop.
 #[inline(always)]
 unsafe fn dtact_asm_fiber_suspend(ctx: *mut FiberContext) {
     unsafe {
@@ -62,9 +67,18 @@ thread_local! {
     pub(crate) static CURRENT_FIBER: core::cell::Cell<*mut FiberContext> = const { core::cell::Cell::new(core::ptr::null_mut()) };
 }
 
-/// Ultra-Fast execution path.
-/// Bridges the asynchronous `Future` ecosystem with the DTA-V3 stackful Fiber topology.
-/// If the future yields, the fiber natively suspends into the hardware mesh.
+/// The core execution bridge between Rust Futures and Dtact Fibers.
+/// 
+/// This function executes a future on the fiber's stack. If the future yields
+/// (returns `Poll::Pending`), this function enters an adaptive spin loop
+/// before natively suspending the fiber if the task remains unresolved.
+/// 
+/// ## Features
+/// - **Zero-Cost Waking**: Uses a direct pointer to `FiberContext` instead of `Arc`.
+/// - **Adaptive Spinning**: Dynamically adjusts spinning duration based on
+///   historical resolution latency.
+/// - **Thread-Migration Guard**: Detects and panics if the OS migrates the 
+///   fiber's thread while it's executing a stack-pinned future.
 #[inline(always)]
 pub fn wait<F: Future>(mut fut: F) -> F::Output {
     let ctx_ptr = CURRENT_FIBER.with(|c| c.get());
@@ -74,9 +88,7 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
 
     let ctx = unsafe { &mut *ctx_ptr };
     
-    // 3. Thread Migration Guard
-    // Since we pin the future to the fiber's stack, we MUST ensure the OS hasn't 
-    // moved us to a different thread/core, which would invalidate the stack address.
+    // Thread Migration Guard
     let tid = crate::utils::get_thread_id();
     if ctx.last_os_thread_id == 0 {
         ctx.last_os_thread_id = tid;
@@ -95,28 +107,23 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
     loop {
         match fut_pinned.as_mut().poll(&mut cx) {
             Poll::Ready(output) => {
-                // Adaptive Reward: Dampened
-                // We increment conservatively to prevent "spinning too much" on a fluke.
+                // Task resolved! Reward the adaptive spin loop budget.
                 ctx.adaptive_spin_count = (ctx.adaptive_spin_count + 1).min(200);
-                // Slowly decay the failure count to preserve "memory" of recent contention.
                 ctx.spin_failure_count = ctx.spin_failure_count.saturating_sub(1);
                 return output;
             },
             Poll::Pending => {
-                // 4. Adaptive Short-Circuit Check with Sparse Polling & Cool-Down
                 let current_spin = ctx.adaptive_spin_count;
                 let failure_count = ctx.spin_failure_count;
 
-                // Cooldown: If we've failed 10+ times, yield immediately to avoid L1 thrashing.
+                // Adaptive Cooldown: If we've failed many times, yield immediately.
                 if failure_count < 10 {
                     for i in 0..current_spin {
                         core::hint::spin_loop();
                         
-                        // Sparse Polling: Only poll every 8 hints to reduce L1 pressure and 
-                        // memory bus traffic (cache coherency storm prevention).
+                        // Sparse Polling: Reduce L1 pressure by only polling every 8 hints.
                         if i & 7 == 0 {
                             if let Poll::Ready(output) = fut_pinned.as_mut().poll(&mut cx) {
-                                // Task resolved! Reward slightly.
                                 ctx.adaptive_spin_count = (current_spin + 2).min(200);
                                 ctx.spin_failure_count = failure_count.saturating_sub(1);
                                 return output;
@@ -125,15 +132,12 @@ pub fn wait<F: Future>(mut fut: F) -> F::Output {
                     }
                 }
 
-                // Spin failed. Increment failure count and decrease budget.
+                // Spin failed. Penalize budget and yield.
                 ctx.spin_failure_count = failure_count.saturating_add(1);
                 ctx.adaptive_spin_count = current_spin.saturating_sub(5).max(5);
 
-                // Future is waiting on I/O or an external event.
-                // Yield the physical CPU core to the next fiber in the mailbox.
                 ctx.state.store(FiberStatus::Yielded as u8, Ordering::Release);
                 
-                // Jump out to `dispatch_loop_asm`
                 unsafe { dtact_asm_fiber_suspend(ctx_ptr) };
             }
         }

@@ -5,38 +5,50 @@ use crate::memory_management::{TopologyMode, WorkloadKind};
 pub use crate::c_ffi::dtact_handle_t;
 pub use topology::Affinity;
 
+/// Scheduling Priority for fibers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Priority {
+    /// Background tasks with no latency requirements.
     Low,
+    /// Standard application tasks.
     Normal,
+    /// Latency-sensitive tasks that should preempt normal work.
     High,
+    /// Critical real-time tasks that must run as soon as possible.
     Critical,
 }
 
+/// Interface for custom context switching logic.
 pub trait ContextSwitcher: Send + Sync + 'static {
+    /// The raw assembly function used for switching to/from this fiber.
     const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers);
 }
 
+/// Standard switcher that saves/restores floating-point state and supports cross-thread migration.
 pub struct CrossThreadFloat;
 impl ContextSwitcher for CrossThreadFloat {
     const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_cross_thread_float;
 }
 
+/// Lightweight switcher that skips floating-point state but supports cross-thread migration.
 pub struct CrossThreadNoFloat;
 impl ContextSwitcher for CrossThreadNoFloat {
     const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_cross_thread_no_float;
 }
 
+/// Optimized switcher for fibers pinned to a single thread, saving/restoring floating-point state.
 pub struct SameThreadFloat;
 impl ContextSwitcher for SameThreadFloat {
     const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_same_thread_float;
 }
 
+/// The fastest possible switcher: pins to one thread and ignores floating-point state.
 pub struct SameThreadNoFloat;
 impl ContextSwitcher for SameThreadNoFloat {
     const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_same_thread_no_float;
 }
 
+/// Fluent builder for configuring and launching fibers.
 pub struct SpawnBuilder<S: ContextSwitcher = CrossThreadFloat> {
     name: Option<&'static str>,
     affinity: topology::Affinity,
@@ -48,6 +60,8 @@ pub struct SpawnBuilder<S: ContextSwitcher = CrossThreadFloat> {
 }
 
 impl<S: ContextSwitcher> SpawnBuilder<S> {
+    /// Creates a new builder with default settings:
+    /// Normal priority, Compute kind, P2P Mesh mode, and Safety0 (raw performance).
     #[inline(always)]
     pub fn new() -> Self {
         Self {
@@ -61,42 +75,54 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
         }
     }
 
+    /// Sets the workload kind (Compute or IO).
     #[inline(always)]
     pub fn kind(mut self, kind: WorkloadKind) -> Self {
         self.kind = kind;
         self
     }
 
+    /// Sets the topology mode (P2P Mesh or Local Queue).
     #[inline(always)]
     pub fn topology_mode(mut self, mode: TopologyMode) -> Self {
         self.mode = mode;
         self
     }
 
+    /// Sets the hardware safety level (0-2).
     #[inline(always)]
     pub fn safety(mut self, safety: crate::memory_management::SafetyLevel) -> Self {
         self.safety = safety;
         self
     }
 
+    /// Sets a descriptive name for the fiber (useful for telemetry).
     #[inline(always)]
     pub fn name(mut self, name: &'static str) -> Self {
         self.name = Some(name);
         self
     }
 
+    /// Sets the core affinity (SameCore, SameNUMA, etc.).
     #[inline(always)]
     pub fn affinity(mut self, affinity: topology::Affinity) -> Self {
         self.affinity = affinity;
         self
     }
 
+    /// Sets the scheduling priority.
     #[inline(always)]
     pub fn priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
         self
     }
 
+    /// Finalizes and launches the fiber into the runtime.
+    /// 
+    /// This performs the critical "Zero-Copy" layout calculation:
+    /// 1. Attempts to place the Future directly at the top of the fiber stack.
+    /// 2. If the Future is too large (>8KB), falls back to heap allocation.
+    /// 3. Configures the assembly trampoline for the selected `ContextSwitcher`.
     #[inline]
     pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(self, fut: F) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
@@ -114,17 +140,15 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             (*ctx_ptr).fiber_index = ctx_id;
             (*ctx_ptr).switch_fn = S::SWITCH_FN;
             
-            // 1. Aligned Zero-Copy Future Migration (with Heap Fallback)
+            // Aligned Zero-Copy Future Migration
             let align = core::mem::align_of::<F>();
             let fut_size = core::mem::size_of::<F>();
             let buffer_start = (*ctx_ptr).read_buffer_ptr as usize;
             let buffer_end = buffer_start + 8192;
             let aligned_fut_addr = (buffer_end - fut_size) & !(align - 1);
             
-            // Point 4: Footprint Check (Start and End must be within the 8KB buffer)
             if aligned_fut_addr < buffer_start || (aligned_fut_addr + fut_size) > buffer_end {
-                // Future exceeds or misaligns outside the pre-allocated 8KB buffer. 
-                // Fallback to heap allocation to maintain stability (slight performance hit).
+                // Future exceeds pre-allocated 8KB buffer. Fallback to heap.
                 crate::HEAP_ESCAPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 
                 #[cfg(debug_assertions)]
@@ -159,14 +183,11 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 (*ctx_ptr).closure_ptr = fut_ptr as *mut ();
             }
             
-            // 3. Windows ABI Compliance (Shadow Space) & Stack Alignment
-            // x86_64 ABI Rule: RSP must be 16-byte aligned BEFORE a CALL.
-            // Point 1: Shadow Space Separation (Stack MUST start BELOW the 8KB Future buffer)
+            // Windows ABI Compliance (Shadow Space) & Stack Alignment
             let mut stack_top = (buffer_start as usize & !0xF) - 64;
             let stack_top_ptr = stack_top as *mut u64;
             
-            // Point 4: "Return-to-Nowhere" Protection
-            // Place a poison return address on the stack.
+            // Poison return address (dtact_abort)
             core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as u64);
             
             let stack_top = stack_top as *mut u8;

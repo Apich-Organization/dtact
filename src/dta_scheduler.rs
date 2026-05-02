@@ -4,24 +4,33 @@ use std::cell::UnsafeCell;
 #[allow(unused_imports)]
 use core::arch::asm;
 
-/// Task Index used for Zero-Copy passing
+/// Task Index used for Zero-Copy passing within the ContextPool.
 pub type TaskIndex = u32;
 
+/// Number of tasks in a single `TaskChunk`.
 pub const CHUNK_SIZE: usize = 32;
-// MUST be a power of two for bitwise masking
+
+/// Capacity of a single core-to-core mailbox.
+/// MUST be a power of two for bitwise masking.
 pub const MAILBOX_CAPACITY: usize = 1024;
+/// Mask for mailbox index wrap-around.
 pub const MAILBOX_MASK: usize = MAILBOX_CAPACITY - 1;
 
-/// Fixed-size local Arena ring buffer to avoid Heap-based Reallocations.
+/// Capacity of a worker's local execution queue.
 /// Sized to exactly hold the max queue without global locks.
 pub const LOCAL_QUEUE_CAPACITY: usize = 8192;
+/// Mask for local queue index wrap-around.
 pub const LOCAL_QUEUE_MASK: usize = LOCAL_QUEUE_CAPACITY - 1;
 
-/// Batch Ownership Transfer Chunk
-/// A chunk of 32 task indices, transferred in a single atomic pointer exchange.
+/// Batch Ownership Transfer Chunk.
+/// 
+/// A chunk of 32 task indices, transferred in a single atomic pointer exchange
+/// to minimize coherency traffic across the P2P mesh.
 #[derive(Debug, Clone, Copy)]
 pub struct TaskChunk {
+    /// Array of task indices in this chunk.
     pub tasks: [TaskIndex; CHUNK_SIZE],
+    /// Number of active tasks in this chunk.
     pub count: usize,
 }
 
@@ -36,12 +45,18 @@ impl Default for TaskChunk {
 }
 
 /// Helper for Huge Page Allocation to eliminate TLB Misses.
+/// 
+/// Manages page-aligned memory regions that utilize 2MB or 1GB huge pages
+/// (where supported by the OS) to maximize memory throughput.
 pub struct HugeBuffer<T> {
+    /// Pointer to the allocated memory.
     pub ptr: *mut T,
+    /// Total size of the buffer in bytes.
     pub size_bytes: usize,
 }
 
 impl<T> HugeBuffer<T> {
+    /// Allocates a new `HugeBuffer` using OS-specific huge page primitives.
     #[inline]
     pub fn new() -> Self {
         let size_bytes = core::mem::size_of::<T>();
@@ -128,7 +143,9 @@ impl<T> Drop for HugeBuffer<T> {
     }
 }
 
-/// Single-Producer Single-Consumer (SPSC) Queue for the P2P Mesh Mailbox
+/// Single-Producer Single-Consumer (SPSC) Queue for the P2P Mesh Mailbox.
+/// 
+/// Aligned to 64 bytes to prevent false sharing between sender and receiver cores.
 #[repr(align(64))]
 pub struct Mailbox {
     head: AtomicUsize,
@@ -144,6 +161,7 @@ unsafe impl Sync for Mailbox {}
 unsafe impl Send for Mailbox {}
 
 impl Mailbox {
+    /// Creates a new, empty Mailbox.
     #[inline(always)]
     pub fn new() -> Self {
         Self {
@@ -155,6 +173,10 @@ impl Mailbox {
         }
     }
 
+    /// Pushes a `TaskChunk` into the mailbox.
+    /// 
+    /// Utilizes hardware-specific demote/clean instructions to accelerate
+    /// visibility of the updated tail pointer to the consumer core.
     #[inline(always)]
     pub fn push(&self, chunk: TaskChunk) -> Result<(), TaskChunk> {
         let current_tail = self.tail.load(Ordering::Relaxed);
@@ -173,31 +195,23 @@ impl Mailbox {
         
         #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86", target_arch = "x86_64")))]
         unsafe {
-            // Hardware Acceleration: CLDEMOTE
-            // Proactively evicts the cache line containing the tail pointer to the shared L3 cache,
-            // anticipating the consumer core will read it soon, significantly reducing coherency traffic.
             core::arch::asm!("cldemote [{}]", in(reg) &self.tail);
         }
 
         #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
         unsafe {
-            // Hardware Acceleration: ARM Data Cache Clean by VA to Point of Coherency (DC CVAC)
-            // Pushes the updated tail index out of the local L1/L2 down to the shared Point of Coherency,
-            // acting identically to CLDEMOTE by accelerating visibility to the remote consumer core.
             core::arch::asm!("dc cvac, {}", in(reg) &self.tail);
         }
 
         #[cfg(all(feature = "hw-acceleration", target_arch = "riscv64"))]
         unsafe {
-            // Hardware Acceleration: RISC-V Zicbom Cache Block Clean (cbo.clean)
-            // Cleans the cache block to the point of coherency, effectively demoting it 
-            // to a shared level so other harts can see the updated tail pointer instantly.
             core::arch::asm!("cbo.clean 0({0})", in(reg) &self.tail);
         }
         
         Ok(())
     }
 
+    /// Pops a `TaskChunk` from the mailbox.
     #[inline(always)]
     pub fn pop(&self) -> Option<TaskChunk> {
         let current_head = self.head.load(Ordering::Relaxed);
@@ -217,30 +231,48 @@ impl Mailbox {
     }
 }
 
+/// Hardware-specific CPU hierarchy information.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuLevel {
+    /// Physical Core ID.
     pub core_id: u16,
+    /// Core Complex (CCX) ID.
     pub ccx_id: u16,
+    /// NUMA Node ID.
     pub numa_id: u16,
 }
 
+/// Topology Strategy for the scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopologyMode {
+    /// Peer-to-Peer Mesh: Tasks are deflected to neighbors based on load.
     P2PMesh,
+    /// Global: Tasks are shared across all cores via a common pool (unsupported in V3).
     Global,
 }
 
+/// Execution unit managed by a single OS thread.
+/// 
+/// Contains the local SPSC queue, load metrics, and work-deflection heuristics.
 #[repr(align(64))]
 pub struct Worker {
+    /// Hierarchy information for this worker's core.
     pub cpu: CpuLevel,
+    /// Current load level (0-100).
     pub load_level: AtomicU8,
+    /// Load threshold above which tasks are deflected to peers.
     pub deflection_threshold: AtomicU8,
     
+    /// Local SPSC execution queue.
     pub local_queue: HugeBuffer<[TaskIndex; LOCAL_QUEUE_CAPACITY]>,
+    /// Head of the local queue.
     pub local_head: usize,
+    /// Tail of the local queue.
     pub local_tail: usize,
     
+    /// Total scheduler ticks executed.
     pub ticks: u64,
+    /// Ordered list of peer core IDs for mailbox polling.
     pub polling_order: Vec<usize>,
 }
 
@@ -248,6 +280,7 @@ unsafe impl Sync for Worker {}
 unsafe impl Send for Worker {}
 
 impl Worker {
+    /// Creates a new `Worker` and calculates its CCX-aware polling order.
     #[inline(always)]
     pub fn new(cpu: CpuLevel, total_cores: usize) -> Self {
         let mut polling_order = Vec::with_capacity(total_cores - 1);
@@ -277,11 +310,13 @@ impl Worker {
         }
     }
     
+    /// Returns the current number of tasks in the local queue.
     #[inline(always)]
     pub fn local_queue_len(&self) -> usize {
         self.local_tail.wrapping_sub(self.local_head) & LOCAL_QUEUE_MASK
     }
 
+    /// Updates the `load_level` based on the current queue length.
     #[inline(always)]
     pub fn update_load(&self) {
         let queue_len = self.local_queue_len();
@@ -289,6 +324,7 @@ impl Worker {
         self.load_level.store(load, Ordering::Relaxed);
     }
     
+    /// Performs internal maintenance tasks (e.g., adaptive threshold updates).
     #[inline(always)]
     pub fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
@@ -308,6 +344,7 @@ impl Worker {
         }
     }
 
+    /// Pushes a single task into the local queue.
     #[inline(always)]
     pub fn push_local(&mut self, task: TaskIndex) {
         unsafe {
@@ -316,6 +353,7 @@ impl Worker {
         self.local_tail = (self.local_tail + 1) & LOCAL_QUEUE_MASK;
     }
     
+    /// Pushes a batch of tasks into the local queue.
     #[inline(always)]
     pub fn push_batch(&mut self, chunk: &TaskChunk) {
         let count = chunk.count;
@@ -349,15 +387,16 @@ impl Worker {
         self.local_tail = end_idx & LOCAL_QUEUE_MASK;
     }
     
-    /// Dispatch Loop
-    /// Executed by the worker thread until the local queue is empty.
+    /// Primary execution loop for the worker thread.
+    /// 
+    /// Drains the local queue, performs O(1) context alignment, and executes
+    /// the context switch to the fiber.
     #[inline(always)]
     pub fn dispatch_loop(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         while self.local_head != self.local_tail {
             let task = (unsafe { *self.local_queue.ptr })[self.local_head];
             self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
             
-            // O(1) alignment calculation with Safety1 GroupGuard spacing natively supported
             let group_offset = (task as usize >> 5) * group_guard_size;
             let target_ptr = unsafe {
                 context_base.add((task as usize) * context_size + group_offset) as *mut crate::memory_management::FiberContext
@@ -374,15 +413,11 @@ impl Worker {
             }
             #[cfg(all(target_arch = "riscv64", feature = "hw-acceleration"))]
             unsafe {
-                // RISC-V Zicbop extension: prefetch for read into L1 cache
                 core::arch::asm!("prefetch.r 0({0})", in(reg) target_ptr, options(nostack, preserves_flags));
             }
 
-            // Maintain Thread-Local Context for .wait() bridge
             crate::future_bridge::CURRENT_FIBER.with(|c| c.set(target_ptr));
 
-            // Safe Context Switch: Call the dynamic switcher defined in `FiberContext`.
-            // This allows per-task configuration of float-saving and thread-affinity logic.
             unsafe {
                 ((*target_ptr).switch_fn)(
                     &mut (*target_ptr).executor_regs,
@@ -390,16 +425,23 @@ impl Worker {
                 );
             }
 
-            // Clear context after fiber yields or terminates
             crate::future_bridge::CURRENT_FIBER.with(|c| c.set(core::ptr::null_mut()));
         }
     }
 }
 
+/// The Dtact-V3 Distributed Scheduler.
+/// 
+/// Manages a set of `Worker` units and the P2P Mailbox matrix for 
+/// cross-core task migration.
 pub struct DtaScheduler {
+    /// Thread-local worker states.
     pub workers: Vec<UnsafeCell<Worker>>,
+    /// N x N Mailbox matrix for P2P communication.
     pub mailboxes: Vec<Vec<Mailbox>>,
+    /// Active topology mode.
     pub topology: TopologyMode,
+    /// Branchless jump table for task enqueuing.
     pub enqueue_jmp: [fn(&DtaScheduler, usize, usize, TaskIndex); 2],
 }
 
@@ -407,6 +449,7 @@ unsafe impl Sync for DtaScheduler {}
 unsafe impl Send for DtaScheduler {}
 
 impl DtaScheduler {
+    /// Creates a new `DtaScheduler` for the specified number of workers.
     #[inline(always)]
     pub fn new(num_workers: usize, topology: TopologyMode) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
@@ -451,10 +494,6 @@ impl DtaScheduler {
         
         #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86", target_arch = "x86_64")))]
         unsafe {
-            // Hardware Acceleration: UINTR (User-Level Interrupts)
-            // Fire a _senduipi directly to the target core to wake it up instantly if it's yielding,
-            // avoiding OS-level context switches or expensive IPIs.
-            // Using raw bytes for `senduipi rax` to guarantee compilation on older LLVMs.
             core::arch::asm!(
                 "mov rax, {}",
                 ".byte 0xf3, 0x0f, 0xc7, 0xf0", 
@@ -466,29 +505,25 @@ impl DtaScheduler {
 
         #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
         unsafe {
-            // Hardware Acceleration: ARM Send Event (SEV)
-            // Broadcasts an event to all cores. If the target core is in a low-power yield state
-            // via WFE (Wait For Event), this wakes it up instantly in userspace without OS traps.
             core::arch::asm!("sev", options(nostack, preserves_flags));
         }
 
         #[cfg(all(feature = "hw-acceleration", target_arch = "riscv64"))]
         unsafe {
-            // Hardware Acceleration: RISC-V AIA (Advanced Interrupt Architecture)
-            // Sends a User-level IPI (UIPI) to the target hart.
-            // Writing to the `uipi` CSR triggers a user-level interrupt directly on the 
-            // target core, allowing instantaneous wakeups from `Zihintpause` spin states.
             core::arch::asm!("csrw uipi, {0}", in(reg) target_core);
         }
     }
 
+    /// Enqueues a task into the mesh, applying work-deflection if necessary.
+    /// 
+    /// Uses a branchless Double-Hash strategy to distribute tasks across the
+    /// CCX neighbors if the local core is under heavy load.
     #[inline(always)]
     pub fn enqueue_task(&self, source_core: usize, flow_id: u64, task: TaskIndex) {
         let worker_ref = unsafe { &*self.workers[source_core].get() };
         let threshold = worker_ref.deflection_threshold.load(Ordering::Relaxed);
         let load = worker_ref.load_level.load(Ordering::Relaxed);
 
-        // Branchless Double Hash for Spatial Smoothing
         let deflect_mask = if load > threshold { usize::MAX } else { 0 };
         let h1 = (flow_id & 7) as usize; 
         let h2 = ((flow_id >> 3) & 7 | 1) as usize; 
@@ -504,6 +539,7 @@ impl DtaScheduler {
         (self.enqueue_jmp[jump_idx])(self, source_core, target_core, task);
     }
 
+    /// Polls all incoming mailboxes for the current core.
     #[inline(always)]
     pub fn poll_mailboxes(&self, current_core: usize) {
         let worker = unsafe { &mut *self.workers[current_core].get() };
@@ -521,50 +557,42 @@ impl DtaScheduler {
         worker.tick();
     }
 
-    /// The Main Scheduler Heartbeat Loop
-    /// Executes the dispatch assembly and seamlessly manages the mailbox topology when exhausted.
+    /// Main heartbeat loop for a worker thread.
+    /// 
+    /// Manages the full lifecycle of fiber execution: local dispatch,
+    /// P2P polling, and hardware-assisted backoff (UMWAIT, WFE, PAUSE).
     #[inline]
     pub fn run_worker(&self, current_core: usize, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
         loop {
-            // 1. Drain the local SPSC queue natively
             unsafe {
                 let worker = &mut *self.workers[current_core].get();
                 worker.dispatch_loop(context_base, context_size, group_guard_size);
             }
             
-            // 2. Local queue exhausted. Pull from P2P Mailbox Mesh.
             self.poll_mailboxes(current_core);
             
-            // 3. Affinity Controls & Backoff
             unsafe {
                 let worker = &*self.workers[current_core].get();
                 if worker.local_queue_len() == 0 {
-                    // Active spinning or hardware-assisted sleep if queue remains completely dry.
                     #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
                     {
-                        // ARM64 WFE (Wait For Event). Pauses execution until a SEV instruction 
-                        // is executed by another core (which we do in `do_push_remote`).
                         core::arch::asm!("wfe", options(nostack, preserves_flags));
                     }
                     #[cfg(all(feature = "hw-acceleration", target_arch = "riscv64"))]
                     {
-                        // RISC-V PAUSE (Zihintpause extension). Reduces energy consumption 
-                        // while spinning, awaiting UIPI.
                         core::arch::asm!("pause", options(nostack, preserves_flags));
                     }
                     #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86_64", target_arch = "x86")))]
                     {
-                        // x86_64: UMONITOR/UMWAIT for optimized user-level backoff.
-                        // We monitor the local queue's head/tail to wake up on new tasks.
                         unsafe {
                             let tail_ptr = &worker.local_tail as *const _ as *mut core::ffi::c_void;
                             core::arch::asm!(
                                 "umonitor {0}",
-                                "test {1}, {1}", // Check if we should still wait
+                                "test {1}, {1}", 
                                 "jnz 2f",
-                                "mov eax, 1",    // Control: C0.1 (Fast wakeup)
-                                "xor edx, edx",  // Timeout high
-                                "mov ebx, 0xFFFFFFFF", // Timeout low (long)
+                                "mov eax, 1",    
+                                "xor edx, edx",  
+                                "mov ebx, 0xFFFFFFFF", 
                                 "umwait eax",
                                 "2:",
                                 in(reg) tail_ptr,
@@ -578,7 +606,6 @@ impl DtaScheduler {
                     }
                     #[cfg(all(not(feature = "hw-acceleration"), any(target_arch = "x86_64", target_arch = "x86")))]
                     {
-                        // x86_64 fallback: `spin_loop` emits `pause`.
                         core::hint::spin_loop();
                     }
                 }

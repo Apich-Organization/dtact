@@ -2,39 +2,54 @@
 #![allow(non_snake_case)]
 
 use core::sync::atomic::{AtomicU32, AtomicU8, AtomicU64, Ordering};
-// use crate::dta_scheduler::TaskIndex; // Reserved for zero-copy flow tracking
 use std::task::RawWaker;
 
 /// Safety policies for context pool memory layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafetyLevel {
+    /// Raw performance: No guard pages, minimal overhead.
     Safety0,
+    /// Balanced: Guard pages every 32 contexts to catch massive overflows.
     Safety1,
+    /// Strict: Per-context hardware guard pages for maximum isolation.
     Safety2,
 }
 
+/// Hints to the scheduler about the expected behavior of a task.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkloadKind {
+    /// CPU-bound logic (default).
     Compute,
+    /// Heavily blocked on external I/O.
     IO,
+    /// Memory-intensive scanning or bulk transfers.
     Memory,
 }
 
+/// Topology Strategy for the scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopologyMode {
+    /// Peer-to-Peer Mesh: Tasks are deflected to neighbors based on load.
     P2PMesh,
+    /// Global: Tasks are shared across all cores via a common pool.
     Global,
 }
 
 /// Machine-specific registers for context switching.
+/// 
+/// Aligned to 64 bytes to prevent cache line splits and ensure atomic
+/// context updates on supported architectures.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub(crate) struct Registers {
+    /// General Purpose Registers (GPRs).
     pub(crate) gprs: [u64; 16],
+    /// SIMD / Extended state (e.g. AVX, Neon).
     pub(crate) extended_state: [u8; 512],
 }
 
 impl Registers {
+    /// Creates a new, zeroed register set.
     #[must_use]
     #[inline(always)]
     pub(crate) const fn new() -> Self {
@@ -52,48 +67,86 @@ impl Default for Registers {
     }
 }
 
+/// Lifecycle state of a fiber.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FiberStatus {
+    /// Not currently allocated.
     Initial = 0,
+    /// Actively scheduled or running.
     Running = 1,
+    /// Voluntarily yielded to another fiber.
     Yielded = 2,
+    /// Execution finished successfully.
     Finished = 3,
+    /// Terminated due to an unhandled panic.
     Panicked = 4,
 }
 
+/// The control block and metadata for a single Dtact Fiber.
+/// 
+/// This struct is placed at the top of each context slot, immediately 
+/// below the 8KB zero-copy buffer.
 #[repr(C, align(64))]
 pub(crate) struct FiberContext {
+    /// Current stack pointer for this fiber.
     pub(crate) stack_ptr: usize,
+    /// Saved stack pointer of the executor thread.
     pub(crate) scheduler_stack_ptr: usize,
+    /// OS-specific TIB stack limit (Windows).
     pub(crate) tib_stack_limit: usize,
+    /// OS-specific TIB stack base (Windows).
     pub(crate) tib_stack_base: usize,
+    /// Current execution state.
     pub(crate) state: AtomicU8,
+    /// Configured workload kind.
     pub(crate) kind: WorkloadKind,
+    /// Configured topology mode.
     pub(crate) mode: TopologyMode,
+    /// Core ID where this fiber was originally spawned.
     pub(crate) origin_core: u16,
+    /// Unique index in the `ContextPool`.
     pub(crate) fiber_index: u32,
+    /// Thread ID of the host awaiting this fiber.
     pub(crate) waiter_thread_id: AtomicU64,
+    /// Standard Rust waker for future compatibility.
     pub(crate) static_raw_waker: RawWaker,
+    /// Saved fiber register state.
     pub(crate) regs: Registers,
+    /// Saved executor register state.
     pub(crate) executor_regs: Registers,
+    /// Link to the next available context in the free list.
     pub(crate) next_free: AtomicU32,
+    /// Pointer to panic payload if the fiber crashed.
     pub(crate) panic_payload_ptr: *mut (),
+    /// Assembly entry point.
     pub(crate) trampoline: unsafe extern "C" fn(),
+    /// Closure/Future invocation wrapper.
     pub(crate) invoke_closure: unsafe fn(*mut ()),
+    /// Pointer to the closure or future.
     pub(crate) closure_ptr: *mut (),
+    /// Pointer to the result of the fiber.
     pub(crate) result_ptr: *mut (),
+    /// Opaque pointer for reader bridge.
     pub(crate) reader_ptr: *mut (),
+    /// Reference to a shared buffer.
     pub(crate) buf_ptr: *mut [u8],
+    /// The 8KB Zero-Copy buffer located just below this struct.
     pub(crate) read_buffer_ptr: *mut u8,
+    /// Target assembly function for context switching.
     pub(crate) switch_fn: unsafe extern "C" fn(*mut Registers, *const Registers),
+    /// Cleanup logic called when the fiber is destroyed.
     pub(crate) cleanup_fn: Option<unsafe extern "C" fn(*mut ())>,
+    /// Adaptive spin count for futex synchronization.
     pub(crate) adaptive_spin_count: u32,
+    /// Number of consecutive spin failures.
     pub(crate) spin_failure_count: u32,
+    /// Last OS thread ID that executed this fiber.
     pub(crate) last_os_thread_id: u64,
 }
 
 impl FiberContext {
+    /// Creates a new, blank `FiberContext`.
     pub(crate) const fn new() -> Self {
         Self {
             stack_ptr: 0,
@@ -130,9 +183,14 @@ impl FiberContext {
 unsafe extern "C" fn dummy_trampoline() {}
 unsafe fn dummy_invoke(_: *mut ()) {}
 
+/// A page-aligned arena for managing fiber stacks and control blocks.
+/// 
+/// The `ContextPool` ensures O(1) allocation and hardware-level isolation
+/// through tiered safety levels and OS memory protection primitives.
 pub struct ContextPool {
     base_ptr: *mut u8,
     total_size: usize,
+    /// Size of each context slot in bytes.
     pub slot_size: usize,
     capacity: u32,
     safety: SafetyLevel,
@@ -143,13 +201,16 @@ unsafe impl Send for ContextPool {}
 unsafe impl Sync for ContextPool {}
 
 impl ContextPool {
+    /// Creates a new `ContextPool` with the specified capacity and safety.
+    /// 
+    /// This function performs the initial bulk allocation (via mmap or 
+    /// VirtualAlloc) and configures any requested hardware guard pages.
     pub fn new(capacity: u32, stack_size: usize, safety: SafetyLevel, _numa: usize) -> Result<Self, &'static str> {
         let page_size = 4096;
         let align = 64;
         let context_sz = (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
         
         // Slot Size: [ Stack Space | 8KB Read Buffer | FiberContext ]
-        // Enforce page alignment for the entire slot to ensure mprotect compatibility
         let slot_size = (stack_size + context_sz + 8192 + page_size - 1) & !(page_size - 1);
         
         let total_size = match safety {
@@ -161,13 +222,13 @@ impl ContextPool {
             SafetyLevel::Safety2 => capacity as usize * (slot_size + page_size),
         };
         
-        // Add 4KB for SEH/Metadata (Windows RVA safety)
+        // Add 4KB for SEH/Metadata
         let total_size_with_meta = total_size + 4096;
 
         unsafe {
             let base_ptr = Self::allocate_arena(total_size_with_meta, safety)?;
             
-            // PRE-PROTECT Guard Pages (Low Address / Bottom of stack)
+            // PRE-PROTECT Guard Pages
             if safety == SafetyLevel::Safety1 {
                 for i in 0..((capacity + 31) / 32) {
                     let guard_ptr = base_ptr.add(i as usize * (slot_size * 32 + page_size));
@@ -189,7 +250,6 @@ impl ContextPool {
                 free_head: AtomicU64::new(0),
             };
 
-            // Build the Lock-Free Free-List
             for i in 0..capacity {
                 let ctx_ptr = pool.get_context_ptr(i);
                 core::ptr::write(ctx_ptr, FiberContext::new());
@@ -199,15 +259,13 @@ impl ContextPool {
                 let raw_read_buf = (ctx_ptr as *mut u8).sub(8192);
                 (*ctx_ptr).read_buffer_ptr = (raw_read_buf as usize & !63) as *mut u8;
                 
-                // Link next available context
                 (*ctx_ptr).next_free.store(i + 1, Ordering::Relaxed);
             }
 
-            // Sentinel for the end of the free list
             let last_ctx = pool.get_context_ptr(capacity - 1);
             (*last_ctx).next_free.store(u32::MAX, Ordering::Relaxed);
 
-            // Point 2: Windows SEH Registration (Full Production Unwind Info)
+            // Windows SEH Registration
             #[cfg(windows)]
             {
                 use windows_sys::Win32::System::Diagnostics::Debug::{RtlAddFunctionTable, RUNTIME_FUNCTION};
@@ -220,7 +278,6 @@ impl ContextPool {
                     frame_register_and_offset: u8,
                 }
                 
-                // Metadata is at the end of the arena (last 4KB page)
                 let meta_base = base_ptr.add(total_size);
                 let unwind_info_ptr = meta_base as *mut UnwindInfo;
                 core::ptr::write(unwind_info_ptr, UnwindInfo {
@@ -281,6 +338,7 @@ impl ContextPool {
         }
     }
 
+    /// Returns a raw pointer to a context based on its index.
     #[inline(always)]
     pub fn get_context_ptr(&self, index: u32) -> *mut FiberContext {
         let page_size = 4096;
@@ -299,7 +357,7 @@ impl ContextPool {
         }
     }
 
-    /// O(1) Pop with ABA protection
+    /// O(1) Pop from the free list with ABA protection.
     #[inline(always)]
     pub fn alloc_context(&self) -> Option<u32> {
         let mut head = self.free_head.load(Ordering::Acquire);
@@ -320,6 +378,7 @@ impl ContextPool {
         }
     }
 
+    /// Returns a context to the free list.
     #[inline(always)]
     pub fn free_context(&self, index: u32) {
         let ctx = self.get_context_ptr(index);
@@ -343,6 +402,7 @@ impl ContextPool {
         }
     }
 
+    /// Returns the base pointer and layout metadata for direct dispatcher access.
     #[inline(always)]
     pub fn get_dispatch_layout(&self) -> (*mut u8, usize, usize) {
         let page_size = 4096;
