@@ -107,23 +107,23 @@ impl<T> HugeBuffer<T> {
 
         #[cfg(windows)]
         unsafe {
-            use crate::memory_management::winapi_shim;
+            use windows_sys::Win32::System::Memory;
             #[cfg(feature = "windows-root")]
             {
-                let mut ptr = winapi_shim::VirtualAlloc(
+                let mut ptr = Memory::VirtualAlloc(
                     core::ptr::null_mut(),
                     size_bytes,
-                    winapi_shim::MEM_RESERVE
-                        | winapi_shim::MEM_COMMIT
-                        | winapi_shim::MEM_LARGE_PAGES,
-                    winapi_shim::PAGE_READWRITE,
+                    Memory::MEM_RESERVE
+                        | Memory::MEM_COMMIT
+                        | Memory::MEM_LARGE_PAGES,
+                    Memory::PAGE_READWRITE,
                 );
                 if ptr.is_null() {
-                    ptr = winapi_shim::VirtualAlloc(
+                    ptr = Memory::VirtualAlloc(
                         core::ptr::null_mut(),
                         size_bytes,
-                        winapi_shim::MEM_RESERVE | winapi_shim::MEM_COMMIT,
-                        winapi_shim::PAGE_READWRITE,
+                        Memory::MEM_RESERVE | Memory::MEM_COMMIT,
+                        Memory::PAGE_READWRITE,
                     );
                     assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
                 }
@@ -134,11 +134,11 @@ impl<T> HugeBuffer<T> {
             }
             #[cfg(not(feature = "windows-root"))]
             {
-                let ptr = winapi_shim::VirtualAlloc(
+                let ptr = Memory::VirtualAlloc(
                     core::ptr::null_mut(),
                     size_bytes,
-                    winapi_shim::MEM_RESERVE | winapi_shim::MEM_COMMIT,
-                    winapi_shim::PAGE_READWRITE,
+                    Memory::MEM_RESERVE | Memory::MEM_COMMIT,
+                    Memory::PAGE_READWRITE,
                 );
                 assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
                 Self {
@@ -159,10 +159,10 @@ impl<T> Drop for HugeBuffer<T> {
         }
         #[cfg(windows)]
         unsafe {
-            crate::memory_management::winapi_shim::VirtualFree(
+            windows_sys::Win32::System::Memory::VirtualFree(
                 self.ptr as *mut core::ffi::c_void,
                 0,
-                crate::memory_management::winapi_shim::MEM_RELEASE,
+                windows_sys::Win32::System::Memory::MEM_RELEASE,
             );
         }
     }

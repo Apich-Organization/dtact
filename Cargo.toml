@@ -14,11 +14,13 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics",
     "Win32_System_Memory",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
 ] }
 
 [dev-dependencies]
 loom = "0.7"
 proptest = "1.6"
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [profile.bench]
 codegen-units = 1
