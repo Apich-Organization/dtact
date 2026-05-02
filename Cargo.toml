@@ -1,5 +1,5 @@
 [workspace]
-members = ["dtact-macros"]
+members = ["dtact-macros", "fuzz"]
 
 [package]
 name = "dtact"
