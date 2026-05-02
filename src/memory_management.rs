@@ -237,7 +237,7 @@ impl ContextPool {
 
             let pool = Self {
                 base_ptr,
-                total_size,
+                total_size: total_size_with_meta,
                 slot_size,
                 capacity,
                 safety,

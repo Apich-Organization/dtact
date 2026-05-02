@@ -77,7 +77,10 @@ impl<T> HugeBuffer<T> {
 
         #[cfg(unix)]
         unsafe {
-            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | 0x40000; // MAP_HUGETLB
+            let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+            if size_bytes >= 2 * 1024 * 1024 {
+                flags |= 0x40000; // MAP_HUGETLB
+            }
             let ptr = libc::mmap(
                 core::ptr::null_mut(),
                 size_bytes,
