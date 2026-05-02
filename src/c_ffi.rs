@@ -88,7 +88,8 @@ pub extern "C" fn dtact_fiber_launch(
     func: extern "C" fn(*mut c_void),
     arg: *mut c_void,
 ) -> dtact_handle_t {
-    let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Dtact Runtime not initialized");
+    let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
+    let pool = &runtime.pool;
     let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
     
     let ctx_ptr = pool.get_context_ptr(ctx_id);
@@ -154,7 +155,8 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
     arg: *mut c_void,
     cleanup: unsafe extern "C" fn(*mut c_void),
 ) -> dtact_handle_t {
-    let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Dtact Runtime not initialized");
+    let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
+    let pool = &runtime.pool;
     let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
     
     let ctx_ptr = pool.get_context_ptr(ctx_id);
@@ -212,7 +214,8 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
         // UNIVERSAL WAIT: If called from a non-Fiber thread (e.g., C++ main), 
         // we use a tiered strategy: spin-loop -> futex_wait.
         let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
-        let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Runtime not initialized");
+        let runtime = crate::GLOBAL_RUNTIME.get().expect("Runtime not initialized");
+        let pool = &runtime.pool;
         let target_ctx = pool.get_context_ptr(target_ctx_id);
         
         let mut spins = 0;
@@ -233,7 +236,8 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     }
 
     let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
-    let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Runtime not initialized");
+    let runtime = crate::GLOBAL_RUNTIME.get().expect("Runtime not initialized");
+    let pool = &runtime.pool;
     let target_ctx = pool.get_context_ptr(target_ctx_id);
 
     loop {
@@ -258,8 +262,9 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_run(_rt: *mut c_void) {
-    let scheduler = crate::GLOBAL_SCHEDULER.get().expect("Dtact Runtime not initialized");
-    let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Dtact Runtime not initialized");
+    let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
+    let scheduler = &runtime.scheduler;
+    let pool = &runtime.pool;
     let (base, sz, guard_sz) = pool.get_dispatch_layout();
     
     let workers_count = scheduler.workers.len();

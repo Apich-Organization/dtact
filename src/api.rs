@@ -99,7 +99,8 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     #[inline]
     pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(self, fut: F) -> dtact_handle_t {
-        let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Dtact Runtime not initialized");
+        let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
+        let pool = &runtime.pool;
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         
         let ctx_ptr = pool.get_context_ptr(ctx_id);
@@ -364,7 +365,8 @@ pub mod fiber {
     use super::*;
     #[inline]
     pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(_stack_size_str: &str, f: F) -> dtact_handle_t {
-        let pool = crate::GLOBAL_CONTEXT_POOL.get().expect("Dtact Runtime not initialized");
+        let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
+        let pool = &runtime.pool;
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         let ctx_ptr = pool.get_context_ptr(ctx_id);
         let current_core = topology::current().core_id as usize;
@@ -412,6 +414,25 @@ pub mod fiber {
 
         crate::wake_fiber(current_core, ctx_id);
         dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
+    }
+
+    /// Yields execution directly to another fiber.
+    /// Note: This is a hint to the scheduler.
+    #[inline(always)]
+    pub fn yield_to(handle: dtact_handle_t) {
+        let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(|c| c.get());
+        if ctx_ptr.is_null() { return; } 
+        
+        let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
+        let target_core_id = (handle.0 >> 32) as usize;
+        
+        crate::wake_fiber(target_core_id, target_ctx_id);
+        
+        unsafe {
+            let ctx = &mut *ctx_ptr;
+            ctx.state.store(crate::memory_management::FiberStatus::Yielded as u8, core::sync::atomic::Ordering::Release);
+            (ctx.switch_fn)(&mut ctx.regs, &ctx.executor_regs);
+        }
     }
 }
 
@@ -474,6 +495,15 @@ pub async fn yield_now() {
         }
     }
     YieldNow(false).await
+}
+
+/// Yields execution to another fiber handle asynchronously.
+#[inline(always)]
+pub async fn yield_to(handle: dtact_handle_t) {
+    let target_ctx_id = (handle.0 & 0xFFFFFFFF) as u32;
+    let target_core_id = (handle.0 >> 32) as usize;
+    crate::wake_fiber(target_core_id, target_ctx_id);
+    yield_now().await;
 }
 
 pub mod config {
