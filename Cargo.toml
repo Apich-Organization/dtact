@@ -11,6 +11,7 @@ pastey = "0.2"
 futures-io = "0.3"
 libc = "0.2"
 tokio = { version = "1.50", default-features = false }
+dtact-macros = { path = "./dtact-macros", version = "0.1.0" }
 
 [profile.bench]
 codegen-units = 1

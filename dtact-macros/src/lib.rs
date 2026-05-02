@@ -10,6 +10,7 @@ struct TaskArgs {
     affinity: String,
     kind: String,
     stack: String,
+    switcher: String,
 }
 
 impl Parse for TaskArgs {
@@ -19,6 +20,7 @@ impl Parse for TaskArgs {
         let mut affinity = "SameCore".to_string();
         let mut kind = "Compute".to_string();
         let mut stack = "2M".to_string();
+        let mut switcher = "CrossThreadFloat".to_string();
 
         for var in vars {
             if let Meta::NameValue(nv) = var {
@@ -50,6 +52,13 @@ impl Parse for TaskArgs {
                     {
                         stack = s.value();
                     }
+                } else if nv.path.is_ident("switcher") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = nv.value
+                    {
+                        switcher = s.value();
+                    }
                 }
             }
         }
@@ -59,6 +68,7 @@ impl Parse for TaskArgs {
             affinity,
             kind,
             stack,
+            switcher,
         })
     }
 }
@@ -78,6 +88,8 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
     let priority_ident = syn::Ident::new(priority, fn_name.span());
     let affinity_ident = syn::Ident::new(affinity, fn_name.span());
     let kind_ident = syn::Ident::new(kind, fn_name.span());
+    let switcher = &args.switcher;
+    let switcher_ident = syn::Ident::new(switcher, fn_name.span());
 
     let expanded = quote! {
         #input
@@ -87,6 +99,7 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
             pub const AFFINITY: dtact::topology::Affinity = dtact::topology::Affinity::#affinity_ident;
             pub const KIND: dtact::WorkloadKind = dtact::WorkloadKind::#kind_ident;
             pub const STACK_SIZE: &'static str = #stack;
+            pub type SWITCHER = dtact::#switcher_ident;
         }
     };
 
@@ -159,23 +172,94 @@ pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+struct InitArgs {
+    topology: String,
+    safety: String,
+    workers: usize,
+    capacity: u32,
+    stack: usize,
+    numa: usize,
+}
+
+impl Parse for InitArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let vars = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
+        let mut topology = "P2PMesh".to_string();
+        let mut safety = "Safety1".to_string();
+        let mut workers = 0;
+        let mut capacity = 16384;
+        let mut stack = 2 * 1024 * 1024;
+        let mut numa = 0;
+
+        for var in vars {
+            if let Meta::NameValue(nv) = var {
+                if nv.path.is_ident("topology") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = &nv.value
+                    {
+                        topology = s.value();
+                    }
+                } else if nv.path.is_ident("safety") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = &nv.value
+                    {
+                        safety = s.value();
+                    }
+                } else if nv.path.is_ident("workers") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Int(i), ..
+                    }) = &nv.value
+                    {
+                        workers = i.base10_parse()?;
+                    }
+                } else if nv.path.is_ident("capacity") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Int(i), ..
+                    }) = &nv.value
+                    {
+                        capacity = i.base10_parse()?;
+                    }
+                } else if nv.path.is_ident("stack") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Int(i), ..
+                    }) = &nv.value
+                    {
+                        stack = i.base10_parse()?;
+                    }
+                } else if nv.path.is_ident("numa") {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Int(i), ..
+                    }) = &nv.value
+                    {
+                        numa = i.base10_parse()?;
+                    }
+                }
+            }
+        }
+        Ok(InitArgs {
+            topology,
+            safety,
+            workers,
+            capacity,
+            stack,
+            numa,
+        })
+    }
+}
+
 #[proc_macro_attribute]
 pub fn dtact_init(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as InitArgs);
     let input = parse_macro_input!(item as ItemFn);
-    let args_str = args.to_string();
 
-    let topology = if args_str.contains("Global") {
-        "Global"
-    } else {
-        "P2PMesh"
-    };
-    let safety = if args_str.contains("Safety2") {
-        "Safety2"
-    } else if args_str.contains("Safety0") {
-        "Safety0"
-    } else {
-        "Safety1"
-    };
+    let topology = &args.topology;
+    let safety = &args.safety;
+    let workers = args.workers;
+    let capacity = args.capacity;
+    let stack = args.stack;
+    let numa = args.numa;
 
     let topology_ident = syn::Ident::new(topology, input.sig.ident.span());
     let safety_ident = syn::Ident::new(safety, input.sig.ident.span());
@@ -187,16 +271,21 @@ pub fn dtact_init(args: TokenStream, item: TokenStream) -> TokenStream {
             #[unsafe(no_mangle)]
             extern "C" fn dtact_autostart() {
                 dtact::GLOBAL_RUNTIME.get_or_init(|| {
+                    let mut workers_count = #workers;
+                    if workers_count == 0 {
+                        workers_count = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+                    }
+
                     let scheduler = dtact::dta_scheduler::DtaScheduler::new(
-                        128,
+                        workers_count,
                         dtact::dta_scheduler::TopologyMode::#topology_ident
                     );
 
                     let pool = dtact::memory_management::ContextPool::new(
-                        16384,
-                        2 * 1024 * 1024,
+                        #capacity,
+                        #stack,
                         dtact::memory_management::SafetyLevel::#safety_ident,
-                        4
+                        #numa
                     ).expect("DTA-V3 Hardware Initialization Failed");
 
                     dtact::Runtime { scheduler, pool }

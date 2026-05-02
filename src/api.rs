@@ -145,6 +145,21 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
         self
     }
 
+    /// Switches the context-switching strategy (e.g. `SameThreadNoFloat`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn switcher<NewS: ContextSwitcher>(self) -> SpawnBuilder<NewS> {
+        SpawnBuilder {
+            name: self.name,
+            affinity: self.affinity,
+            priority: self.priority,
+            kind: self.kind,
+            mode: self.mode,
+            safety: self.safety,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
     /// Finalizes and launches the fiber into the runtime.
     ///
     /// This performs the critical "Zero-Copy" layout calculation:
@@ -454,11 +469,13 @@ pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(fut: F) -> dtact_
 }
 
 /// Fiber configuration and construction utilities.
+#[doc(hidden)]
 pub mod spawn {
     use super::{CrossThreadFloat, SpawnBuilder};
     /// Returns a new `SpawnBuilder` with default settings.
     #[inline(always)]
     #[must_use]
+    #[doc(hidden)]
     pub const fn builder() -> SpawnBuilder<CrossThreadFloat> {
         SpawnBuilder::new()
     }

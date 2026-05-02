@@ -55,14 +55,14 @@ pub fn get_cpu_fast() -> u32 {
         #[cfg(not(feature = "hw-acceleration"))]
         {
             // Fallback to RDTSCP for legacy compatibility.
-            core::arch::x86_64::__rdtscp(&mut aux);
+            core::arch::x86_64::__rdtscp(&raw mut aux);
         }
         aux
     }
     #[cfg(all(not(target_arch = "x86_64"), target_os = "linux"))]
     unsafe {
         let mut cpu: u32 = 0;
-        libc::getcpu(&mut cpu, core::ptr::null_mut());
+        libc::getcpu(&raw mut cpu, core::ptr::null_mut());
         cpu
     }
     #[cfg(not(any(target_arch = "x86_64", target_os = "linux")))]

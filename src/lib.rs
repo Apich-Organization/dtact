@@ -1,7 +1,7 @@
 //! # Dtact-V3: Distributed Task-Aware Coroutine Toolkit
 //!
 //! Dtact is a high-performance, low-latency asynchronous runtime designed for systems-level
-//! programming across heterogeneous architectures (`x86_64`, `AArch64`, RISC-V).
+//! programming across heterogeneous architectures (`x86_64`, `AArch64`, `RISC-V`).
 //!
 //! ## Core Architecture
 //! 1. **Lock-Free Arena**: A page-aligned memory pool for fiber contexts, providing O(1) allocation
@@ -11,7 +11,6 @@
 //! 3. **Zero-Copy Migration**: Leveraging self-referential futures and direct stack-top injection
 //!    to move running tasks across cores without heap allocation.
 //!
-//! ## Safety & Safety Levels
 //! Dtact provides tiered safety levels (0-2) allowing developers to trade off between raw
 //! performance and hardware-enforced isolation (e.g., guard pages and SEH registration).
 
@@ -73,21 +72,60 @@
 
 extern crate alloc;
 
+/// Set the deflection threshold for the DTA-V3 Scheduler.
+pub use crate::api::config::set_deflection_threshold;
+/// Spawn a fiber with a custom stack size.
+pub use crate::api::fiber::spawn_with_stack;
+/// Hardware-level demotion API.
+#[cfg(feature = "hw-acceleration")]
+pub use crate::api::hw::cldemote;
+/// Hardware-level interrupt signaling API.
+#[cfg(feature = "hw-acceleration")]
+pub use crate::api::hw::uintr_signal;
+/// Spawn a fiber.
+pub use crate::api::spawn;
+/// Yield execution to the scheduler.
+pub use crate::api::yield_now;
+/// Yield execution to another fiber.
+pub use crate::api::yield_to;
+/// Handle for C-compatible FFI.
+pub use crate::c_ffi::dtact_handle_t;
+/// Runtime error types.
+pub use crate::errors::DtactError;
+/// Wait for a fiber to complete.
+pub use crate::future_bridge::wait;
+/// Attribute macro for initializing the Dtact runtime.
+pub use dtact_macros::dtact_init;
+/// Attribute macro for exporting an async function to C.
+pub use dtact_macros::export_async;
+/// Attribute macro for exporting a fiber to C.
+pub use dtact_macros::export_fiber;
+/// Attribute macro for defining a Dtact task.
+pub use dtact_macros::task;
+
 /// Public user-facing API for spawning and managing fibers.
+#[doc(hidden)]
 pub mod api;
 /// C-compatible FFI boundary for cross-language integration.
+#[doc(hidden)]
 pub mod c_ffi;
 /// Low-level assembly-based context switching primitives.
+#[doc(hidden)]
 pub mod context_switch;
 /// Distributed P2P Mesh scheduler implementation.
+#[doc(hidden)]
 pub mod dta_scheduler;
 /// Standard error types for the Dtact runtime.
+#[doc(hidden)]
 pub mod errors;
 /// Bridge for polling futures within a `FiberContext`.
+#[doc(hidden)]
 pub mod future_bridge;
 /// Lock-free arena and OS-level memory management.
+#[doc(hidden)]
 pub mod memory_management;
 /// Timing, topology, and OS-specific primitives.
+#[doc(hidden)]
 pub mod utils;
 
 pub use api::*;
@@ -96,6 +134,7 @@ pub use api::*;
 ///
 /// Consolidates the distributed scheduler and the memory pool into a single
 /// unit to ensure architectural consistency across all worker threads.
+#[doc(hidden)]
 pub struct Runtime {
     /// The distributed P2P work-deflection scheduler.
     pub(crate) scheduler: dta_scheduler::DtaScheduler,
@@ -113,6 +152,7 @@ pub(crate) static GLOBAL_RUNTIME: std::sync::OnceLock<Runtime> = std::sync::Once
 ///
 /// A high value indicates that captured future sizes exceed the pre-allocated
 /// stack-top buffer, causing a performance cliff due to heap traffic.
+#[doc(hidden)]
 pub static HEAP_ESCAPED_SPAWNS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 

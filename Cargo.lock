@@ -6,6 +6,7 @@ version = 4
 name = "dtact"
 version = "0.1.0"
 dependencies = [
+ "dtact-macros",
  "futures-io",
  "libc",
  "pastey",
