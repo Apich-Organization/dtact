@@ -39,7 +39,7 @@ fn test_guard_page_isolation() {
     // The read buffer is 8KB, and above it is the stack.
     // If we write far below the context pointer (into the guard page), it should fault.
     // We can't easily catch a segfault in a test, but we can verify the memory layout.
-    let (base, slot_sz, guard_sz) = pool.get_dispatch_layout();
+    let (base, slot_sz, guard_sz, _context_offset) = pool.get_dispatch_layout();
     assert_eq!(guard_sz, 4096);
     assert!(slot_sz > 4096 + 8192);
 }

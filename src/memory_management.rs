@@ -475,14 +475,18 @@ impl ContextPool {
 
     /// Returns the base pointer and layout metadata for direct dispatcher access.
     #[inline(always)]
-    pub fn get_dispatch_layout(&self) -> (*mut u8, usize, usize) {
+    pub fn get_dispatch_layout(&self) -> (*mut u8, usize, usize, usize) {
         let page_size = 4096;
+        let align = 64;
+        let context_sz = (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
         let guard_size = if self.safety == SafetyLevel::Safety0 {
             0
         } else {
             page_size
         };
-        (self.base_ptr, self.slot_size, guard_size)
+        // context_offset: byte offset within each slot where FiberContext begins
+        let context_offset = self.slot_size - context_sz;
+        (self.base_ptr, self.slot_size, guard_size, context_offset)
     }
 }
 

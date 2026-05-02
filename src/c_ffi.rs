@@ -341,7 +341,7 @@ pub extern "C" fn dtact_run(_rt: *mut c_void) {
         .expect("Dtact Runtime not initialized");
     let scheduler = &runtime.scheduler;
     let pool = &runtime.pool;
-    let (base, sz, guard_sz) = pool.get_dispatch_layout();
+    let (base, sz, guard_sz, context_offset) = pool.get_dispatch_layout();
 
     let workers_count = scheduler.workers.len();
     let mut handles = alloc::vec::Vec::with_capacity(workers_count);
@@ -355,7 +355,7 @@ pub extern "C" fn dtact_run(_rt: *mut c_void) {
         let handle = std::thread::spawn(move || {
             let s = unsafe { &*(scheduler_ptr as *const crate::dta_scheduler::DtaScheduler) };
             let b = base_ptr as *mut u8;
-            unsafe { s.run_worker_with_shutdown(i, b, sz, guard_sz, shutdown_ptr) };
+            unsafe { s.run_worker_with_shutdown(i, b, sz, guard_sz, context_offset, shutdown_ptr) };
         });
         handles.push(handle);
     }

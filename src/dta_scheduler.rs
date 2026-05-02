@@ -439,6 +439,7 @@ impl Worker {
         context_base: *mut u8,
         context_size: usize,
         group_guard_size: usize,
+        context_offset: usize,
     ) {
         while self.local_head != self.local_tail {
             let task = unsafe {
@@ -452,6 +453,7 @@ impl Worker {
                 #[allow(clippy::cast_ptr_alignment)]
                 context_base
                     .add((task as usize) * context_size + group_offset)
+                    .add(context_offset)
                     .cast::<crate::memory_management::FiberContext>()
             };
 
@@ -584,6 +586,8 @@ impl DtaScheduler {
     /// be deflected to any available core in the runtime.
     #[inline(always)]
     pub fn enqueue_task(&self, source_core: usize, flow_id: u64, task: TaskIndex) {
+        let num_workers = self.workers.len();
+        let source_core = source_core % num_workers;
         let worker_ref = unsafe { &*self.workers[source_core].get() };
         let threshold = worker_ref.deflection_threshold.load(Ordering::Relaxed);
         let load = worker_ref.load_level.load(Ordering::Relaxed);
@@ -596,7 +600,6 @@ impl DtaScheduler {
 
         let target_core = if self.topology == TopologyMode::Global {
             // Global mode: Hash across all workers
-            let num_workers = self.workers.len();
             (source_core + h1 + h2) % num_workers
         } else {
             // P2P Mesh mode: Restricted to CCX (8-core boundary)
@@ -604,7 +607,7 @@ impl DtaScheduler {
             let local_idx = source_core & 7;
             let deflect_target = (local_idx + h1 + h2) & 7;
             let target_idx = local_idx ^ ((local_idx ^ deflect_target) & deflect_mask);
-            ccx_base | target_idx
+            (ccx_base | target_idx) % num_workers
         };
 
         let jump_idx = usize::from(target_core != source_core);
@@ -643,6 +646,7 @@ impl DtaScheduler {
         context_base: *mut u8,
         context_size: usize,
         group_guard_size: usize,
+        context_offset: usize,
         shutdown: &core::sync::atomic::AtomicBool,
     ) {
         loop {
@@ -652,7 +656,7 @@ impl DtaScheduler {
 
             unsafe {
                 let worker = &mut *self.workers[current_core].get();
-                worker.dispatch_loop(context_base, context_size, group_guard_size);
+                worker.dispatch_loop(context_base, context_size, group_guard_size, context_offset);
             }
 
             self.poll_mailboxes(current_core);

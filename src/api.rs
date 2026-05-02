@@ -184,7 +184,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
         let ctx_ptr = pool.get_context_ptr(ctx_id);
         #[allow(clippy::cast_possible_truncation)]
-        let current_core = topology::current().core_id as usize;
+        let current_core = topology::current().core_id as usize % runtime.scheduler.workers.len();
 
         unsafe {
             (*ctx_ptr).state.store(
@@ -212,6 +212,10 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             let buffer_end = buffer_start + 8192;
             let aligned_fut_addr = (buffer_end - fut_size) & !(align - 1);
 
+            // Determine where the stack region ends (just below the future).
+            // The stack grows DOWNWARD from this address toward buffer_start.
+            let stack_limit: usize;
+
             if aligned_fut_addr < buffer_start || (aligned_fut_addr + fut_size) > buffer_end {
                 // Future exceeds pre-allocated 8KB buffer. Fallback to heap.
                 crate::HEAP_ESCAPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -236,6 +240,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                     crate::future_bridge::wait_pinned(f_pinned);
                 };
                 (*ctx_ptr).cleanup_fn = None;
+
+                // Heap path: entire 8KB buffer is available as stack
+                stack_limit = buffer_end;
             } else {
                 let fut_ptr = aligned_fut_addr as *mut F;
                 core::ptr::write(fut_ptr, fut);
@@ -249,13 +256,19 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                     }
                 };
                 (*ctx_ptr).closure_ptr = fut_ptr.cast::<()>();
+
+                // Inline path: stack lives below the future
+                stack_limit = aligned_fut_addr;
             }
 
-            // Windows ABI Compliance (Shadow Space) & Stack Alignment
-            let stack_top = (buffer_start & !0xF) - 64;
+            // Stack setup: RSP starts at the top of the available stack region.
+            // 16-byte aligned, minus 8 for the poison return address (to satisfy
+            // x86_64 ABI requirement that RSP is 16n+8 at function entry after call).
+            let stack_top = (stack_limit & !0xF) - 8;
             let stack_top_ptr = stack_top as *mut u64;
 
-            // Poison return address (dtact_abort)
+            // Poison return address (dtact_abort) — if fiber_entry_point ever returns,
+            // this triggers a controlled abort instead of undefined behavior.
             core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
 
             let stack_top = stack_top as *mut u8;
