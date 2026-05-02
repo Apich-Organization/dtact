@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
+#[allow(unused_imports)]
 use core::arch::asm;
 
 /// Task Index used for Zero-Copy passing
@@ -538,9 +539,33 @@ impl DtaScheduler {
                         // while spinning, awaiting UIPI.
                         core::arch::asm!("pause", options(nostack, preserves_flags));
                     }
-                    #[cfg(any(not(feature = "hw-acceleration"), target_arch = "x86_64", target_arch = "x86"))]
+                    #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86_64", target_arch = "x86")))]
                     {
-                        // x86_64: `spin_loop` emits `pause`. UINTR will interrupt this.
+                        // x86_64: UMONITOR/UMWAIT for optimized user-level backoff.
+                        // We monitor the local queue's head/tail to wake up on new tasks.
+                        unsafe {
+                            let tail_ptr = &worker.local_tail as *const _ as *mut core::ffi::c_void;
+                            core::arch::asm!(
+                                "umonitor {0}",
+                                "test {1}, {1}", // Check if we should still wait
+                                "jnz 2f",
+                                "mov eax, 1",    // Control: C0.1 (Fast wakeup)
+                                "xor edx, edx",  // Timeout high
+                                "mov ebx, 0xFFFFFFFF", // Timeout low (long)
+                                "umwait eax",
+                                "2:",
+                                in(reg) tail_ptr,
+                                in(reg) worker.local_queue_len(),
+                                out("eax") _,
+                                out("edx") _,
+                                out("ebx") _,
+                                options(nostack, preserves_flags)
+                            );
+                        }
+                    }
+                    #[cfg(all(not(feature = "hw-acceleration"), any(target_arch = "x86_64", target_arch = "x86")))]
+                    {
+                        // x86_64 fallback: `spin_loop` emits `pause`.
                         core::hint::spin_loop();
                     }
                 }

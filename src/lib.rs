@@ -36,7 +36,6 @@
     // For `no-std` Situation Issues
     dead_code,
     warnings,
-    unsafe_code,
     clippy::dbg_macro,
     clippy::todo,
     clippy::cast_possible_truncation,
@@ -48,6 +47,7 @@
 // LEVEL 3: ALLOW/IGNORABLE (Allow)
 // -------------------------------------------------------------------------
 #![allow(
+    unsafe_code,
     clippy::restriction,
     clippy::inline_always,
     unused_doc_comments,

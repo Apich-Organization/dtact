@@ -2,6 +2,7 @@
 #![allow(non_snake_case)]
 
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use crate::dta_scheduler::TaskIndex;
 use std::task::RawWaker;
 
 /// Safety policies for context pool memory layout.
@@ -320,10 +321,7 @@ impl ContextPool {
             let generation = (current_head >> 32) as u32;
             if index == u32::MAX { return None; }
             
-            let ctx_ptr = unsafe {
-                let (_, slot_sz) = self.get_dispatch_layout();
-                self.base_ptr.add(index as usize * slot_sz + slot_sz - ((core::mem::size_of::<FiberContext>() + 63) & !63)) as *const FiberContext
-            };
+            let ctx_ptr = self.get_context_ptr(index);
             let next_index = unsafe { (*ctx_ptr).next_free.load(Ordering::Relaxed) };
             
             // Advance generation counter to prevent ABA vulnerability
@@ -339,10 +337,7 @@ impl ContextPool {
     /// Lock-Free Reclamation (O(1) Push with ABA protection)
     #[inline(always)]
     pub fn free_context(&self, index: u32) {
-        let ctx_ptr = unsafe {
-            let (_, slot_sz) = self.get_dispatch_layout();
-            self.base_ptr.add(index as usize * slot_sz + slot_sz - ((core::mem::size_of::<FiberContext>() + 63) & !63)) as *mut FiberContext
-        };
+        let ctx_ptr = self.get_context_ptr(index);
         
         let mut current_head = self.free_head.load(Ordering::Relaxed);
         loop {
