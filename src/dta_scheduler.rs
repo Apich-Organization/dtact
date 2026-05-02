@@ -113,9 +113,7 @@ impl<T> HugeBuffer<T> {
                 let mut ptr = Memory::VirtualAlloc(
                     core::ptr::null_mut(),
                     size_bytes,
-                    Memory::MEM_RESERVE
-                        | Memory::MEM_COMMIT
-                        | Memory::MEM_LARGE_PAGES,
+                    Memory::MEM_RESERVE | Memory::MEM_COMMIT | Memory::MEM_LARGE_PAGES,
                     Memory::PAGE_READWRITE,
                 );
                 if ptr.is_null() {
