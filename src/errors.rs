@@ -1,5 +1,5 @@
 /// Generates a structured error enum with cold-path optimization.
-/// 
+///
 /// This macro generates the error enumeration and a set of "cold" helper
 /// functions that wrap the error variants in `Err`. These helpers are
 /// marked with `#[cold]` and `#[inline(never)]` to ensure that error

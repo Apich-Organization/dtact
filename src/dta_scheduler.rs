@@ -1,8 +1,8 @@
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use core::cell::UnsafeCell;
 #[allow(unused_imports)]
 use core::arch::asm;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// Task Index used for Zero-Copy passing within the `ContextPool`.
 pub type TaskIndex = u32;
@@ -23,7 +23,7 @@ pub const LOCAL_QUEUE_CAPACITY: usize = 8192;
 pub const LOCAL_QUEUE_MASK: usize = LOCAL_QUEUE_CAPACITY - 1;
 
 /// Batch Ownership Transfer Chunk.
-/// 
+///
 /// A chunk of 32 task indices, transferred in a single atomic pointer exchange
 /// to minimize coherency traffic across the P2P mesh.
 #[derive(Debug, Clone, Copy)]
@@ -45,7 +45,7 @@ impl Default for TaskChunk {
 }
 
 /// Helper for Huge Page Allocation to eliminate TLB Misses.
-/// 
+///
 /// Manages page-aligned memory regions that utilize 2MB or 1GB huge pages
 /// (where supported by the OS) to maximize memory throughput.
 pub struct HugeBuffer<T> {
@@ -67,14 +67,14 @@ impl<T> Default for HugeBuffer<T> {
 
 impl<T> HugeBuffer<T> {
     /// Allocates a new `HugeBuffer` using OS-specific huge page primitives.
-    /// 
+    ///
     /// # Panics
     /// Panics if the OS fails to allocate memory (even after fallback to 4KB pages).
     #[inline]
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         let size_bytes = core::mem::size_of::<T>();
-        
+
         #[cfg(unix)]
         unsafe {
             let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | 0x40000; // MAP_HUGETLB
@@ -99,7 +99,10 @@ impl<T> HugeBuffer<T> {
                 assert!(ptr != libc::MAP_FAILED, "HugeBuffer mmap failed");
             }
             core::ptr::write_bytes(ptr, 0, size_bytes);
-            Self { ptr: ptr.cast::<T>(), size_bytes }
+            Self {
+                ptr: ptr.cast::<T>(),
+                size_bytes,
+            }
         }
 
         #[cfg(windows)]
@@ -110,7 +113,9 @@ impl<T> HugeBuffer<T> {
                 let mut ptr = winapi_shim::VirtualAlloc(
                     core::ptr::null_mut(),
                     size_bytes,
-                    winapi_shim::MEM_RESERVE | winapi_shim::MEM_COMMIT | winapi_shim::MEM_LARGE_PAGES,
+                    winapi_shim::MEM_RESERVE
+                        | winapi_shim::MEM_COMMIT
+                        | winapi_shim::MEM_LARGE_PAGES,
                     winapi_shim::PAGE_READWRITE,
                 );
                 if ptr.is_null() {
@@ -122,7 +127,10 @@ impl<T> HugeBuffer<T> {
                     );
                     assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
                 }
-                Self { ptr: ptr as *mut T, size_bytes }
+                Self {
+                    ptr: ptr as *mut T,
+                    size_bytes,
+                }
             }
             #[cfg(not(feature = "windows-root"))]
             {
@@ -133,7 +141,10 @@ impl<T> HugeBuffer<T> {
                     winapi_shim::PAGE_READWRITE,
                 );
                 assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
-                Self { ptr: ptr as *mut T, size_bytes }
+                Self {
+                    ptr: ptr as *mut T,
+                    size_bytes,
+                }
             }
         }
     }
@@ -151,23 +162,23 @@ impl<T> Drop for HugeBuffer<T> {
             crate::memory_management::winapi_shim::VirtualFree(
                 self.ptr as *mut core::ffi::c_void,
                 0,
-                crate::memory_management::winapi_shim::MEM_RELEASE
+                crate::memory_management::winapi_shim::MEM_RELEASE,
             );
         }
     }
 }
 
 /// Single-Producer Single-Consumer (SPSC) Queue for the P2P Mesh Mailbox.
-/// 
+///
 /// Aligned to 64 bytes to prevent false sharing between sender and receiver cores.
 #[repr(align(64))]
 pub struct Mailbox {
     head: AtomicUsize,
     _pad1: [u8; 64 - core::mem::size_of::<AtomicUsize>()],
-    
+
     tail: AtomicUsize,
     _pad2: [u8; 64 - core::mem::size_of::<AtomicUsize>()],
-    
+
     buffer: HugeBuffer<UnsafeCell<[TaskChunk; MAILBOX_CAPACITY]>>,
 }
 
@@ -184,7 +195,7 @@ impl Default for Mailbox {
 impl Mailbox {
     /// Creates a new, empty Mailbox.
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub fn new() -> Self {
         Self {
             head: AtomicUsize::new(0),
@@ -196,10 +207,10 @@ impl Mailbox {
     }
 
     /// Pushes a `TaskChunk` into the mailbox.
-    /// 
+    ///
     /// Utilizes hardware-specific demote/clean instructions to accelerate
     /// visibility of the updated tail pointer to the consumer core.
-    /// 
+    ///
     /// # Errors
     /// Returns the `TaskChunk` back to the caller if the mailbox is full.
     #[inline(always)]
@@ -218,8 +229,11 @@ impl Mailbox {
         }
 
         self.tail.store(next_tail, Ordering::Release);
-        
-        #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86", target_arch = "x86_64")))]
+
+        #[cfg(all(
+            feature = "hw-acceleration",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
         unsafe {
             core::arch::asm!("cldemote [{}]", in(reg) &raw const self.tail);
         }
@@ -233,7 +247,7 @@ impl Mailbox {
         unsafe {
             core::arch::asm!("cbo.clean 0({0})", in(reg) &self.tail);
         }
-        
+
         Ok(())
     }
 
@@ -278,7 +292,7 @@ pub enum TopologyMode {
 }
 
 /// Execution unit managed by a single OS thread.
-/// 
+///
 /// Contains the local SPSC queue, load metrics, and work-deflection heuristics.
 #[repr(align(64))]
 pub struct Worker {
@@ -288,14 +302,14 @@ pub struct Worker {
     pub load_level: AtomicU8,
     /// Load threshold above which tasks are deflected to peers.
     pub deflection_threshold: AtomicU8,
-    
+
     /// Local SPSC execution queue.
     pub local_queue: HugeBuffer<[TaskIndex; LOCAL_QUEUE_CAPACITY]>,
     /// Head of the local queue.
     pub local_head: usize,
     /// Tail of the local queue.
     pub local_tail: usize,
-    
+
     /// Total scheduler ticks executed.
     pub ticks: u64,
     /// Ordered list of peer core IDs for mailbox polling.
@@ -308,7 +322,7 @@ unsafe impl Send for Worker {}
 impl Worker {
     /// Creates a new `Worker` and calculates its CCX-aware polling order.
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     #[allow(clippy::cast_possible_truncation)]
     pub fn new(cpu: CpuLevel, total_cores: usize) -> Self {
         let mut polling_order = Vec::with_capacity(total_cores - 1);
@@ -337,7 +351,7 @@ impl Worker {
             polling_order,
         }
     }
-    
+
     /// Returns the current number of tasks in the local queue.
     #[inline(always)]
     pub const fn local_queue_len(&self) -> usize {
@@ -352,7 +366,7 @@ impl Worker {
         let load = core::cmp::min((queue_len * 100) >> 13, 100) as u8;
         self.load_level.store(load, Ordering::Relaxed);
     }
-    
+
     /// Performs internal maintenance tasks (e.g., adaptive threshold updates).
     #[inline(always)]
     pub fn tick(&mut self) {
@@ -360,7 +374,7 @@ impl Worker {
         if self.ticks.trailing_zeros() >= 10 {
             let load = self.load_level.load(Ordering::Relaxed);
             let current_thresh = self.deflection_threshold.load(Ordering::Relaxed);
-            
+
             let new_thresh = if load > 90 {
                 current_thresh.saturating_sub(5).max(40)
             } else if load < 30 {
@@ -368,8 +382,9 @@ impl Worker {
             } else {
                 current_thresh
             };
-            
-            self.deflection_threshold.store(new_thresh, Ordering::Relaxed);
+
+            self.deflection_threshold
+                .store(new_thresh, Ordering::Relaxed);
         }
     }
 
@@ -381,20 +396,20 @@ impl Worker {
         }
         self.local_tail = (self.local_tail + 1) & LOCAL_QUEUE_MASK;
     }
-    
+
     /// Pushes a batch of tasks into the local queue.
     #[inline(always)]
     pub fn push_batch(&mut self, chunk: &TaskChunk) {
         let count = chunk.count;
         let tail = self.local_tail;
         let end_idx = tail + count;
-        
+
         if end_idx <= LOCAL_QUEUE_CAPACITY {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     chunk.tasks.as_ptr(),
                     (*self.local_queue.ptr).as_mut_ptr().add(tail),
-                    count
+                    count,
                 );
             }
         } else {
@@ -404,38 +419,45 @@ impl Worker {
                 core::ptr::copy_nonoverlapping(
                     chunk.tasks.as_ptr(),
                     (*self.local_queue.ptr).as_mut_ptr().add(tail),
-                    first_part
+                    first_part,
                 );
                 core::ptr::copy_nonoverlapping(
                     chunk.tasks.as_ptr().add(first_part),
                     (*self.local_queue.ptr).as_mut_ptr(),
-                    second_part
+                    second_part,
                 );
             }
         }
         self.local_tail = end_idx & LOCAL_QUEUE_MASK;
     }
-    
+
     /// Primary execution loop for the worker thread.
-    /// 
+    ///
     /// Drains the local queue, performs O(1) context alignment, and executes
     /// the context switch to the fiber.
-    /// 
+    ///
     /// # Safety
     /// * `context_base` must point to the start of the `ContextPool` memory region.
     /// * `context_size` and `group_guard_size` must match the pool's initialized layout.
     #[inline(always)]
-    pub unsafe fn dispatch_loop(&mut self, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
+    pub unsafe fn dispatch_loop(
+        &mut self,
+        context_base: *mut u8,
+        context_size: usize,
+        group_guard_size: usize,
+    ) {
         while self.local_head != self.local_tail {
             let task = (unsafe { *self.local_queue.ptr })[self.local_head];
             self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
-            
+
             let group_offset = (task as usize >> 5) * group_guard_size;
             let target_ptr = unsafe {
                 #[allow(clippy::cast_ptr_alignment)]
-                context_base.add((task as usize) * context_size + group_offset).cast::<crate::memory_management::FiberContext>()
+                context_base
+                    .add((task as usize) * context_size + group_offset)
+                    .cast::<crate::memory_management::FiberContext>()
             };
-            
+
             // Hardware Prefetch: Bring FiberContext to L1 using T0 hint immediately
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -465,8 +487,8 @@ impl Worker {
 }
 
 /// The Dtact-V3 Distributed Scheduler.
-/// 
-/// Manages a set of `Worker` units and the P2P Mailbox matrix for 
+///
+/// Manages a set of `Worker` units and the P2P Mailbox matrix for
 /// cross-core task migration.
 pub struct DtaScheduler {
     /// Thread-local worker states.
@@ -485,19 +507,22 @@ unsafe impl Send for DtaScheduler {}
 impl DtaScheduler {
     /// Creates a new `DtaScheduler` for the specified number of workers.
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub fn new(num_workers: usize, topology: TopologyMode) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
         let mut mailboxes = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
             #[allow(clippy::cast_possible_truncation)]
-            workers.push(UnsafeCell::new(Worker::new(CpuLevel {
-                core_id: i as u16,
-                ccx_id: (i / 8) as u16,
-                numa_id: (i / 64) as u16,
-            }, num_workers)));
-            
+            workers.push(UnsafeCell::new(Worker::new(
+                CpuLevel {
+                    core_id: i as u16,
+                    ccx_id: (i / 8) as u16,
+                    numa_id: (i / 64) as u16,
+                },
+                num_workers,
+            )));
+
             let mut row = Vec::with_capacity(num_workers);
             for _ in 0..num_workers {
                 row.push(Mailbox::new());
@@ -527,12 +552,15 @@ impl DtaScheduler {
         chunk.tasks[0] = task;
         chunk.count = 1;
         let _ = self.mailboxes[source_core][target_core].push(chunk);
-        
-        #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86", target_arch = "x86_64")))]
+
+        #[cfg(all(
+            feature = "hw-acceleration",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
         unsafe {
             core::arch::asm!(
                 "mov rax, {}",
-                ".byte 0xf3, 0x0f, 0xc7, 0xf0", 
+                ".byte 0xf3, 0x0f, 0xc7, 0xf0",
                 in(reg) target_core as u64,
                 out("rax") _,
                 options(nostack, preserves_flags),
@@ -551,11 +579,11 @@ impl DtaScheduler {
     }
 
     /// Enqueues a task into the mesh, applying work-deflection if necessary.
-    /// 
+    ///
     /// Enqueues a task into the mesh, applying work-deflection if necessary.
-    /// 
-    /// If `TopologyMode::P2PMesh` is active, deflection is restricted to 
-    /// local CCX neighbors. If `TopologyMode::Global` is active, tasks can 
+    ///
+    /// If `TopologyMode::P2PMesh` is active, deflection is restricted to
+    /// local CCX neighbors. If `TopologyMode::Global` is active, tasks can
     /// be deflected to any available core in the runtime.
     #[inline(always)]
     pub fn enqueue_task(&self, source_core: usize, flow_id: u64, task: TaskIndex) {
@@ -565,9 +593,9 @@ impl DtaScheduler {
 
         let deflect_mask = if load > threshold { usize::MAX } else { 0 };
         #[allow(clippy::cast_possible_truncation)]
-        let h1 = (flow_id & 7) as usize; 
+        let h1 = (flow_id & 7) as usize;
         #[allow(clippy::cast_possible_truncation)]
-        let h2 = ((flow_id >> 3) & 7 | 1) as usize; 
+        let h2 = ((flow_id >> 3) & 7 | 1) as usize;
 
         let target_core = if self.topology == TopologyMode::Global {
             // Global mode: Hash across all workers
@@ -590,38 +618,44 @@ impl DtaScheduler {
     #[inline(always)]
     pub fn poll_mailboxes(&self, current_core: usize) {
         let worker = unsafe { &mut *self.workers[current_core].get() };
-        
+
         let num_polls = worker.polling_order.len();
         for idx in 0..num_polls {
             let i = worker.polling_order[idx];
-            
+
             while let Some(chunk) = self.mailboxes[i][current_core].pop() {
                 worker.push_batch(&chunk);
             }
         }
-        
+
         worker.update_load();
         worker.tick();
     }
 
     /// Main heartbeat loop for a worker thread.
-    /// 
+    ///
     /// Manages the full lifecycle of fiber execution: local dispatch,
     /// P2P polling, and hardware-assisted backoff (UMWAIT, WFE, PAUSE).
-    /// 
+    ///
     /// # Safety
     /// This function performs raw stack-swapping and memory-access-guard manipulation.
     /// * `context_base` must be a valid pointer to the runtime's context arena.
     #[inline]
-    pub unsafe fn run_worker(&self, current_core: usize, context_base: *mut u8, context_size: usize, group_guard_size: usize) {
+    pub unsafe fn run_worker(
+        &self,
+        current_core: usize,
+        context_base: *mut u8,
+        context_size: usize,
+        group_guard_size: usize,
+    ) {
         loop {
             unsafe {
                 let worker = &mut *self.workers[current_core].get();
                 worker.dispatch_loop(context_base, context_size, group_guard_size);
             }
-            
+
             self.poll_mailboxes(current_core);
-            
+
             unsafe {
                 let worker = &*self.workers[current_core].get();
                 if worker.local_queue_len() == 0 {
@@ -633,14 +667,17 @@ impl DtaScheduler {
                     {
                         core::arch::asm!("pause", options(nostack, preserves_flags));
                     }
-                    #[cfg(all(feature = "hw-acceleration", any(target_arch = "x86_64", target_arch = "x86")))]
+                    #[cfg(all(
+                        feature = "hw-acceleration",
+                        any(target_arch = "x86_64", target_arch = "x86")
+                    ))]
                     {
                         unsafe {
                             let tail_ptr = &raw const worker.local_tail as *mut core::ffi::c_void;
                             let control = 1u32; // C0.1 (Fast wakeup)
                             core::arch::asm!(
                                 "umonitor {0}",
-                                "test {1}, {1}", 
+                                "test {1}, {1}",
                                 "jnz 2f",
                                 "umwait {2:e}",
                                 "2:",
@@ -653,7 +690,10 @@ impl DtaScheduler {
                             );
                         }
                     }
-                    #[cfg(all(not(feature = "hw-acceleration"), any(target_arch = "x86_64", target_arch = "x86")))]
+                    #[cfg(all(
+                        not(feature = "hw-acceleration"),
+                        any(target_arch = "x86_64", target_arch = "x86")
+                    ))]
                     {
                         core::hint::spin_loop();
                     }

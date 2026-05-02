@@ -1,14 +1,14 @@
 //! # Low-Level Context Switching Assembly
-//! 
-//! This module contains the architecture-specific assembly trampolines for 
+//!
+//! This module contains the architecture-specific assembly trampolines for
 //! saving and restoring fiber execution contexts.
-//! 
+//!
 //! ## Performance Strategy
 //! 1. **Hardware Prefetching**: Every switch proactively warms the cache with the
 //!    target fiber's stack and register metadata.
 //! 2. **Windows ABI Compliance**: Preserves the Thread Information Block (TIB)
 //!    stack limits and SEH pointers across switches.
-//! 3. **Non-Serializing State**: Minimizes pipeline stalls by using 
+//! 3. **Non-Serializing State**: Minimizes pipeline stalls by using
 //!    non-serializing instructions where possible.
 
 use crate::memory_management::Registers;
@@ -19,10 +19,10 @@ use core::arch::naked_asm;
 // ============================================================================
 
 /// Switches execution context while preserving floating-point state.
-/// 
+///
 /// Supports cross-thread migration by saving/restoring the full callee-saved
 /// register set and extended SIMD state (FXSAVE/FXRSTOR).
-/// 
+///
 /// # Safety
 /// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
 /// * The stack pointer in `restore` must point to a valid stack region.
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetcht0 [rdx]", 
+        "prefetcht0 [rdx]",
         "mov rax, [rdx]",
         "prefetcht0 [rax]",
         "mov [rcx + 0], rsp",
@@ -123,9 +123,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prfm pldl1keep, [x1]", 
-        "ldr x9, [x1, 96]",     
-        "prfm pldl1keep, [x9]", 
+        "prfm pldl1keep, [x1]",
+        "ldr x9, [x1, 96]",
+        "prfm pldl1keep, [x9]",
         "stp x19, x20, [x0, 0]",
         "stp x21, x22, [x0, 16]",
         "stp x23, x24, [x0, 32]",
@@ -162,7 +162,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prfm pldl1keep, [x1]", 
+        "prfm pldl1keep, [x1]",
         "ldr x9, [x1, 96]",
         "prfm pldl1keep, [x9]",
         "stp x19, x20, [x0, 0]",
@@ -213,9 +213,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetch.r 0(a1)", 
-        "ld a2, 0(a1)",     
-        "prefetch.r 0(a2)", 
+        "prefetch.r 0(a1)",
+        "ld a2, 0(a1)",
+        "prefetch.r 0(a2)",
         "sd sp, 0(a0)",
         "sd s0, 8(a0)",
         "sd s1, 16(a0)",
@@ -340,10 +340,10 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 // ============================================================================
 
 /// Switches execution context without preserving floating-point state.
-/// 
+///
 /// Optimized for non-numerical tasks, significantly reducing the memory
 /// footprint of each switch by ignoring the extended SIMD context.
-/// 
+///
 /// # Safety
 /// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
 /// * The stack pointer in `restore` must point to a valid stack region.
@@ -533,10 +533,10 @@ pub unsafe extern "C" fn switch_context_cross_thread_no_float(
 // ============================================================================
 
 /// Lightweight context switch for fibers pinned to the current thread.
-/// 
+///
 /// Skips the preservation of OS-specific TIB/TEB metadata, assuming the
 /// target fiber will always execute on the same physical host thread.
-/// 
+///
 /// # Safety
 /// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
 /// * The stack pointer in `restore` must point to a valid stack region.
@@ -742,10 +742,10 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 // ============================================================================
 
 /// The fastest possible context switch: same-thread and no floating-point.
-/// 
-/// Utilizes aggressive hardware prefetching (`prefetcht0` / `prfm`) to 
+///
+/// Utilizes aggressive hardware prefetching (`prefetcht0` / `prfm`) to
 /// eliminate memory stalls during local fiber handoffs.
-/// 
+///
 /// # Safety
 /// * `save` and `restore` must be valid, aligned pointers to `Registers` structures.
 /// * The stack pointer in `restore` must point to a valid stack region.
@@ -756,7 +756,7 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetcht0 [rsi]", 
+        "prefetcht0 [rsi]",
         "mov rax, [rsi]",
         "prefetcht0 [rax]",
         "mov [rdi + 0], rsp",
@@ -787,7 +787,7 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetcht0 [rdx]", 
+        "prefetcht0 [rdx]",
         "mov rax, [rdx]",
         "prefetcht0 [rax]",
         "mov [rcx + 0], rsp",
@@ -822,7 +822,7 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prfm pldl1keep, [x1]", 
+        "prfm pldl1keep, [x1]",
         "ldr x9, [x1, 96]",
         "prfm pldl1keep, [x9]",
         "stp x19, x20, [x0, 0]",
@@ -852,7 +852,7 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prfm pldl1keep, [x1]", 
+        "prfm pldl1keep, [x1]",
         "ldr x9, [x1, 96]",
         "prfm pldl1keep, [x9]",
         "stp x19, x20, [x0, 0]",
@@ -882,9 +882,9 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetch.r 0(a1)", 
-        "ld a2, 0(a1)",     
-        "prefetch.r 0(a2)", 
+        "prefetch.r 0(a1)",
+        "ld a2, 0(a1)",
+        "prefetch.r 0(a2)",
         "sd sp, 0(a0)",
         "sd s0, 8(a0)",
         "sd s1, 16(a0)",

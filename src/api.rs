@@ -1,5 +1,5 @@
-use core::future::Future;
 use crate::memory_management::{TopologyMode, WorkloadKind};
+use core::future::Future;
 
 pub use crate::c_ffi::dtact_handle_t;
 pub use topology::Affinity;
@@ -20,31 +20,46 @@ pub enum Priority {
 /// Interface for custom context switching logic.
 pub trait ContextSwitcher: Send + Sync + 'static {
     /// The raw assembly function used for switching to/from this fiber.
-    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers);
+    const SWITCH_FN: unsafe extern "C" fn(
+        *mut crate::memory_management::Registers,
+        *const crate::memory_management::Registers,
+    );
 }
 
 /// Standard switcher that saves/restores floating-point state and supports cross-thread migration.
 pub struct CrossThreadFloat;
 impl ContextSwitcher for CrossThreadFloat {
-    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_cross_thread_float;
+    const SWITCH_FN: unsafe extern "C" fn(
+        *mut crate::memory_management::Registers,
+        *const crate::memory_management::Registers,
+    ) = crate::context_switch::switch_context_cross_thread_float;
 }
 
 /// Lightweight switcher that skips floating-point state but supports cross-thread migration.
 pub struct CrossThreadNoFloat;
 impl ContextSwitcher for CrossThreadNoFloat {
-    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_cross_thread_no_float;
+    const SWITCH_FN: unsafe extern "C" fn(
+        *mut crate::memory_management::Registers,
+        *const crate::memory_management::Registers,
+    ) = crate::context_switch::switch_context_cross_thread_no_float;
 }
 
 /// Optimized switcher for fibers pinned to a single thread, saving/restoring floating-point state.
 pub struct SameThreadFloat;
 impl ContextSwitcher for SameThreadFloat {
-    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_same_thread_float;
+    const SWITCH_FN: unsafe extern "C" fn(
+        *mut crate::memory_management::Registers,
+        *const crate::memory_management::Registers,
+    ) = crate::context_switch::switch_context_same_thread_float;
 }
 
 /// The fastest possible switcher: pins to one thread and ignores floating-point state.
 pub struct SameThreadNoFloat;
 impl ContextSwitcher for SameThreadNoFloat {
-    const SWITCH_FN: unsafe extern "C" fn(*mut crate::memory_management::Registers, *const crate::memory_management::Registers) = crate::context_switch::switch_context_same_thread_no_float;
+    const SWITCH_FN: unsafe extern "C" fn(
+        *mut crate::memory_management::Registers,
+        *const crate::memory_management::Registers,
+    ) = crate::context_switch::switch_context_same_thread_no_float;
 }
 
 /// Fluent builder for configuring and launching fibers.
@@ -69,7 +84,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     /// Creates a new builder with default settings:
     /// Normal priority, Compute kind, P2P Mesh mode, and Safety0 (raw performance).
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             name: None,
@@ -84,7 +99,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     /// Sets the workload kind (Compute or IO).
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn kind(mut self, kind: WorkloadKind) -> Self {
         self.kind = kind;
         self
@@ -92,7 +107,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     /// Sets the topology mode (P2P Mesh or Local Queue).
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn topology_mode(mut self, mode: TopologyMode) -> Self {
         self.mode = mode;
         self
@@ -100,7 +115,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     /// Sets the hardware safety level (0-2).
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn safety(mut self, safety: crate::memory_management::SafetyLevel) -> Self {
         self.safety = safety;
         self
@@ -108,7 +123,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     /// Sets a descriptive name for the fiber (useful for telemetry).
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn name(mut self, name: &'static str) -> Self {
         self.name = Some(name);
         self
@@ -116,7 +131,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     /// Sets the core affinity (`SameCore`, `SameNUMA`, etc.).
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn affinity(mut self, affinity: topology::Affinity) -> Self {
         self.affinity = affinity;
         self
@@ -124,81 +139,87 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
     /// Sets the scheduling priority.
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn priority(mut self, priority: Priority) -> Self {
         self.priority = priority;
         self
     }
 
     /// Finalizes and launches the fiber into the runtime.
-    /// 
+    ///
     /// This performs the critical "Zero-Copy" layout calculation:
     /// 1. Attempts to place the Future directly at the top of the fiber stack.
     /// 2. If the Future is too large (>8KB), falls back to heap allocation.
     /// 3. Configures the assembly trampoline for the selected `ContextSwitcher`.
-    /// 
+    ///
     /// # Panics
     /// * Panics if the runtime is not initialized.
     /// * Panics if the context pool is exhausted.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
     pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(self, fut: F) -> dtact_handle_t {
-        let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
+        let runtime = crate::GLOBAL_RUNTIME
+            .get()
+            .expect("Dtact Runtime not initialized");
         let pool = &runtime.pool;
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
-        
+
         let ctx_ptr = pool.get_context_ptr(ctx_id);
         #[allow(clippy::cast_possible_truncation)]
         let current_core = topology::current().core_id as usize;
 
         unsafe {
-            (*ctx_ptr).state.store(crate::memory_management::FiberStatus::Running as u8, core::sync::atomic::Ordering::Release);
+            (*ctx_ptr).state.store(
+                crate::memory_management::FiberStatus::Running as u8,
+                core::sync::atomic::Ordering::Release,
+            );
             (*ctx_ptr).kind = self.kind;
             (*ctx_ptr).mode = self.mode;
             (*ctx_ptr).origin_core = current_core as u16;
             (*ctx_ptr).fiber_index = ctx_id;
             (*ctx_ptr).switch_fn = S::SWITCH_FN;
-            
+
             // Set adaptive spin count based on workload kind
             (*ctx_ptr).adaptive_spin_count = match self.kind {
                 WorkloadKind::Compute => 1000,
                 WorkloadKind::Memory => 500,
                 WorkloadKind::IO => 100,
             };
-            
+
             // Aligned Zero-Copy Future Migration
             let align = core::mem::align_of::<F>();
             let fut_size = core::mem::size_of::<F>();
             let buffer_start = (*ctx_ptr).read_buffer_ptr as usize;
             let buffer_end = buffer_start + 8192;
             let aligned_fut_addr = (buffer_end - fut_size) & !(align - 1);
-            
+
             if aligned_fut_addr < buffer_start || (aligned_fut_addr + fut_size) > buffer_end {
                 // Future exceeds pre-allocated 8KB buffer. Fallback to heap.
                 crate::HEAP_ESCAPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                
+
                 #[cfg(debug_assertions)]
                 {
-                    static WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+                    static WARNED: core::sync::atomic::AtomicBool =
+                        core::sync::atomic::AtomicBool::new(false);
                     if !WARNED.swap(true, core::sync::atomic::Ordering::Relaxed) {
-                        eprintln!("DTA-V3 WARNING: Future exceeds or misaligns 8KB zero-copy buffer. Switching to heap-allocation mode.");
+                        eprintln!(
+                            "DTA-V3 WARNING: Future exceeds or misaligns 8KB zero-copy buffer. Switching to heap-allocation mode."
+                        );
                     }
                 }
-                
+
                 let boxed = Box::new(fut);
                 let fut_ptr = Box::into_raw(boxed);
                 (*ctx_ptr).closure_ptr = fut_ptr.cast::<()>();
-                (*ctx_ptr).invoke_closure = |ptr| {
-                    unsafe {
-                        let mut f = Box::from_raw(ptr.cast::<F>());
-                        crate::future_bridge::wait(&mut *f);
-                    }
+                (*ctx_ptr).invoke_closure = |ptr| unsafe {
+                    let mut f = Box::from_raw(ptr.cast::<F>());
+                    crate::future_bridge::wait(&mut *f);
                 };
-                (*ctx_ptr).cleanup_fn = None; 
+                (*ctx_ptr).cleanup_fn = None;
             } else {
                 let fut_ptr = aligned_fut_addr as *mut F;
                 core::ptr::write(fut_ptr, fut);
-                
+
                 (*ctx_ptr).invoke_closure = |ptr| {
                     let f_ptr = ptr.cast::<F>();
                     unsafe {
@@ -208,14 +229,14 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 };
                 (*ctx_ptr).closure_ptr = fut_ptr.cast::<()>();
             }
-            
+
             // Windows ABI Compliance (Shadow Space) & Stack Alignment
             let stack_top = (buffer_start & !0xF) - 64;
             let stack_top_ptr = stack_top as *mut u64;
-            
+
             // Poison return address (dtact_abort)
             core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
-            
+
             let stack_top = stack_top as *mut u8;
 
             #[cfg(target_arch = "x86_64")]
@@ -242,30 +263,32 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
 pub(crate) unsafe extern "C" fn fiber_entry_point() {
     let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
-    if ctx_ptr.is_null() { return; }
-    
+    if ctx_ptr.is_null() {
+        return;
+    }
+
     let ctx = unsafe { &mut *ctx_ptr };
     let invoke = ctx.invoke_closure;
     let arg = ctx.closure_ptr;
-    
+
     // Execute the task payload with SEH/Panic protection
     let _ = std::panic::catch_unwind(core::panic::AssertUnwindSafe(move || {
         unsafe { invoke(arg) };
     }));
-    
+
     // Mark context as free for the lock-free pool
-    ctx.state.store(crate::memory_management::FiberStatus::Initial as u8, core::sync::atomic::Ordering::Release);
-    
+    ctx.state.store(
+        crate::memory_management::FiberStatus::Initial as u8,
+        core::sync::atomic::Ordering::Release,
+    );
+
     // Execute cleanup if present (e.g. FFI arg free)
     if let Some(cleanup) = ctx.cleanup_fn.take() {
         unsafe { cleanup(ctx.closure_ptr) };
     }
-    
+
     unsafe {
-        (ctx.switch_fn)(
-            &raw mut ctx.regs,
-            &raw const ctx.executor_regs,
-        );
+        (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
     }
 }
 
@@ -290,7 +313,7 @@ pub mod topology {
 
     /// Returns the Core ID of the currently executing hardware thread.
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub fn current_core() -> u16 {
         current().core_id
     }
@@ -307,20 +330,20 @@ pub mod topology {
     }
 
     /// Returns the hierarchical topology information for the current core.
-    /// 
-    /// This function utilizes thread-local caching and adaptive refresh 
+    ///
+    /// This function utilizes thread-local caching and adaptive refresh
     /// intervals to minimize the overhead of hardware discovery (e.g., CPUID).
     #[inline(always)]
     pub fn current() -> CpuLevel {
         thread_local! {
-            static CACHED: core::cell::Cell<(CpuLevel, u64)> = const { 
-                core::cell::Cell::new((CpuLevel { core_id: 0, ccx_id: 0, numa_id: 0 }, 0)) 
+            static CACHED: core::cell::Cell<(CpuLevel, u64)> = const {
+                core::cell::Cell::new((CpuLevel { core_id: 0, ccx_id: 0, numa_id: 0 }, 0))
             };
         }
-        
+
         let (mut cpu, mut last_refresh) = CACHED.with(std::cell::Cell::get);
         let (now, cpu_id) = crate::utils::get_tick_with_cpu();
-        
+
         // Refresh every 100k cycles OR if Core ID mismatch (vCPU migration)
         if now.wrapping_sub(last_refresh) > 100_000 || u32::from(cpu.core_id) != cpu_id {
             let next_cpu = current_raw();
@@ -336,12 +359,12 @@ pub mod topology {
 
     /// Performs a raw hardware topology discovery via CPUID/MPIDR.
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub fn current_raw() -> CpuLevel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
             let (x2apic_id, core_shift, package_shift): (u32, u32, u32);
-            
+
             unsafe {
                 let (mut eax, mut edx_v): (u32, u32);
                 core::arch::asm!(
@@ -356,7 +379,7 @@ pub mod topology {
                 );
                 core_shift = eax;
                 x2apic_id = edx_v;
-                
+
                 let eax_p: u32;
                 core::arch::asm!(
                     "push rbx",
@@ -370,7 +393,7 @@ pub mod topology {
                 );
                 package_shift = eax_p;
             }
-            
+
             let core_id = x2apic_id & ((1 << core_shift) - 1);
             let ccx_id = (x2apic_id >> core_shift) & ((1 << (package_shift - core_shift)) - 1);
             let numa_id = x2apic_id >> package_shift;
@@ -389,9 +412,9 @@ pub mod topology {
                 core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
             }
             return CpuLevel {
-                core_id: (mpidr & 0xFF) as u16,         
-                ccx_id: ((mpidr >> 8) & 0xFF) as u16,   
-                numa_id: ((mpidr >> 16) & 0xFF) as u16, 
+                core_id: (mpidr & 0xFF) as u16,
+                ccx_id: ((mpidr >> 8) & 0xFF) as u16,
+                numa_id: ((mpidr >> 16) & 0xFF) as u16,
             };
         }
 
@@ -408,9 +431,18 @@ pub mod topology {
             };
         }
 
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64", target_arch = "riscv64")))]
+        #[cfg(not(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "riscv64"
+        )))]
         {
-            CpuLevel { core_id: 0, ccx_id: 0, numa_id: 0 }
+            CpuLevel {
+                core_id: 0,
+                ccx_id: 0,
+                numa_id: 0,
+            }
         }
     }
 }
@@ -423,10 +455,10 @@ pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(fut: F) -> dtact_
 
 /// Fiber configuration and construction utilities.
 pub mod spawn {
-    use super::{SpawnBuilder, CrossThreadFloat};
+    use super::{CrossThreadFloat, SpawnBuilder};
     /// Returns a new `SpawnBuilder` with default settings.
     #[inline(always)]
-    #[must_use] 
+    #[must_use]
     pub const fn builder() -> SpawnBuilder<CrossThreadFloat> {
         SpawnBuilder::new()
     }
@@ -436,14 +468,19 @@ pub mod spawn {
 pub mod fiber {
     use super::{dtact_handle_t, topology};
     /// Spawns a fiber from a closure with a specific stack configuration.
-    /// 
+    ///
     /// # Panics
     /// * Panics if the runtime is not initialized.
     /// * Panics if the context pool is exhausted.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(_stack_size_str: &str, f: F) -> dtact_handle_t {
-        let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
+    pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(
+        _stack_size_str: &str,
+        f: F,
+    ) -> dtact_handle_t {
+        let runtime = crate::GLOBAL_RUNTIME
+            .get()
+            .expect("Dtact Runtime not initialized");
         let pool = &runtime.pool;
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         let ctx_ptr = pool.get_context_ptr(ctx_id);
@@ -451,11 +488,14 @@ pub mod fiber {
         let current_core = topology::current().core_id as usize;
 
         unsafe {
-            (*ctx_ptr).state.store(crate::memory_management::FiberStatus::Running as u8, core::sync::atomic::Ordering::Release);
+            (*ctx_ptr).state.store(
+                crate::memory_management::FiberStatus::Running as u8,
+                core::sync::atomic::Ordering::Release,
+            );
             (*ctx_ptr).origin_core = current_core as u16;
             (*ctx_ptr).fiber_index = ctx_id;
             (*ctx_ptr).switch_fn = crate::context_switch::switch_context_same_thread_no_float;
-            
+
             let f_ptr = (*ctx_ptr).read_buffer_ptr.cast::<F>();
             core::ptr::write(f_ptr, f);
             (*ctx_ptr).invoke_closure = |ptr| {
@@ -463,17 +503,17 @@ pub mod fiber {
                 f();
             };
             (*ctx_ptr).closure_ptr = f_ptr.cast::<()>();
-            
+
             // Point 1: Shadow Space Separation (Stack MUST start BELOW the 8KB Future buffer)
             let buffer_start = (*ctx_ptr).read_buffer_ptr as usize;
             let stack_top = (buffer_start & !0xF) - 64;
             let stack_top_ptr = stack_top as *mut u64;
-            
+
             // Point 4: "Return-to-Nowhere" Protection
             core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
-            
+
             let stack_top = stack_top as *mut u8;
-            
+
             #[cfg(target_arch = "x86_64")]
             {
                 (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
@@ -500,16 +540,21 @@ pub mod fiber {
     #[inline(always)]
     pub fn yield_to(handle: dtact_handle_t) {
         let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
-        if ctx_ptr.is_null() { return; } 
-        
+        if ctx_ptr.is_null() {
+            return;
+        }
+
         let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
         let target_core_id = (handle.0 >> 32) as usize;
-        
+
         crate::wake_fiber(target_core_id, target_ctx_id);
-        
+
         unsafe {
             let ctx = &mut *ctx_ptr;
-            ctx.state.store(crate::memory_management::FiberStatus::Yielded as u8, core::sync::atomic::Ordering::Release);
+            ctx.state.store(
+                crate::memory_management::FiberStatus::Yielded as u8,
+                core::sync::atomic::Ordering::Release,
+            );
             (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
         }
     }
@@ -542,7 +587,7 @@ pub mod hw {
         unsafe {
             core::arch::asm!(
                 "mov rax, {}",
-                ".byte 0xf3, 0x0f, 0xc7, 0xf0", 
+                ".byte 0xf3, 0x0f, 0xc7, 0xf0",
                 in(reg) target_cpu as u64,
                 out("rax") _,
                 options(nostack, preserves_flags),
@@ -565,7 +610,10 @@ pub async fn yield_now() {
     impl Future for YieldNow {
         type Output = ();
         #[inline(always)]
-        fn poll(mut self: core::pin::Pin<&mut Self>, cx: &mut core::task::Context<'_>) -> core::task::Poll<Self::Output> {
+        fn poll(
+            mut self: core::pin::Pin<&mut Self>,
+            cx: &mut core::task::Context<'_>,
+        ) -> core::task::Poll<Self::Output> {
             if self.0 {
                 core::task::Poll::Ready(())
             } else {
@@ -594,12 +642,15 @@ pub mod config {
     #[inline(always)]
     pub fn set_deflection_threshold(core_id: usize, threshold: u8) {
         if let Some(runtime) = crate::GLOBAL_RUNTIME.get()
-            && core_id < runtime.scheduler.workers.len() {
-                unsafe {
-                    let worker = &*runtime.scheduler.workers[core_id].get();
-                    worker.deflection_threshold.store(threshold, Ordering::Release);
-                }
+            && core_id < runtime.scheduler.workers.len()
+        {
+            unsafe {
+                let worker = &*runtime.scheduler.workers[core_id].get();
+                worker
+                    .deflection_threshold
+                    .store(threshold, Ordering::Release);
             }
+        }
     }
 }
 
@@ -608,7 +659,7 @@ pub trait DtactWaitExt {
     /// The type of value produced by the future.
     type Output;
     /// Blocks the current fiber until the future resolves.
-    
+
     fn wait(self) -> Self::Output;
 }
 

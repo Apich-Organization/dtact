@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
 
-use core::sync::atomic::{AtomicU32, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Safety policies for context pool memory layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub enum TopologyMode {
 }
 
 /// Machine-specific registers for context switching.
-/// 
+///
 /// Aligned to 64 bytes to prevent cache line splits and ensure atomic
 /// context updates on supported architectures.
 #[repr(C, align(64))]
@@ -85,8 +85,8 @@ pub(crate) enum FiberStatus {
 }
 
 /// The control block and metadata for a single Dtact Fiber.
-/// 
-/// This struct is placed at the top of each context slot, immediately 
+///
+/// This struct is placed at the top of each context slot, immediately
 /// below the 8KB zero-copy buffer.
 #[repr(C, align(64))]
 pub(crate) struct FiberContext {
@@ -182,7 +182,7 @@ const unsafe extern "C" fn dummy_trampoline() {}
 const unsafe fn dummy_invoke(_: *mut ()) {}
 
 /// A page-aligned arena for managing fiber stacks and control blocks.
-/// 
+///
 /// The `ContextPool` ensures O(1) allocation and hardware-level isolation
 /// through tiered safety levels and OS memory protection primitives.
 pub struct ContextPool {
@@ -201,21 +201,26 @@ unsafe impl Sync for ContextPool {}
 
 impl ContextPool {
     /// Creates a new `ContextPool` with the specified capacity and safety.
-    /// 
-    /// This function performs the initial bulk allocation (via mmap or 
+    ///
+    /// This function performs the initial bulk allocation (via mmap or
     /// `VirtualAlloc`) and configures any requested hardware guard pages.
-    /// 
+    ///
     /// # Errors
-    /// Returns an error if the OS fails to allocate the requested memory region 
+    /// Returns an error if the OS fails to allocate the requested memory region
     /// or if hardware protection cannot be applied to the guard pages.
-    pub fn new(capacity: u32, stack_size: usize, safety: SafetyLevel, _numa: usize) -> Result<Self, &'static str> {
+    pub fn new(
+        capacity: u32,
+        stack_size: usize,
+        safety: SafetyLevel,
+        _numa: usize,
+    ) -> Result<Self, &'static str> {
         let page_size = 4096;
         let align = 64;
         let context_sz = (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
-        
+
         // Slot Size: [ Stack Space | 8KB Read Buffer | FiberContext ]
         let slot_size = (stack_size + context_sz + 8192 + page_size - 1) & !(page_size - 1);
-        
+
         let total_size = match safety {
             SafetyLevel::Safety0 => capacity as usize * slot_size,
             SafetyLevel::Safety1 => {
@@ -224,13 +229,13 @@ impl ContextPool {
             }
             SafetyLevel::Safety2 => capacity as usize * (slot_size + page_size),
         };
-        
+
         // Add 4KB for SEH/Metadata
         let total_size_with_meta = total_size + 4096;
 
         unsafe {
             let base_ptr = Self::allocate_arena(total_size_with_meta, safety)?;
-            
+
             // PRE-PROTECT Guard Pages
             if safety == SafetyLevel::Safety1 {
                 for i in 0..capacity.div_ceil(32) {
@@ -257,11 +262,11 @@ impl ContextPool {
                 let ctx_ptr = pool.get_context_ptr(i);
                 core::ptr::write(ctx_ptr, FiberContext::new());
                 (*ctx_ptr).fiber_index = i;
-                
+
                 // Robust Aligned Read Buffer (64-byte aligned)
                 let raw_read_buf = ctx_ptr.cast::<u8>().sub(8192);
                 (*ctx_ptr).read_buffer_ptr = (raw_read_buf as usize & !63) as *mut u8;
-                
+
                 (*ctx_ptr).next_free.store(i + 1, Ordering::Relaxed);
             }
 
@@ -271,8 +276,10 @@ impl ContextPool {
             // Windows SEH Registration
             #[cfg(windows)]
             {
-                use windows_sys::Win32::System::Diagnostics::Debug::{RtlAddFunctionTable, RUNTIME_FUNCTION};
-                
+                use windows_sys::Win32::System::Diagnostics::Debug::{
+                    RUNTIME_FUNCTION, RtlAddFunctionTable,
+                };
+
                 #[repr(C, packed)]
                 struct UnwindInfo {
                     version_and_flags: u8,
@@ -280,23 +287,29 @@ impl ContextPool {
                     unwind_code_count: u8,
                     frame_register_and_offset: u8,
                 }
-                
+
                 let meta_base = base_ptr.add(total_size);
                 let unwind_info_ptr = meta_base as *mut UnwindInfo;
-                core::ptr::write(unwind_info_ptr, UnwindInfo {
-                    version_and_flags: 0x01, 
-                    prolog_size: 0,
-                    unwind_code_count: 0,
-                    frame_register_and_offset: 0,
-                });
+                core::ptr::write(
+                    unwind_info_ptr,
+                    UnwindInfo {
+                        version_and_flags: 0x01,
+                        prolog_size: 0,
+                        unwind_code_count: 0,
+                        frame_register_and_offset: 0,
+                    },
+                );
 
                 let function_table_ptr = unwind_info_ptr.add(1) as *mut RUNTIME_FUNCTION;
-                core::ptr::write(function_table_ptr, RUNTIME_FUNCTION {
-                    BeginAddress: 0,
-                    EndAddress: total_size as u32,
-                    UnwindData: (unwind_info_ptr as usize - base_ptr as usize) as u32,
-                });
-                
+                core::ptr::write(
+                    function_table_ptr,
+                    RUNTIME_FUNCTION {
+                        BeginAddress: 0,
+                        EndAddress: total_size as u32,
+                        UnwindData: (unwind_info_ptr as usize - base_ptr as usize) as u32,
+                    },
+                );
+
                 let base = base_ptr as usize;
                 RtlAddFunctionTable(function_table_ptr as *const _, 1, base as u64);
             }
@@ -309,13 +322,17 @@ impl ContextPool {
     fn apply_hardware_protection(ptr: *mut u8, size: usize) -> Result<(), &'static str> {
         #[cfg(unix)]
         unsafe {
-            if libc::mprotect(ptr.cast(), size, libc::PROT_NONE) != 0 { return Err("mprotect failed"); }
+            if libc::mprotect(ptr.cast(), size, libc::PROT_NONE) != 0 {
+                return Err("mprotect failed");
+            }
         }
         #[cfg(windows)]
         unsafe {
-            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_NOACCESS};
+            use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
             let mut old = 0;
-            if VirtualProtect(ptr as *mut _, size, PAGE_NOACCESS, &mut old) == 0 { return Err("VirtualProtect failed"); }
+            if VirtualProtect(ptr as *mut _, size, PAGE_NOACCESS, &mut old) == 0 {
+                return Err("VirtualProtect failed");
+            }
         }
         Ok(())
     }
@@ -325,18 +342,37 @@ impl ContextPool {
         #[cfg(unix)]
         {
             let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-            if safety == SafetyLevel::Safety0 { flags |= 0x40000; } // MAP_HUGETLB
-            let ptr = unsafe { libc::mmap(core::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
-            if ptr == libc::MAP_FAILED { return Err("mmap failed"); }
+            if safety == SafetyLevel::Safety0 {
+                flags |= 0x40000;
+            } // MAP_HUGETLB
+            let ptr = unsafe {
+                libc::mmap(
+                    core::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    flags,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err("mmap failed");
+            }
             Ok(ptr.cast::<u8>())
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
             let mut flags = MEM_COMMIT | MEM_RESERVE;
-            if safety == SafetyLevel::Safety0 { flags |= 0x20000000; } // MEM_LARGE_PAGES
+            if safety == SafetyLevel::Safety0 {
+                flags |= 0x20000000;
+            } // MEM_LARGE_PAGES
             let ptr = VirtualAlloc(core::ptr::null_mut(), size, flags, PAGE_READWRITE);
-            if ptr.is_null() { return Err("VirtualAlloc failed"); }
+            if ptr.is_null() {
+                return Err("VirtualAlloc failed");
+            }
             Ok(ptr as *mut u8)
         }
     }
@@ -347,7 +383,7 @@ impl ContextPool {
         let page_size = 4096;
         let align = 64;
         let context_sz = (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
-        
+
         let guard_offset = match self.safety {
             SafetyLevel::Safety0 => 0,
             SafetyLevel::Safety1 => (index as usize / 32 + 1) * page_size,
@@ -355,9 +391,13 @@ impl ContextPool {
         };
 
         unsafe {
-            let slot_base = self.base_ptr.add(index as usize * self.slot_size + guard_offset);
+            let slot_base = self
+                .base_ptr
+                .add(index as usize * self.slot_size + guard_offset);
             #[allow(clippy::cast_ptr_alignment)]
-            slot_base.add(self.slot_size - context_sz).cast::<FiberContext>()
+            slot_base
+                .add(self.slot_size - context_sz)
+                .cast::<FiberContext>()
         }
     }
 
@@ -369,14 +409,21 @@ impl ContextPool {
         loop {
             let index = head as u32;
             let r#gen = (head >> 32) as u32;
-            if index == u32::MAX { return None; }
-            
+            if index == u32::MAX {
+                return None;
+            }
+
             let ctx = self.get_context_ptr(index);
             let next = unsafe { (*ctx).next_free.load(Ordering::Relaxed) };
-            
+
             let new_head = (u64::from(r#gen.wrapping_add(1)) << 32) | u64::from(next);
-            
-            match self.free_head.compare_exchange_weak(head, new_head, Ordering::AcqRel, Ordering::Acquire) {
+
+            match self.free_head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => return Some(index),
                 Err(latest) => head = latest,
             }
@@ -388,10 +435,12 @@ impl ContextPool {
     #[allow(clippy::cast_possible_truncation)]
     pub fn free_context(&self, index: u32) {
         let ctx = self.get_context_ptr(index);
-        
+
         // Reset state to Initial and notify any waiting host threads
-        unsafe { 
-            (*ctx).state.store(FiberStatus::Initial as u8, Ordering::Release); 
+        unsafe {
+            (*ctx)
+                .state
+                .store(FiberStatus::Initial as u8, Ordering::Release);
             crate::utils::futex_wake(&raw const (*ctx).state);
         };
 
@@ -401,7 +450,12 @@ impl ContextPool {
             let r#gen = (head >> 32) as u32;
             unsafe { (*ctx).next_free.store(current_idx, Ordering::Relaxed) };
             let new_head = (u64::from(r#gen.wrapping_add(1)) << 32) | u64::from(index);
-            match self.free_head.compare_exchange_weak(head, new_head, Ordering::Release, Ordering::Relaxed) {
+            match self.free_head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(h) => head = h,
             }
@@ -412,7 +466,11 @@ impl ContextPool {
     #[inline(always)]
     pub fn get_dispatch_layout(&self) -> (*mut u8, usize, usize) {
         let page_size = 4096;
-        let guard_size = if self.safety == SafetyLevel::Safety0 { 0 } else { page_size };
+        let guard_size = if self.safety == SafetyLevel::Safety0 {
+            0
+        } else {
+            page_size
+        };
         (self.base_ptr, self.slot_size, guard_size)
     }
 }
@@ -421,10 +479,12 @@ impl Drop for ContextPool {
     #[inline(always)]
     fn drop(&mut self) {
         #[cfg(unix)]
-        unsafe { libc::munmap(self.base_ptr.cast(), self.total_size); }
+        unsafe {
+            libc::munmap(self.base_ptr.cast(), self.total_size);
+        }
         #[cfg(windows)]
         unsafe {
-            use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
             VirtualFree(self.base_ptr as *mut _, 0, MEM_RELEASE);
         }
     }

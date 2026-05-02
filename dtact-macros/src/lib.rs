@@ -1,6 +1,9 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn, Meta, Lit, parse::Parse, parse::ParseStream, Token, punctuated::Punctuated, FnArg};
+use syn::{
+    FnArg, ItemFn, Lit, Meta, Token, parse::Parse, parse::ParseStream, parse_macro_input,
+    punctuated::Punctuated,
+};
 
 struct TaskArgs {
     priority: String,
@@ -20,26 +23,43 @@ impl Parse for TaskArgs {
         for var in vars {
             if let Meta::NameValue(nv) = var {
                 if nv.path.is_ident("priority") {
-                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = nv.value
+                    {
                         priority = s.value();
                     }
                 } else if nv.path.is_ident("affinity") {
-                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = nv.value
+                    {
                         affinity = s.value();
                     }
                 } else if nv.path.is_ident("kind") {
-                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = nv.value
+                    {
                         kind = s.value();
                     }
                 } else if nv.path.is_ident("stack") {
-                    if let syn::Expr::Lit(syn::ExprLit { lit: Lit::Str(s), .. }) = nv.value {
+                    if let syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) = nv.value
+                    {
                         stack = s.value();
                     }
                 }
             }
         }
 
-        Ok(TaskArgs { priority, affinity, kind, stack })
+        Ok(TaskArgs {
+            priority,
+            affinity,
+            kind,
+            stack,
+        })
     }
 }
 
@@ -47,13 +67,13 @@ impl Parse for TaskArgs {
 pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as TaskArgs);
     let input = parse_macro_input!(item as ItemFn);
-    
+
     let fn_name = &input.sig.ident;
     let priority = &args.priority;
     let affinity = &args.affinity;
     let kind = &args.kind;
     let stack = &args.stack;
-    
+
     let metadata_mod = syn::Ident::new(&format!("dtact_metadata_{}", fn_name), fn_name.span());
     let priority_ident = syn::Ident::new(priority, fn_name.span());
     let affinity_ident = syn::Ident::new(affinity, fn_name.span());
@@ -61,7 +81,7 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         #input
-        
+
         pub mod #metadata_mod {
             pub const PRIORITY: dtact::Priority = dtact::Priority::#priority_ident;
             pub const AFFINITY: dtact::topology::Affinity = dtact::topology::Affinity::#affinity_ident;
@@ -78,10 +98,10 @@ pub fn export_async(_args: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
     let fn_name = &input.sig.ident;
     let wrapper_name = syn::Ident::new(&format!("dtact_export_{}", fn_name), fn_name.span());
-    
+
     let mut c_params = Vec::new();
     let mut call_args = Vec::new();
-    
+
     for input in &input.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
             let pat = &pat_type.pat;
@@ -92,16 +112,16 @@ pub fn export_async(_args: TokenStream, item: TokenStream) -> TokenStream {
             panic!("export_async does not support 'self' parameters");
         }
     }
-    
+
     let expanded = quote! {
         #input
-        
+
         #[unsafe(no_mangle)]
         pub extern "C" fn #wrapper_name(#(#c_params),*) -> dtact::dtact_handle_t {
             dtact::spawn(#fn_name(#(#call_args),*))
         }
     };
-    
+
     TokenStream::from(expanded)
 }
 
@@ -113,7 +133,7 @@ pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
 
     let mut c_params = Vec::new();
     let mut call_args = Vec::new();
-    
+
     for input in &input.sig.inputs {
         if let FnArg::Typed(pat_type) = input {
             let pat = &pat_type.pat;
@@ -127,7 +147,7 @@ pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
 
     let expanded = quote! {
         #input
-        
+
         #[unsafe(no_mangle)]
         pub extern "C" fn #wrapper_name(#(#c_params),*) -> dtact::dtact_handle_t {
             dtact::api::fiber::spawn_with_stack("2M", move || {
@@ -135,7 +155,7 @@ pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
             })
         }
     };
-    
+
     TokenStream::from(expanded)
 }
 
@@ -143,32 +163,42 @@ pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
 pub fn dtact_init(args: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
     let args_str = args.to_string();
-    
-    let topology = if args_str.contains("Global") { "Global" } else { "P2PMesh" };
-    let safety = if args_str.contains("Safety2") { "Safety2" } else if args_str.contains("Safety0") { "Safety0" } else { "Safety1" };
-    
+
+    let topology = if args_str.contains("Global") {
+        "Global"
+    } else {
+        "P2PMesh"
+    };
+    let safety = if args_str.contains("Safety2") {
+        "Safety2"
+    } else if args_str.contains("Safety0") {
+        "Safety0"
+    } else {
+        "Safety1"
+    };
+
     let topology_ident = syn::Ident::new(topology, input.sig.ident.span());
     let safety_ident = syn::Ident::new(safety, input.sig.ident.span());
 
     let expanded = quote! {
         #input
-        
+
         const _: () = {
             #[unsafe(no_mangle)]
             extern "C" fn dtact_autostart() {
                 dtact::GLOBAL_RUNTIME.get_or_init(|| {
                     let scheduler = dtact::dta_scheduler::DtaScheduler::new(
-                        128, 
+                        128,
                         dtact::dta_scheduler::TopologyMode::#topology_ident
                     );
-                    
+
                     let pool = dtact::memory_management::ContextPool::new(
-                        16384, 
+                        16384,
                         2 * 1024 * 1024,
-                        dtact::memory_management::SafetyLevel::#safety_ident, 
-                        4 
+                        dtact::memory_management::SafetyLevel::#safety_ident,
+                        4
                     ).expect("DTA-V3 Hardware Initialization Failed");
-                    
+
                     dtact::Runtime { scheduler, pool }
                 });
             }
