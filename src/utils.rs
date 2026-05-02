@@ -192,7 +192,7 @@ pub fn get_thread_id() -> u64 {
             }
             #[cfg(target_os = "windows")]
             unsafe {
-                tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+                tid = windows_sys::Win32::System::Threading::GetCurrentThreadId() as u64;
             }
             c.set(tid);
         }

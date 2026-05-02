@@ -263,7 +263,7 @@ impl ContextPool {
             #[cfg(windows)]
             {
                 use windows_sys::Win32::System::Diagnostics::Debug::{
-                    RUNTIME_FUNCTION, RtlAddFunctionTable,
+                    IMAGE_RUNTIME_FUNCTION_ENTRY, RtlAddFunctionTable,
                 };
 
                 #[repr(C, packed)]
@@ -286,10 +286,11 @@ impl ContextPool {
                     },
                 );
 
-                let function_table_ptr = unwind_info_ptr.add(1) as *mut RUNTIME_FUNCTION;
+                let function_table_ptr =
+                    unwind_info_ptr.add(1) as *mut IMAGE_RUNTIME_FUNCTION_ENTRY;
                 core::ptr::write(
                     function_table_ptr,
-                    RUNTIME_FUNCTION {
+                    IMAGE_RUNTIME_FUNCTION_ENTRY {
                         BeginAddress: 0,
                         EndAddress: total_size as u32,
                         UnwindData: (unwind_info_ptr as usize - base_ptr as usize) as u32,
