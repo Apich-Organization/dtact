@@ -293,7 +293,9 @@ impl ContextPool {
                     IMAGE_RUNTIME_FUNCTION_ENTRY {
                         BeginAddress: 0,
                         EndAddress: total_size as u32,
-                        UnwindData: (unwind_info_ptr as usize - base_ptr as usize) as u32,
+                        Anonymous: windows_sys::Win32::System::Diagnostics::Debug::IMAGE_RUNTIME_FUNCTION_ENTRY_0 {
+                            UnwindData: (unwind_info_ptr as usize - base_ptr as usize) as u32,
+                        },
                     },
                 );
 
