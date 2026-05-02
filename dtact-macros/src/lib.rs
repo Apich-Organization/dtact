@@ -52,14 +52,13 @@ impl Parse for TaskArgs {
                     {
                         stack = s.value();
                     }
-                } else if nv.path.is_ident("switcher") {
-                    if let syn::Expr::Lit(syn::ExprLit {
+                } else if nv.path.is_ident("switcher")
+                    && let syn::Expr::Lit(syn::ExprLit {
                         lit: Lit::Str(s), ..
                     }) = nv.value
                     {
                         switcher = s.value();
                     }
-                }
             }
         }
 
@@ -228,14 +227,13 @@ impl Parse for InitArgs {
                     {
                         stack = i.base10_parse()?;
                     }
-                } else if nv.path.is_ident("numa") {
-                    if let syn::Expr::Lit(syn::ExprLit {
+                } else if nv.path.is_ident("numa")
+                    && let syn::Expr::Lit(syn::ExprLit {
                         lit: Lit::Int(i), ..
                     }) = &nv.value
                     {
                         numa = i.base10_parse()?;
                     }
-                }
             }
         }
         Ok(InitArgs {

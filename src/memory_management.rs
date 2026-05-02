@@ -212,7 +212,7 @@ impl ContextPool {
         capacity: u32,
         stack_size: usize,
         safety: SafetyLevel,
-        _numa: usize,
+        numa: usize,
     ) -> Result<Self, &'static str> {
         let page_size = 4096;
         let align = 64;
@@ -234,7 +234,7 @@ impl ContextPool {
         let total_size_with_meta = total_size + 4096;
 
         unsafe {
-            let base_ptr = Self::allocate_arena(total_size_with_meta, safety)?;
+            let base_ptr = Self::allocate_arena(total_size_with_meta, safety, numa)?;
 
             // PRE-PROTECT Guard Pages
             if safety == SafetyLevel::Safety1 {
@@ -338,7 +338,7 @@ impl ContextPool {
     }
 
     #[inline(always)]
-    unsafe fn allocate_arena(size: usize, safety: SafetyLevel) -> Result<*mut u8, &'static str> {
+    unsafe fn allocate_arena(size: usize, safety: SafetyLevel, numa: usize) -> Result<*mut u8, &'static str> { unsafe {
         #[cfg(unix)]
         {
             let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
@@ -358,6 +358,14 @@ impl ContextPool {
             if ptr == libc::MAP_FAILED {
                 return Err("mmap failed");
             }
+            
+            #[cfg(target_os = "linux")]
+            if numa > 0 {
+                let mask: usize = 1 << (numa % 64);
+                // MPOL_BIND = 2
+                libc::syscall(libc::SYS_mbind, ptr, size, 2, &raw const mask, 64, 0);
+            }
+            
             Ok(ptr.cast::<u8>())
         }
         #[cfg(windows)]
@@ -369,13 +377,26 @@ impl ContextPool {
             if safety == SafetyLevel::Safety0 {
                 flags |= 0x20000000;
             } // MEM_LARGE_PAGES
-            let ptr = VirtualAlloc(core::ptr::null_mut(), size, flags, PAGE_READWRITE);
+            
+            let ptr = if numa > 0 {
+                windows_sys::Win32::System::Memory::VirtualAllocExNuma(
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                    core::ptr::null_mut(),
+                    size,
+                    flags,
+                    PAGE_READWRITE,
+                    numa as u32,
+                )
+            } else {
+                VirtualAlloc(core::ptr::null_mut(), size, flags, PAGE_READWRITE)
+            };
+
             if ptr.is_null() {
                 return Err("VirtualAlloc failed");
             }
             Ok(ptr as *mut u8)
         }
-    }
+    }}
 
     /// Returns a raw pointer to a context based on its index.
     #[inline(always)]
