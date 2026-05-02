@@ -385,7 +385,7 @@ pub mod topology {
                 core::arch::asm!(
                     "push rbx",
                     "cpuid",
-                    "mov {ebx_out:e}, rbx",
+                    "mov {ebx_out:e}, ebx",
                     "pop rbx",
                     ebx_out = out(reg) _,
                     inout("eax") 0x0B => eax,
@@ -399,7 +399,7 @@ pub mod topology {
                 core::arch::asm!(
                     "push rbx",
                     "cpuid",
-                    "mov {ebx_out:e}, rbx",
+                    "mov {ebx_out:e}, ebx",
                     "pop rbx",
                     ebx_out = out(reg) _,
                     inout("eax") 0x0B => eax_p,

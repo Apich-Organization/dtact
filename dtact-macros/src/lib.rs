@@ -56,9 +56,9 @@ impl Parse for TaskArgs {
                     && let syn::Expr::Lit(syn::ExprLit {
                         lit: Lit::Str(s), ..
                     }) = nv.value
-                    {
-                        switcher = s.value();
-                    }
+                {
+                    switcher = s.value();
+                }
             }
         }
 
@@ -231,9 +231,9 @@ impl Parse for InitArgs {
                     && let syn::Expr::Lit(syn::ExprLit {
                         lit: Lit::Int(i), ..
                     }) = &nv.value
-                    {
-                        numa = i.base10_parse()?;
-                    }
+                {
+                    numa = i.base10_parse()?;
+                }
             }
         }
         Ok(InitArgs {
