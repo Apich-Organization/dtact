@@ -2,18 +2,24 @@ use core::ffi::c_void;
 use crate::memory_management::SafetyLevel;
 use crate::dta_scheduler::TopologyMode;
 
+/// Opaque handle representing a spawned Dtact fiber.
 #[allow(non_camel_case_types)]
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct dtact_handle_t(pub u64);
 
+/// Configuration structure for initializing the Dtact runtime from C.
 #[repr(C)]
 pub struct dtact_config_t {
+    /// Number of hardware worker threads. Set to 0 for auto-detection.
     pub workers: u32,
+    /// Memory safety level (0-2).
     pub safety_level: u8,
+    /// Topology mode (0: P2PMesh, 1: Global).
     pub topology_mode: u8,
 }
 
+/// Returns the recommended default configuration for the Dtact runtime.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_default_config() -> dtact_config_t {
     dtact_config_t {
@@ -23,6 +29,10 @@ pub extern "C" fn dtact_default_config() -> dtact_config_t {
     }
 }
 
+/// Initializes the global Dtact runtime singleton.
+/// 
+/// # Safety
+/// This function should be called once at application startup.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
     let cfg = unsafe { &*cfg };
@@ -60,12 +70,15 @@ pub extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
     core::ptr::null_mut()
 }
 
+/// Critical failure handler. Aborts the process if a fiber attempts to 
+/// return without properly terminating via the runtime.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_abort() -> ! {
     eprintln!("DTA-V3 Critical: Fiber attempted to 'return' instead of yielding. Stack corrupted.");
     std::process::abort();
 }
 
+/// Frees an argument pointer previously allocated for a fiber.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_free_arg(arg: *mut c_void) {
     if !arg.is_null() {
@@ -207,6 +220,11 @@ pub extern "C" fn dtact_fiber_launch_with_cleanup(
     dtact_handle_t((ctx_id as u64) | ((current_core as u64) << 32))
 }
 
+/// Blocks the current thread until the specified fiber terminates.
+/// 
+/// If called from a Dtact fiber, this will natively yield the physical core.
+/// If called from a non-managed thread (e.g., C main), this uses a tiered
+/// spin-loop and futex-wait strategy for zero-CPU idling.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(|c| c.get());
@@ -260,6 +278,8 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     }
 }
 
+/// Spawns the hardware worker threads and starts the Dtact runtime.
+/// This call blocks until all worker threads terminate.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_run(_rt: *mut c_void) {
     let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");

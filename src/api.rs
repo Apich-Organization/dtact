@@ -243,29 +243,46 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
     }
 }
 
+/// Global epoch counter for hardware topology changes.
+/// Incremented whenever a thread migration across CCX/NUMA boundaries is detected.
 pub static TOPOLOGY_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Hardware Topology Discovery and Affinity Management.
 pub mod topology {
+    /// Resumption affinity hints for the P2P Mesh scheduler.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Affinity {
+        /// Resume on the same physical CPU core.
         SameCore,
+        /// Resume on any core within the same Core Complex (CCX).
         SameCCX,
+        /// Resume on any core within the same NUMA node.
         SameNUMA,
+        /// No affinity preference.
         Any,
     }
 
+    /// Returns the Core ID of the currently executing hardware thread.
     #[inline(always)]
     pub fn current_core() -> u16 {
         current().core_id
     }
 
+    /// Hierarchical representation of a CPU core's location.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct CpuLevel {
+        /// Logical Core ID.
         pub core_id: u16,
+        /// Core Complex (L3 boundary) ID.
         pub ccx_id: u16,
+        /// Non-Uniform Memory Access (NUMA) node ID.
         pub numa_id: u16,
     }
 
+    /// Returns the hierarchical topology information for the current core.
+    /// 
+    /// This function utilizes thread-local caching and adaptive refresh 
+    /// intervals to minimize the overhead of hardware discovery (e.g., CPUID).
     #[inline(always)]
     pub fn current() -> CpuLevel {
         thread_local! {
@@ -290,6 +307,7 @@ pub mod topology {
         cpu
     }
 
+    /// Performs a raw hardware topology discovery via CPUID/MPIDR.
     #[inline(always)]
     pub fn current_raw() -> CpuLevel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -369,21 +387,26 @@ pub mod topology {
     }
 }
 
+/// Spawns a new fiber and returns a handle for synchronization.
 #[inline(always)]
 pub fn spawn<F: Future + Send + 'static + core::marker::Unpin>(fut: F) -> dtact_handle_t {
     SpawnBuilder::<CrossThreadFloat>::new().spawn(fut)
 }
 
+/// Fiber configuration and construction utilities.
 pub mod spawn {
     use super::*;
+    /// Returns a new `SpawnBuilder` with default settings.
     #[inline(always)]
     pub fn builder() -> SpawnBuilder<CrossThreadFloat> {
         SpawnBuilder::new()
     }
 }
 
+/// Fiber-local execution and synchronization utilities.
 pub mod fiber {
     use super::*;
+    /// Spawns a fiber from a closure with a specific stack configuration.
     #[inline]
     pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(_stack_size_str: &str, f: F) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME.get().expect("Dtact Runtime not initialized");
@@ -457,6 +480,7 @@ pub mod fiber {
     }
 }
 
+/// Advanced Hardware Acceleration primitives.
 #[cfg(feature = "hw-acceleration")]
 pub mod hw {
     /// Hardware-Assisted Optimization: Proactively push data to L3 cache
@@ -500,6 +524,7 @@ pub mod hw {
     }
 }
 
+/// Yields execution to the scheduler.
 pub async fn yield_now() {
     struct YieldNow(bool);
     impl Future for YieldNow {
@@ -527,8 +552,10 @@ pub async fn yield_to(handle: dtact_handle_t) {
     yield_now().await;
 }
 
+/// Global Runtime Configuration and Telemetry.
 pub mod config {
     use core::sync::atomic::Ordering;
+    /// Sets the work-deflection threshold for a specific hardware worker.
     #[inline(always)]
     pub fn set_deflection_threshold(core_id: usize, threshold: u8) {
         if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
@@ -542,8 +569,11 @@ pub mod config {
     }
 }
 
+/// Extension trait for blocking on asynchronous futures from within a fiber.
 pub trait DtactWaitExt {
+    /// The type of value produced by the future.
     type Output;
+    /// Blocks the current fiber until the future resolves.
     #[inline(always)]
     fn wait(self) -> Self::Output;
 }
