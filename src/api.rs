@@ -337,8 +337,32 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         .swap(0, core::sync::atomic::Ordering::AcqRel);
     if waiter != 0 {
         let waiter_ctx_id = (waiter & 0xFFFF_FFFF) as u32;
-        let waiter_core_id = (waiter >> 32) as usize;
-        crate::wake_fiber(waiter_core_id, waiter_ctx_id);
+        let target_worker = (waiter >> 32) as usize;
+
+        if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
+            let num_workers = runtime.scheduler.workers.len();
+            let target_worker = target_worker % num_workers;
+            let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
+
+            if current_worker == target_worker {
+                // We are on the target worker's thread! Safe to push local.
+                unsafe {
+                    let worker = &mut *runtime.scheduler.workers[target_worker].get();
+                    worker.push_local(waiter_ctx_id);
+                }
+            } else if current_worker < num_workers {
+                // Cross-core wakeup: use the mailbox matrix.
+                let mut chunk = crate::dta_scheduler::TaskChunk::default();
+                chunk.tasks[0] = waiter_ctx_id;
+                chunk.count = 1;
+                let _ = runtime.scheduler.mailboxes[current_worker][target_worker].push(chunk);
+            } else {
+                // Fallback for non-worker threads: use global enqueue or pick a source
+                runtime
+                    .scheduler
+                    .enqueue_task(target_worker, waiter_ctx_id as u64, waiter_ctx_id);
+            }
+        }
     }
 
     // Also wake any non-fiber thread blocked on futex_wait

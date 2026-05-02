@@ -59,6 +59,8 @@ unsafe fn dtact_asm_fiber_suspend(ctx: *mut FiberContext) {
 thread_local! {
     /// Tracks the active executing fiber on the current hardware thread.
     pub(crate) static CURRENT_FIBER: core::cell::Cell<*mut FiberContext> = const { core::cell::Cell::new(core::ptr::null_mut()) };
+    /// Tracks the index of the worker executing on this thread.
+    pub(crate) static CURRENT_WORKER_ID: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
 }
 
 /// The core execution bridge between Rust Futures and Dtact Fibers.

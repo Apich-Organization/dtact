@@ -656,6 +656,7 @@ impl DtaScheduler {
         pool: &crate::memory_management::ContextPool,
         shutdown: &core::sync::atomic::AtomicBool,
     ) {
+        crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(current_core));
         loop {
             if shutdown.load(core::sync::atomic::Ordering::Relaxed) {
                 return;

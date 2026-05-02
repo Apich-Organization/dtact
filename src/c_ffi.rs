@@ -280,58 +280,21 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
 /// * Panics if the runtime is not initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_await(handle: dtact_handle_t) {
+    let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
+    let handle_gen = (handle.0 >> 48) as u16;
+    let runtime = crate::GLOBAL_RUNTIME
+        .get()
+        .expect("Runtime not initialized");
+    let pool = &runtime.pool;
+    let target_ctx = pool.get_context_ptr(target_ctx_id);
+
     let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
+
     if ctx_ptr.is_null() {
-        // UNIVERSAL WAIT: If called from a non-Fiber thread (e.g., C++ main),
-        // we use a tiered strategy: spin-loop -> futex_wait.
-        let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
-        let handle_gen = (handle.0 >> 48) as u16;
-        let runtime = crate::GLOBAL_RUNTIME
-            .get()
-            .expect("Runtime not initialized");
-        let pool = &runtime.pool;
-        let target_ctx = pool.get_context_ptr(target_ctx_id);
-
-        if ctx_ptr.is_null() {
-            // UNIVERSAL WAIT: If called from a non-Fiber thread (e.g., C++ main),
-            // we use a tiered strategy: spin-loop -> futex_wait.
-            let mut spins = 0;
-            loop {
-                let current_gen = unsafe {
-                    (*target_ctx)
-                        .generation
-                        .load(core::sync::atomic::Ordering::Acquire)
-                } as u16;
-                let status = unsafe {
-                    (*target_ctx)
-                        .state
-                        .load(core::sync::atomic::Ordering::Acquire)
-                };
-                if current_gen != handle_gen
-                    || status == crate::memory_management::FiberStatus::Initial as u8
-                {
-                    break;
-                }
-                if spins < 100 {
-                    core::hint::spin_loop();
-                    spins += 1;
-                } else {
-                    // Perform a zero-overhead OS-level wait until the Fiber finishes
-                    unsafe { crate::utils::futex_wait(&raw const (*target_ctx).state, status) };
-                }
-            }
-            return;
-        }
-
-        let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
-        let runtime = crate::GLOBAL_RUNTIME
-            .get()
-            .expect("Runtime not initialized");
-        let pool = &runtime.pool;
-        let target_ctx = pool.get_context_ptr(target_ctx_id);
-
+        // ===== NON-FIBER PATH (C main thread, host thread) =====
+        // Tiered strategy: spin-loop -> futex_wait
+        let mut spins = 0u32;
         loop {
-            // 0. Generation check for ABA protection
             let current_gen = unsafe {
                 (*target_ctx)
                     .generation
@@ -345,65 +308,95 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
 
             if current_gen != handle_gen
                 || status == crate::memory_management::FiberStatus::Initial as u8
+                || status == crate::memory_management::FiberStatus::Finished as u8
             {
-                // Target already finished, clear waiter and break
-                unsafe {
-                    (*target_ctx)
-                        .waiter_handle
-                        .store(0, core::sync::atomic::Ordering::Relaxed);
-                }
                 break;
             }
 
-            // 1. Register the current fiber as a waiter for the target fiber
-            let current_core = crate::api::topology::current().core_id as u64;
-            let current_ctx_id = unsafe { (*ctx_ptr).fiber_index as u64 };
-            let my_handle = current_ctx_id | (current_core << 32);
+            if spins < 100 {
+                core::hint::spin_loop();
+                spins += 1;
+            } else {
+                unsafe { crate::utils::futex_wait(&raw const (*target_ctx).state, status) };
+            }
+        }
+        return;
+    }
 
+    // ===== FIBER PATH (called from within a running fiber) =====
+    loop {
+        // 0. Check target state and generation
+        let current_gen = unsafe {
+            (*target_ctx)
+                .generation
+                .load(core::sync::atomic::Ordering::Acquire)
+        } as u16;
+        let status = unsafe {
+            (*target_ctx)
+                .state
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
+
+        if current_gen != handle_gen
+            || status == crate::memory_management::FiberStatus::Initial as u8
+            || status == crate::memory_management::FiberStatus::Finished as u8
+        {
+            // Target already finished (or context recycled), clear waiter and break
             unsafe {
                 (*target_ctx)
                     .waiter_handle
-                    .store(my_handle, core::sync::atomic::Ordering::Release);
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
             }
+            break;
+        }
 
-            // Full memory barrier: waiter_handle store must be visible before state load (re-check)
-            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        // 1. Register the current fiber as a waiter for the target fiber
+        let current_core = crate::api::topology::current().core_id as u64;
+        let current_ctx_id = unsafe { (*ctx_ptr).fiber_index as u64 };
+        let my_handle = current_ctx_id | (current_core << 32);
 
-            // 2. Double-Check the target state and generation
-            let current_gen = unsafe {
-                (*target_ctx)
-                    .generation
-                    .load(core::sync::atomic::Ordering::Acquire)
-            } as u16;
-            let status = unsafe {
-                (*target_ctx)
-                    .state
-                    .load(core::sync::atomic::Ordering::Acquire)
-            };
+        unsafe {
+            (*target_ctx)
+                .waiter_handle
+                .store(my_handle, core::sync::atomic::Ordering::Release);
+        }
 
-            if current_gen != handle_gen
-                || status == crate::memory_management::FiberStatus::Initial as u8
-            {
-                // Target already finished, clear waiter and break
-                unsafe {
-                    (*target_ctx)
-                        .waiter_handle
-                        .store(0, core::sync::atomic::Ordering::Relaxed);
-                }
-                break;
-            }
+        // Full memory barrier: waiter_handle store must be visible before state re-check
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
-            // 3. Yield the current fiber natively to the scheduler
+        // 2. Double-check target state after registering waiter
+        let current_gen = unsafe {
+            (*target_ctx)
+                .generation
+                .load(core::sync::atomic::Ordering::Acquire)
+        } as u16;
+        let status = unsafe {
+            (*target_ctx)
+                .state
+                .load(core::sync::atomic::Ordering::Acquire)
+        };
+
+        if current_gen != handle_gen
+            || status == crate::memory_management::FiberStatus::Initial as u8
+            || status == crate::memory_management::FiberStatus::Finished as u8
+        {
+            // Completed between check and waiter registration
             unsafe {
-                let ctx = &mut *ctx_ptr;
-                ctx.state.store(
-                    crate::memory_management::FiberStatus::Yielded as u8,
-                    core::sync::atomic::Ordering::Release,
-                );
-
-                // Invoke the assembly trampoline to swap stacks back to the scheduler
-                (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
+                (*target_ctx)
+                    .waiter_handle
+                    .store(0, core::sync::atomic::Ordering::Relaxed);
             }
+            break;
+        }
+
+        // 3. Yield the current fiber natively to the scheduler
+        unsafe {
+            let ctx = &mut *ctx_ptr;
+            ctx.state.store(
+                crate::memory_management::FiberStatus::Yielded as u8,
+                core::sync::atomic::Ordering::Release,
+            );
+            (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
         }
     }
 }
