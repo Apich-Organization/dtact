@@ -173,6 +173,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     /// * Panics if the context pool is exhausted.
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::useless_let_if_seq)]
     pub fn spawn<F: Future + Send + 'static>(self, fut: F) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME
             .get()

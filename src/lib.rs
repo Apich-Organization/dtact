@@ -150,6 +150,11 @@ pub struct Runtime {
 
 impl Runtime {
     /// Spawns the OS worker threads for the scheduler.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system fails to spawn a new thread. This can occur if
+    /// the operating system limits on the number of threads have been reached.
     pub fn start(&'static self) {
         if self
             .started
@@ -168,7 +173,7 @@ impl Runtime {
             let my_id = i;
 
             std::thread::Builder::new()
-                .name(format!("dtact-worker-{}", my_id))
+                .name(format!("dtact-worker-{my_id}"))
                 .spawn(move || {
                     sched.run_worker_with_shutdown(my_id, pool, shutdown);
                 })
