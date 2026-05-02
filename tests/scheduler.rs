@@ -15,17 +15,32 @@ proptest! {
 
         // Set local load
         unsafe {
-            let worker = &*scheduler.workers[source_core].get();
+            let worker = &mut *scheduler.workers[source_core].get();
             worker.load_level.store(load, Ordering::SeqCst);
             worker.deflection_threshold.store(threshold, Ordering::SeqCst);
         }
 
-        // We can't easily capture the result of enqueue_task because it uses a function pointer
-        // that pushes to a mailbox. But we can test the target_core calculation logic
-        // if we expose it or test the resulting mailbox state.
-
-        // For now, let's verify that the deflection logic doesn't panic and stays within bounds.
         scheduler.enqueue_task(source_core, flow_id, 0);
+
+        // Verify task is successfully enqueued somewhere
+        let mut total_tasks = 0;
+        unsafe {
+            for i in 0..64 {
+                let worker = &*scheduler.workers[i].get();
+                total_tasks += worker.local_queue_len();
+
+                for j in 0..64 {
+                    let mailbox = &scheduler.mailboxes[i][j];
+                    let head = mailbox.head.load(Ordering::SeqCst);
+                    let tail = mailbox.tail.load(Ordering::SeqCst);
+                    // DTACT_MAILBOX_MASK is not public, but we can just check if tail != head
+                    if tail != head {
+                        total_tasks += 1; // 1 TaskChunk
+                    }
+                }
+            }
+        }
+        assert_eq!(total_tasks, 1, "Task must be enqueued exactly once");
     }
 
     #[test]
@@ -35,14 +50,28 @@ proptest! {
     ) {
         let scheduler = DtaScheduler::new(64, TopologyMode::Global);
 
-        // In Global mode, deflection should be able to reach any core.
-        // We'll verify this by setting a very low threshold.
         unsafe {
-            let worker = &*scheduler.workers[source_core].get();
+            let worker = &mut *scheduler.workers[source_core].get();
             worker.load_level.store(100, Ordering::SeqCst);
             worker.deflection_threshold.store(10, Ordering::SeqCst);
         }
 
         scheduler.enqueue_task(source_core, flow_id, 1);
+
+        let mut total_tasks = 0;
+        unsafe {
+            for i in 0..64 {
+                let worker = &*scheduler.workers[i].get();
+                total_tasks += worker.local_queue_len();
+
+                for j in 0..64 {
+                    let mailbox = &scheduler.mailboxes[i][j];
+                    if mailbox.tail.load(Ordering::SeqCst) != mailbox.head.load(Ordering::SeqCst) {
+                        total_tasks += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(total_tasks, 1, "Task must be enqueued exactly once in Global mode");
     }
 }

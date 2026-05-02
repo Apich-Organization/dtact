@@ -181,6 +181,7 @@ impl Runtime {
 ///
 /// This is initialized exactly once per process via `dtact_init` or
 /// implicit autostart triggers in the proc-macro layer.
+#[doc(hidden)]
 pub static GLOBAL_RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
 
 /// Telemetry: Tracks fibers that failed the 8KB zero-copy check and fell back to heap allocation.

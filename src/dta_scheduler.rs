@@ -173,13 +173,13 @@ impl<T> Drop for HugeBuffer<T> {
 /// Aligned to 64 bytes to prevent false sharing between sender and receiver cores.
 #[repr(align(64))]
 pub struct Mailbox {
-    head: AtomicUsize,
+    pub head: AtomicUsize,
     _pad1: [u8; 64 - core::mem::size_of::<AtomicUsize>()],
 
-    tail: AtomicUsize,
+    pub tail: AtomicUsize,
     _pad2: [u8; 64 - core::mem::size_of::<AtomicUsize>()],
 
-    buffer: HugeBuffer<UnsafeCell<[TaskChunk; MAILBOX_CAPACITY]>>,
+    pub buffer: HugeBuffer<UnsafeCell<[TaskChunk; MAILBOX_CAPACITY]>>,
 }
 
 unsafe impl Sync for Mailbox {}
