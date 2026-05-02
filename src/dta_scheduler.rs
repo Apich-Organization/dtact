@@ -434,13 +434,7 @@ impl Worker {
     /// * `context_base` must point to the start of the `ContextPool` memory region.
     /// * `context_size` and `group_guard_size` must match the pool's initialized layout.
     #[inline(always)]
-    pub unsafe fn dispatch_loop(
-        &mut self,
-        context_base: *mut u8,
-        context_size: usize,
-        group_guard_size: usize,
-        context_offset: usize,
-    ) {
+    pub unsafe fn dispatch_loop(&mut self, pool: &crate::memory_management::ContextPool) {
         while self.local_head != self.local_tail {
             let task = unsafe {
                 let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
@@ -448,14 +442,7 @@ impl Worker {
             };
             self.local_head = (self.local_head + 1) & LOCAL_QUEUE_MASK;
 
-            let group_offset = (task as usize >> 5) * group_guard_size;
-            let target_ptr = unsafe {
-                #[allow(clippy::cast_ptr_alignment)]
-                context_base
-                    .add((task as usize) * context_size + group_offset)
-                    .add(context_offset)
-                    .cast::<crate::memory_management::FiberContext>()
-            };
+            let target_ptr = pool.get_context_ptr(task);
 
             // Hardware Prefetch: Bring FiberContext to L1 using T0 hint immediately
             #[cfg(target_arch = "x86_64")]
@@ -640,13 +627,10 @@ impl DtaScheduler {
     /// # Safety
     /// Same safety requirements as `run_worker`.
     #[inline]
-    pub unsafe fn run_worker_with_shutdown(
+    pub fn run_worker_with_shutdown(
         &self,
         current_core: usize,
-        context_base: *mut u8,
-        context_size: usize,
-        group_guard_size: usize,
-        context_offset: usize,
+        pool: &crate::memory_management::ContextPool,
         shutdown: &core::sync::atomic::AtomicBool,
     ) {
         loop {
@@ -656,7 +640,7 @@ impl DtaScheduler {
 
             unsafe {
                 let worker = &mut *self.workers[current_core].get();
-                worker.dispatch_loop(context_base, context_size, group_guard_size, context_offset);
+                worker.dispatch_loop(pool);
             }
 
             self.poll_mailboxes(current_core);

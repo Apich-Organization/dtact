@@ -1,10 +1,8 @@
-use core::future::Future;
-use core::pin::Pin;
 pub use crate::c_ffi::dtact_handle_t;
 pub use crate::common_types::{TopologyMode, WorkloadKind};
-pub use crate::memory_management::{
-    ContextPool, FiberContext, FiberStatus, SafetyLevel,
-};
+pub use crate::memory_management::{ContextPool, FiberContext, FiberStatus, SafetyLevel};
+use core::future::Future;
+use core::pin::Pin;
 pub use topology::Affinity;
 
 /// Scheduling Priority for fibers.
@@ -489,7 +487,7 @@ pub fn spawn<F: Future + Send + 'static>(fut: F) -> dtact_handle_t {
 
 /// Returns a new `SpawnBuilder` for configuring a fiber.
 #[inline(always)]
-#[must_use] 
+#[must_use]
 pub const fn spawn_with() -> SpawnBuilder<CrossThreadFloat> {
     SpawnBuilder::new()
 }

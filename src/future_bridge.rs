@@ -30,14 +30,14 @@ unsafe fn wake_impl(data: *const ()) {
 unsafe fn wake_by_ref_impl(data: *const ()) {
     let ctx = unsafe { &*data.cast::<FiberContext>() };
 
-    // CAS-free topology resumption:
-    // Mark the fiber as ready for execution.
-    ctx.state
-        .store(FiberStatus::Running as u8, Ordering::Release);
+    let prev = ctx
+        .state
+        .swap(FiberStatus::Notified as u8, Ordering::AcqRel);
 
-    // Inject the fiber back into the P2P Mailbox Mesh.
-    // The scheduler will handle whether this is a local push or a cross-core signal.
-    crate::wake_fiber(ctx.origin_core as usize, ctx.fiber_index);
+    if prev == FiberStatus::Yielded as u8 {
+        // The fiber was fully suspended. We can safely enqueue it.
+        crate::wake_fiber(ctx.origin_core as usize, ctx.fiber_index);
+    }
 }
 
 #[inline(always)]
@@ -119,6 +119,10 @@ pub fn wait_pinned<F: Future>(mut fut_pinned: Pin<&mut F>) -> F::Output {
     let mut cx = Context::from_waker(&waker);
 
     loop {
+        // Clear Notified state before polling
+        ctx.state
+            .store(FiberStatus::Running as u8, Ordering::Release);
+
         match fut_pinned.as_mut().poll(&mut cx) {
             Poll::Ready(output) => {
                 // Task resolved! Reward the adaptive spin loop budget.
@@ -150,10 +154,20 @@ pub fn wait_pinned<F: Future>(mut fut_pinned: Pin<&mut F>) -> F::Output {
                 ctx.spin_failure_count = failure_count.saturating_add(1);
                 ctx.adaptive_spin_count = current_spin.saturating_sub(5).max(5);
 
-                ctx.state
-                    .store(FiberStatus::Yielded as u8, Ordering::Release);
-
-                unsafe { dtact_asm_fiber_suspend(ctx_ptr) };
+                // Try to transition to Yielded and suspend.
+                // If it fails, it means a wake() occurred (state is Notified), so we skip suspension.
+                if ctx
+                    .state
+                    .compare_exchange(
+                        FiberStatus::Running as u8,
+                        FiberStatus::Yielded as u8,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    unsafe { dtact_asm_fiber_suspend(ctx_ptr) };
+                }
             }
         }
     }

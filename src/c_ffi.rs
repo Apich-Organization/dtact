@@ -61,9 +61,9 @@ pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
         let scheduler = crate::dta_scheduler::DtaScheduler::new(128, topology);
         let pool = crate::memory_management::ContextPool::new(16384, 2 * 1024 * 1024, safety, 4)
             .expect("DTA-V3 FFI Initialization Failed");
-        crate::Runtime { 
-            scheduler, 
-            pool, 
+        crate::Runtime {
+            scheduler,
+            pool,
             started: core::sync::atomic::AtomicBool::new(false),
             shutdown: core::sync::atomic::AtomicBool::new(false),
         }
@@ -341,21 +341,19 @@ pub extern "C" fn dtact_run(_rt: *mut c_void) {
         .expect("Dtact Runtime not initialized");
     let scheduler = &runtime.scheduler;
     let pool = &runtime.pool;
-    let (base, sz, guard_sz, context_offset) = pool.get_dispatch_layout();
-
     let workers_count = scheduler.workers.len();
     let mut handles = alloc::vec::Vec::with_capacity(workers_count);
 
     for i in 0..workers_count {
         // Capture raw pointers to avoid lifetime issues across thread boundaries
         let scheduler_ptr = std::ptr::from_ref(scheduler) as usize;
-        let base_ptr = base as usize;
+        let pool_ptr = std::ptr::from_ref(pool) as usize;
         let shutdown_ptr = &runtime.shutdown;
 
         let handle = std::thread::spawn(move || {
             let s = unsafe { &*(scheduler_ptr as *const crate::dta_scheduler::DtaScheduler) };
-            let b = base_ptr as *mut u8;
-            unsafe { s.run_worker_with_shutdown(i, b, sz, guard_sz, context_offset, shutdown_ptr) };
+            let p = unsafe { &*(pool_ptr as *const crate::memory_management::ContextPool) };
+            s.run_worker_with_shutdown(i, p, shutdown_ptr);
         });
         handles.push(handle);
     }

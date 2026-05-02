@@ -289,8 +289,8 @@ pub fn dtact_init(args: TokenStream, item: TokenStream) -> TokenStream {
                     #numa
                 ).expect("DTA-V3 Hardware Initialization Failed");
 
-                dtact::Runtime { 
-                    scheduler, 
+                dtact::Runtime {
+                    scheduler,
                     pool,
                     started: core::sync::atomic::AtomicBool::new(false),
                     shutdown: core::sync::atomic::AtomicBool::new(false),

@@ -103,14 +103,14 @@ pub use dtact_macros::export_fiber;
 /// Attribute macro for defining a Dtact task.
 pub use dtact_macros::task;
 
-/// Common types used across the Dtact runtime.
-pub mod common_types;
 /// Public user-facing API for spawning and managing fibers.
 #[doc(hidden)]
 pub mod api;
 /// C-compatible FFI boundary for cross-language integration.
 #[doc(hidden)]
 pub mod c_ffi;
+/// Common types used across the Dtact runtime.
+pub mod common_types;
 /// Low-level assembly-based context switching primitives.
 #[doc(hidden)]
 pub mod context_switch;
@@ -159,23 +159,18 @@ impl Runtime {
         }
 
         let workers_count = self.scheduler.workers.len();
-        let (base_ptr, slot_sz, guard_sz, context_offset) = self.pool.get_dispatch_layout();
-        let base_addr = base_ptr as usize;
 
         for i in 0..workers_count {
             // Each closure must capture its own copy of these values.
             let sched: &'static dta_scheduler::DtaScheduler = &self.scheduler;
+            let pool: &'static memory_management::ContextPool = &self.pool;
             let shutdown: &'static core::sync::atomic::AtomicBool = &self.shutdown;
-            let my_base = base_addr;
-            let my_slot = slot_sz;
-            let my_guard = guard_sz;
-            let my_offset = context_offset;
             let my_id = i;
 
             std::thread::Builder::new()
                 .name(format!("dtact-worker-{}", my_id))
-                .spawn(move || unsafe {
-                    sched.run_worker_with_shutdown(my_id, my_base as *mut u8, my_slot, my_guard, my_offset, shutdown);
+                .spawn(move || {
+                    sched.run_worker_with_shutdown(my_id, pool, shutdown);
                 })
                 .expect("Failed to spawn Dtact worker thread");
         }

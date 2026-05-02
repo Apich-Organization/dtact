@@ -1,7 +1,7 @@
-use dtact::{ContextPool, SafetyLevel, FiberStatus};
+use dtact::{ContextPool, FiberStatus, SafetyLevel};
 use std::sync::Arc;
-use std::thread;
 use std::sync::atomic::Ordering;
+use std::thread;
 
 #[test]
 fn test_concurrent_context_allocation() {
@@ -30,16 +30,16 @@ fn test_concurrent_context_allocation() {
 
 #[test]
 fn test_guard_page_isolation() {
-    // This test verifies that Safety2 (per-context guard pages) correctly 
+    // This test verifies that Safety2 (per-context guard pages) correctly
     // catches overflows.
     let pool = ContextPool::new(64, 4096, SafetyLevel::Safety2, 0).unwrap();
     let idx = pool.alloc_context().expect("Should alloc");
-    let ctx_ptr = pool.get_context_ptr(idx);
-    
+    let _ctx_ptr = pool.get_context_ptr(idx);
+
     // The read buffer is 8KB, and above it is the stack.
     // If we write far below the context pointer (into the guard page), it should fault.
     // We can't easily catch a segfault in a test, but we can verify the memory layout.
-    let (base, slot_sz, guard_sz, _context_offset) = pool.get_dispatch_layout();
+    let (_base, slot_sz, guard_sz, _context_offset) = pool.get_dispatch_layout();
     assert_eq!(guard_sz, 4096);
     assert!(slot_sz > 4096 + 8192);
 }

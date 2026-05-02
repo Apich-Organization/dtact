@@ -63,6 +63,8 @@ pub enum FiberStatus {
     Finished = 3,
     /// Terminated due to an unhandled panic.
     Panicked = 4,
+    /// The fiber was woken up by a waker.
+    Notified = 5,
 }
 
 /// The hardware-level execution context for a stackful fiber.
