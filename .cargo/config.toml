@@ -1,0 +1,8 @@
+[target.'cfg(not(target_arch="wasm32"))']
+rustflags = ["-C", "target-cpu=native"]
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=2097152"]
+
+[target.'cfg(not(target_os = "windows"))']
+rustflags = ["-C", "force-unwind-tables=no"]

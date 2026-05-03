@@ -40,8 +40,8 @@ pub const extern "C" fn dtact_default_config() -> dtact_config_t {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
     let cfg = unsafe { &*cfg };
-    let _workers = if cfg.workers == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    let workers = if cfg.workers == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
     } else {
         cfg.workers as usize
     };
@@ -58,7 +58,7 @@ pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
     };
 
     crate::GLOBAL_RUNTIME.get_or_init(|| {
-        let scheduler = crate::dta_scheduler::DtaScheduler::new(_workers, topology);
+        let scheduler = crate::dta_scheduler::DtaScheduler::new(workers, topology);
         let pool = crate::memory_management::ContextPool::new(16384, 2 * 1024 * 1024, safety, 0)
             .expect("DTA-V3 FFI Initialization Failed");
         crate::Runtime {
@@ -174,15 +174,16 @@ pub unsafe extern "C" fn dtact_fiber_launch(
         (*ctx_ptr).cleanup_fn = None;
     }
 
-    let r#gen = unsafe {
+    let r#gen = u64::from(unsafe {
         (*ctx_ptr)
             .generation
             .load(core::sync::atomic::Ordering::Acquire)
-    } as u64;
+    });
     crate::wake_fiber(current_core, ctx_id);
 
-    // Handle Layout: [16-bit Generation | 16-bit CoreID | 32-bit ContextID]
-    let handle_val = u64::from(ctx_id) | ((current_core as u64) << 32) | ((r#gen & 0xFFFF) << 48);
+    // Handle Layout: [1-bit Valid | 15-bit Generation | 16-bit CoreID | 32-bit ContextID]
+    let handle_val =
+        u64::from(ctx_id) | ((current_core as u64) << 32) | ((r#gen & 0xFFFF) << 48) | (1 << 63);
     dtact_handle_t(handle_val)
 }
 
@@ -266,8 +267,16 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
         }
     }
 
+    let r#gen = u64::from(unsafe {
+        (*ctx_ptr)
+            .generation
+            .load(core::sync::atomic::Ordering::Acquire)
+    });
+
     crate::wake_fiber(current_core, ctx_id);
-    dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
+    dtact_handle_t(
+        u64::from(ctx_id) | ((current_core as u64) << 32) | ((r#gen & 0xFFFF) << 48) | (1 << 63),
+    )
 }
 
 /// Blocks the current thread until the specified fiber terminates.
@@ -279,6 +288,8 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
 /// # Panics
 /// * Panics if the runtime is not initialized.
 #[unsafe(no_mangle)]
+#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::too_many_lines)]
 pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
     let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
@@ -328,9 +339,10 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     loop {
         // Clear Notified state before starting check
         unsafe {
-            (*ctx_ptr)
-                .state
-                .store(crate::memory_management::FiberStatus::Running as u8, core::sync::atomic::Ordering::Release);
+            (*ctx_ptr).state.store(
+                crate::memory_management::FiberStatus::Running as u8,
+                core::sync::atomic::Ordering::Release,
+            );
         }
 
         // 0. Check target state and generation
@@ -344,7 +356,6 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
                 .state
                 .load(core::sync::atomic::Ordering::Acquire)
         };
-        // unsafe { libc::printf(b"[Dtact] Fiber %u checking Target %u: state=%u\n\0".as_ptr().cast(), (*ctx_ptr).fiber_index, target_ctx_id, status); }
 
         if current_gen != handle_gen
             || status == crate::memory_management::FiberStatus::Initial as u8
@@ -360,9 +371,9 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
         }
 
         // 1. Register the current fiber as a waiter for the target fiber
-        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
-        let current_ctx_id = unsafe { (*ctx_ptr).fiber_index as u64 };
-        let my_handle = current_ctx_id | ((current_worker as u64) << 32);
+        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(std::cell::Cell::get);
+        let current_ctx_id = unsafe { u64::from((*ctx_ptr).fiber_index) };
+        let my_handle = current_ctx_id | ((current_worker as u64) << 32) | (1 << 63);
 
         unsafe {
             (*target_ctx)

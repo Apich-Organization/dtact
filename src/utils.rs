@@ -201,7 +201,7 @@ pub fn get_thread_id() -> u64 {
     })
 }
 
-/// A lightweight, hardware-optimized SpinLock.
+/// A lightweight, hardware-optimized `SpinLock`.
 ///
 /// Designed for extremely short critical sections within the scheduler,
 /// utilizing the `PAUSE` instruction to reduce power consumption and
@@ -211,7 +211,8 @@ pub struct SpinLock {
 }
 
 impl SpinLock {
-    /// Creates a new, unlocked SpinLock.
+    /// Creates a new, unlocked `SpinLock`.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             locked: core::sync::atomic::AtomicBool::new(false),
@@ -236,5 +237,11 @@ impl SpinLock {
     pub fn unlock(&self) {
         self.locked
             .store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Default for SpinLock {
+    fn default() -> Self {
+        Self::new()
     }
 }

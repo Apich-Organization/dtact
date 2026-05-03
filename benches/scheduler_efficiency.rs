@@ -43,20 +43,6 @@ fn bench_spawn_efficiency(c: &mut Criterion) {
     let mut group = c.benchmark_group("Spawn Efficiency (1M tasks)");
     let num_tasks = 1_000_000;
 
-    group.bench_function("Tokio", |b| {
-        b.to_async(&tokio_rt).iter(|| async {
-            let mut handles = Vec::with_capacity(num_tasks);
-            for _ in 0..num_tasks {
-                handles.push(tokio::spawn(async move {
-                    black_box(1);
-                }));
-            }
-            for h in handles {
-                let _ = h.await;
-            }
-        });
-    });
-
     group.bench_function("Dtact", |b| {
         b.iter(|| {
             let handle =
@@ -78,6 +64,21 @@ fn bench_spawn_efficiency(c: &mut Criterion) {
             dtact::c_ffi::dtact_await(handle);
         });
     });
+
+    group.bench_function("Tokio", |b| {
+        b.to_async(&tokio_rt).iter(|| async {
+            let mut handles = Vec::with_capacity(num_tasks);
+            for _ in 0..num_tasks {
+                handles.push(tokio::spawn(async move {
+                    black_box(1);
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+    });
+
     group.finish();
 }
 
@@ -93,22 +94,6 @@ fn bench_yield_efficiency(c: &mut Criterion) {
     let mut group = c.benchmark_group("Yield Efficiency (10 tasks x 100 yields)");
     let num_yields = 100;
     let num_tasks = 10;
-
-    group.bench_function("Tokio", |b| {
-        b.to_async(&tokio_rt).iter(|| async {
-            let mut handles = Vec::with_capacity(num_tasks);
-            for _ in 0..num_tasks {
-                handles.push(tokio::spawn(async move {
-                    for _ in 0..num_yields {
-                        tokio::task::yield_now().await;
-                    }
-                }));
-            }
-            for h in handles {
-                let _ = h.await;
-            }
-        });
-    });
 
     group.bench_function("Dtact", |b| {
         b.iter(|| {
@@ -133,6 +118,23 @@ fn bench_yield_efficiency(c: &mut Criterion) {
             dtact::c_ffi::dtact_await(handle);
         });
     });
+
+    group.bench_function("Tokio", |b| {
+        b.to_async(&tokio_rt).iter(|| async {
+            let mut handles = Vec::with_capacity(num_tasks);
+            for _ in 0..num_tasks {
+                handles.push(tokio::spawn(async move {
+                    for _ in 0..num_yields {
+                        tokio::task::yield_now().await;
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+    });
+
     group.finish();
 }
 
@@ -147,24 +149,6 @@ fn bench_deflection_efficiency(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("Work Deflection (Hot Core)");
     let num_tasks = 10_000_000;
-
-    group.bench_function("Tokio", |b| {
-        b.to_async(&tokio_rt).iter(|| async {
-            let mut handles = Vec::with_capacity(num_tasks);
-            for _ in 0..num_tasks {
-                handles.push(tokio::spawn(async move {
-                    let mut sum = 0;
-                    for i in 0..100 {
-                        sum += black_box(i);
-                    }
-                    sum
-                }));
-            }
-            for h in handles {
-                let _ = h.await;
-            }
-        });
-    });
 
     group.bench_function("Dtact", |b| {
         b.iter(|| {
@@ -191,6 +175,25 @@ fn bench_deflection_efficiency(c: &mut Criterion) {
             dtact::c_ffi::dtact_await(handle);
         });
     });
+
+    group.bench_function("Tokio", |b| {
+        b.to_async(&tokio_rt).iter(|| async {
+            let mut handles = Vec::with_capacity(num_tasks);
+            for _ in 0..num_tasks {
+                handles.push(tokio::spawn(async move {
+                    let mut sum = 0;
+                    for i in 0..100 {
+                        sum += black_box(i);
+                    }
+                    sum
+                }));
+            }
+            for h in handles {
+                let _ = h.await;
+            }
+        });
+    });
+
     group.finish();
 }
 

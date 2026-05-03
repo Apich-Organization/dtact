@@ -175,7 +175,9 @@ impl Runtime {
             std::thread::Builder::new()
                 .name(format!("dtact-worker-{my_id}"))
                 .spawn(move || {
-                    crate::dta_scheduler::DtaScheduler::run_worker_static(sched, my_id, pool, shutdown);
+                    crate::dta_scheduler::DtaScheduler::run_worker_static(
+                        sched, my_id, pool, shutdown,
+                    );
                 })
                 .expect("Failed to spawn Dtact worker thread");
         }
@@ -209,10 +211,32 @@ pub static HEAP_ESCAPED_SPAWNS: core::sync::atomic::AtomicU64 =
 #[inline(always)]
 pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
     if let Some(runtime) = GLOBAL_RUNTIME.get() {
-        // Submit the fiber back to the mesh.
-        runtime
-            .scheduler
-            .enqueue_task(origin_core, u64::from(fiber_index), fiber_index);
+        // Submit the fiber back to the mesh. Loop with yield on backpressure.
+        loop {
+            let success =
+                runtime
+                    .scheduler
+                    .enqueue_task(origin_core, u64::from(fiber_index), fiber_index);
+
+            if success {
+                break;
+            }
+
+            // Queue is full: yield to scheduler to let it drain
+            let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
+            if ctx_ptr.is_null() {
+                std::thread::yield_now();
+            } else {
+                unsafe {
+                    let ctx = &mut *ctx_ptr;
+                    ctx.state.store(
+                        crate::memory_management::FiberStatus::Notified as u8,
+                        core::sync::atomic::Ordering::Release,
+                    );
+                    (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
+                }
+            }
+        }
     } else {
         panic!("dtact::wake_fiber() invoked before Runtime Initialization");
     }

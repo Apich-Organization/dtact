@@ -18,7 +18,7 @@ pub const MAILBOX_MASK: usize = MAILBOX_CAPACITY - 1;
 
 /// Capacity of a worker's local execution queue.
 /// Sized to exactly hold the max queue without global locks.
-pub const LOCAL_QUEUE_CAPACITY: usize = 8192;
+pub const LOCAL_QUEUE_CAPACITY: usize = 131_072;
 /// Mask for local queue index wrap-around.
 pub const LOCAL_QUEUE_MASK: usize = LOCAL_QUEUE_CAPACITY - 1;
 
@@ -346,7 +346,7 @@ impl Worker {
             cpu,
             load_level: AtomicU8::new(0),
             deflection_threshold: AtomicU8::new(80),
-    local_queue: HugeBuffer::new(),
+            local_queue: HugeBuffer::new(),
             local_head: 0,
             local_tail: 0,
             ticks: 0,
@@ -390,14 +390,18 @@ impl Worker {
         }
     }
 
-    /// Pushes a single task into the local queue.
+    /// Pushes a single task into the local queue. Returns true if successful.
     #[inline(always)]
-    pub fn push_local(&mut self, task: TaskIndex) {
+    pub fn push_local(&mut self, task: TaskIndex) -> bool {
+        if self.local_queue_len() >= LOCAL_QUEUE_CAPACITY - 1 {
+            return false;
+        }
         unsafe {
             let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
             *buffer_ptr.add(self.local_tail) = task;
         }
         self.local_tail = (self.local_tail + 1) & LOCAL_QUEUE_MASK;
+        true
     }
 
     /// Pushes a batch of tasks into the local queue.
@@ -519,7 +523,8 @@ pub struct DtaScheduler {
     /// Active topology mode.
     pub topology: TopologyMode,
     /// Branchless jump table for task enqueuing.
-    pub enqueue_jmp: [fn(&Self, usize, usize, TaskIndex); 2],
+    #[allow(clippy::type_complexity)]
+    pub enqueue_jmp: [fn(&Self, usize, usize, TaskIndex) -> bool; 2],
 }
 
 unsafe impl Sync for DtaScheduler {}
@@ -566,42 +571,48 @@ impl DtaScheduler {
     }
 
     #[inline(always)]
-    fn do_push_local(&self, source_core: usize, target_core: usize, task: TaskIndex) {
-        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
+    fn do_push_local(&self, source_core: usize, target_core: usize, task: TaskIndex) -> bool {
+        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(std::cell::Cell::get);
         if current_worker == source_core {
             unsafe {
                 let worker = &mut *self.workers[source_core].get();
-                worker.push_local(task);
+                if worker.push_local(task) {
+                    return true;
+                }
             }
-        } else {
-            // Not on the worker thread! Push to external mailbox instead of racing on local queue.
-            self.external_locks[target_core].lock();
-            let mut chunk = TaskChunk::default();
-            chunk.tasks[0] = task;
-            chunk.count = 1;
-            let _ = self.external_mailboxes[target_core].push(chunk);
-            self.external_locks[target_core].unlock();
         }
+
+        // Fallback to external mailbox if local queue is full or cross-thread
+        self.external_locks[target_core].lock();
+        let mut chunk = TaskChunk::default();
+        chunk.tasks[0] = task;
+        chunk.count = 1;
+        let res = self.external_mailboxes[target_core].push(chunk);
+        self.external_locks[target_core].unlock();
+        res.is_ok()
     }
 
     #[inline(always)]
-    fn do_push_remote(&self, _source_core: usize, target_core: usize, task: TaskIndex) {
-        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
-        
-        if current_worker < self.workers.len() {
+    fn do_push_remote(&self, _source_core: usize, target_core: usize, task: TaskIndex) -> bool {
+        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(std::cell::Cell::get);
+
+        let res = if current_worker < self.workers.len() {
             let mut chunk = TaskChunk::default();
             chunk.tasks[0] = task;
             chunk.count = 1;
-            let _ = self.mailboxes[current_worker][target_core].push(chunk);
+            self.mailboxes[current_worker][target_core]
+                .push(chunk)
+                .is_ok()
         } else {
             // External thread: Push to external mailbox
             self.external_locks[target_core].lock();
             let mut chunk = TaskChunk::default();
             chunk.tasks[0] = task;
             chunk.count = 1;
-            let _ = self.external_mailboxes[target_core].push(chunk);
+            let success = self.external_mailboxes[target_core].push(chunk).is_ok();
             self.external_locks[target_core].unlock();
-        }
+            success
+        };
 
         #[cfg(all(
             feature = "hw-acceleration",
@@ -626,6 +637,7 @@ impl DtaScheduler {
         unsafe {
             core::arch::asm!("csrw uipi, {0}", in(reg) target_core);
         }
+        res
     }
 
     /// Enqueues a task into the mesh, applying work-deflection if necessary.
@@ -634,7 +646,8 @@ impl DtaScheduler {
     /// local CCX neighbors. If `TopologyMode::Global` is active, tasks can
     /// be deflected to any available core in the runtime.
     #[inline(always)]
-    pub fn enqueue_task(&self, source_core: usize, flow_id: u64, task: TaskIndex) {
+    #[must_use]
+    pub fn enqueue_task(&self, source_core: usize, flow_id: u64, task: TaskIndex) -> bool {
         let num_workers = self.workers.len();
         let source_core = source_core % num_workers;
         let worker_ref = unsafe { &*self.workers[source_core].get() };
@@ -660,7 +673,7 @@ impl DtaScheduler {
         };
 
         let jump_idx = usize::from(target_core != source_core);
-        (self.enqueue_jmp[jump_idx])(self, source_core, target_core, task);
+        (self.enqueue_jmp[jump_idx])(self, source_core, target_core, task)
     }
 
     /// Polls all incoming mailboxes for the current core.
@@ -669,27 +682,17 @@ impl DtaScheduler {
         let worker = unsafe { &mut *self.workers[current_core].get() };
 
         let num_polls = worker.polling_order.len();
-        let num_rows = self.mailboxes.len();
 
         for idx in 0..num_polls {
             let i = worker.polling_order[idx];
-            
-            if i >= num_rows {
-                unsafe { libc::printf(b"[Dtact] CRITICAL: worker %zu polling out-of-bounds index %zu (rows=%zu)\n\0".as_ptr().cast(), current_core, i, num_rows); }
-                continue;
-            }
 
             let row = &self.mailboxes[i];
-            if current_core >= row.len() {
-                unsafe { libc::printf(b"[Dtact] CRITICAL: worker %zu out of bounds for row %zu (cols=%zu)\n\0".as_ptr().cast(), current_core, i, row.len()); }
-                continue;
-            }
 
             while let Some(chunk) = row[current_core].pop() {
                 worker.push_batch(&chunk);
             }
         }
- 
+
         // 2. Poll External Mailbox for external host-thread spawns
         while let Some(chunk) = self.external_mailboxes[current_core].pop() {
             worker.push_batch(&chunk);
@@ -705,12 +708,11 @@ impl DtaScheduler {
     /// Supports cooperative shutdown via the provided atomic flag.
     #[inline]
     pub fn run_worker_static(
-        scheduler: &DtaScheduler,
+        scheduler: &Self,
         current_core: usize,
         pool: &crate::memory_management::ContextPool,
         shutdown: &core::sync::atomic::AtomicBool,
     ) {
-        unsafe { libc::printf(b"[Dtact] Worker %zu starting (sched=%p, pool=%p)...\n\0".as_ptr().cast(), current_core, scheduler as *const _, pool as *const _); }
         crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(current_core));
         loop {
             if shutdown.load(core::sync::atomic::Ordering::Relaxed) {

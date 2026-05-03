@@ -174,6 +174,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::useless_let_if_seq)]
+    #[allow(clippy::too_many_lines)]
     pub fn spawn<F: Future + Send + 'static>(self, fut: F) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME
             .get()
@@ -196,7 +197,23 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             }
 
             let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
-            if !ctx_ptr.is_null() {
+            if ctx_ptr.is_null() {
+                // HOST-THREAD SPINNING
+                if fixed_spins < 2000 {
+                    core::hint::spin_loop();
+                    fixed_spins += 1;
+
+                    // Sparse Polling for host threads too
+                    if fixed_spins.trailing_zeros() >= 3
+                        && let Some(id) = pool.alloc_context()
+                    {
+                        break 'alloc id;
+                    }
+                } else {
+                    std::thread::yield_now();
+                    fixed_spins = 0; // Reset after yield
+                }
+            } else {
                 // FIBER-AWARE ADAPTIVE SPINNING
                 unsafe {
                     let ctx = &mut *ctx_ptr;
@@ -209,12 +226,12 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                             core::hint::spin_loop();
 
                             // Sparse Polling: only check the pool every 8 iterations to reduce L1 pressure
-                            if i.trailing_zeros() >= 3 {
-                                if let Some(id) = pool.alloc_context() {
-                                    ctx.adaptive_spin_count = (current_spin + 2).min(2000);
-                                    ctx.spin_failure_count = failure_count.saturating_sub(1);
-                                    break 'alloc id;
-                                }
+                            if i.trailing_zeros() >= 3
+                                && let Some(id) = pool.alloc_context()
+                            {
+                                ctx.adaptive_spin_count = (current_spin + 2).min(2000);
+                                ctx.spin_failure_count = failure_count.saturating_sub(1);
+                                break 'alloc id;
                             }
                         }
                     }
@@ -228,22 +245,6 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                         core::sync::atomic::Ordering::Release,
                     );
                     (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
-                }
-            } else {
-                // HOST-THREAD SPINNING
-                if fixed_spins < 2000 {
-                    core::hint::spin_loop();
-                    fixed_spins += 1;
-
-                    // Sparse Polling for host threads too
-                    if fixed_spins.trailing_zeros() >= 3 {
-                        if let Some(id) = pool.alloc_context() {
-                            break 'alloc id;
-                        }
-                    }
-                } else {
-                    std::thread::yield_now();
-                    fixed_spins = 0; // Reset after yield
                 }
             }
         };
@@ -362,16 +363,21 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             }
         }
 
-        let r#gen = unsafe {
+        let r#gen = u64::from(unsafe {
             (*ctx_ptr)
                 .generation
                 .load(core::sync::atomic::Ordering::Acquire)
-        } as u64;
+        });
 
         crate::wake_fiber(current_core, ctx_id);
 
         // Handle Layout: [1-bit Valid | 15-bit Generation | 16-bit CoreID | 32-bit ContextID]
-        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32) | ((r#gen & 0xFFFF) << 48) | (1 << 63))
+        dtact_handle_t(
+            u64::from(ctx_id)
+                | ((current_core as u64) << 32)
+                | ((r#gen & 0xFFFF) << 48)
+                | (1 << 63),
+        )
     }
 }
 
@@ -416,7 +422,7 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
             let num_workers = runtime.scheduler.workers.len();
             let target_worker = target_worker % num_workers;
-            let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
+            let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(std::cell::Cell::get);
 
             if current_worker == target_worker {
                 // We are on the target worker's thread! Safe to push local.
@@ -432,9 +438,11 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
                 let _ = runtime.scheduler.mailboxes[current_worker][target_worker].push(chunk);
             } else {
                 // Fallback for non-worker threads: use global enqueue or pick a source
-                runtime
-                    .scheduler
-                    .enqueue_task(target_worker, waiter_ctx_id as u64, waiter_ctx_id);
+                let _ = runtime.scheduler.enqueue_task(
+                    target_worker,
+                    u64::from(waiter_ctx_id),
+                    waiter_ctx_id,
+                );
             }
         }
     }
@@ -711,7 +719,7 @@ pub mod fiber {
         }
 
         let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
-        let target_core_id = (handle.0 >> 32) as usize;
+        let target_core_id = ((handle.0 >> 32) & 0xFFFF) as usize;
 
         crate::wake_fiber(target_core_id, target_ctx_id);
 
@@ -797,7 +805,7 @@ pub async fn yield_now() {
 pub async fn yield_to(handle: dtact_handle_t) {
     let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
     let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
-    let target_core_id = (handle_val >> 32) as usize;
+    let target_core_id = ((handle_val >> 32) & 0xFFFF) as usize;
     crate::wake_fiber(target_core_id, target_ctx_id);
     yield_now().await;
 }

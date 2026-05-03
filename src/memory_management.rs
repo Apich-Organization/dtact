@@ -200,6 +200,8 @@ impl ContextPool {
     /// # Errors
     /// Returns an error if the OS fails to allocate the requested memory region
     /// or if hardware protection cannot be applied to the guard pages.
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
     pub fn new(
         capacity: u32,
         stack_size: usize,
@@ -341,6 +343,7 @@ impl ContextPool {
     }
 
     #[inline(always)]
+    #[allow(clippy::useless_let_if_seq)]
     unsafe fn allocate_arena(
         size: usize,
         safety: SafetyLevel,
@@ -511,6 +514,8 @@ impl ContextPool {
 
     /// Returns the base pointer and layout metadata for direct dispatcher access.
     #[inline(always)]
+    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
     pub fn get_dispatch_layout(&self) -> (*mut u8, usize, usize, usize) {
         #[cfg(unix)]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
