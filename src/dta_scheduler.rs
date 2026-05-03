@@ -346,7 +346,7 @@ impl Worker {
             cpu,
             load_level: AtomicU8::new(0),
             deflection_threshold: AtomicU8::new(80),
-            local_queue: HugeBuffer::new(),
+    local_queue: HugeBuffer::new(),
             local_head: 0,
             local_tail: 0,
             ticks: 0,
@@ -490,6 +490,14 @@ impl Worker {
             };
             if state == crate::memory_management::FiberStatus::Finished as u8 {
                 pool.free_context(task);
+            } else if state == crate::memory_management::FiberStatus::Notified as u8 {
+                // Cooperative yield or backpressure-induced suspension: re-enqueue.
+                // We MUST do this here (on the scheduler stack) to ensure the fiber's
+                // registers were fully saved by the switch_fn before it's picked up
+                // by another worker.
+                self.push_local(task);
+                // Return to allow mailbox polling and prevent live-locks on high contention.
+                return;
             }
         }
     }
@@ -504,6 +512,10 @@ pub struct DtaScheduler {
     pub workers: Vec<UnsafeCell<Worker>>,
     /// N x N Mailbox matrix for P2P communication.
     pub mailboxes: Vec<Vec<Mailbox>>,
+    /// Mailboxes for tasks spawned from external host threads.
+    pub external_mailboxes: Vec<Mailbox>,
+    /// Locks for external mailboxes (to allow multiple host threads to spawn).
+    pub external_locks: Vec<crate::utils::SpinLock>,
     /// Active topology mode.
     pub topology: TopologyMode,
     /// Branchless jump table for task enqueuing.
@@ -520,6 +532,8 @@ impl DtaScheduler {
     pub fn new(num_workers: usize, topology: TopologyMode) -> Self {
         let mut workers = Vec::with_capacity(num_workers);
         let mut mailboxes = Vec::with_capacity(num_workers);
+        let mut external_mailboxes = Vec::with_capacity(num_workers);
+        let mut external_locks = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
             #[allow(clippy::cast_possible_truncation)]
@@ -537,30 +551,57 @@ impl DtaScheduler {
                 row.push(Mailbox::new());
             }
             mailboxes.push(row);
+            external_mailboxes.push(Mailbox::new());
+            external_locks.push(crate::utils::SpinLock::new());
         }
 
         Self {
             workers,
             mailboxes,
+            external_mailboxes,
+            external_locks,
             topology,
             enqueue_jmp: [Self::do_push_local, Self::do_push_remote],
         }
     }
 
     #[inline(always)]
-    fn do_push_local(&self, source_core: usize, _target_core: usize, task: TaskIndex) {
-        unsafe {
-            let worker = &mut *self.workers[source_core].get();
-            worker.push_local(task);
+    fn do_push_local(&self, source_core: usize, target_core: usize, task: TaskIndex) {
+        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
+        if current_worker == source_core {
+            unsafe {
+                let worker = &mut *self.workers[source_core].get();
+                worker.push_local(task);
+            }
+        } else {
+            // Not on the worker thread! Push to external mailbox instead of racing on local queue.
+            self.external_locks[target_core].lock();
+            let mut chunk = TaskChunk::default();
+            chunk.tasks[0] = task;
+            chunk.count = 1;
+            let _ = self.external_mailboxes[target_core].push(chunk);
+            self.external_locks[target_core].unlock();
         }
     }
 
     #[inline(always)]
-    fn do_push_remote(&self, source_core: usize, target_core: usize, task: TaskIndex) {
-        let mut chunk = TaskChunk::default();
-        chunk.tasks[0] = task;
-        chunk.count = 1;
-        let _ = self.mailboxes[source_core][target_core].push(chunk);
+    fn do_push_remote(&self, _source_core: usize, target_core: usize, task: TaskIndex) {
+        let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
+        
+        if current_worker < self.workers.len() {
+            let mut chunk = TaskChunk::default();
+            chunk.tasks[0] = task;
+            chunk.count = 1;
+            let _ = self.mailboxes[current_worker][target_core].push(chunk);
+        } else {
+            // External thread: Push to external mailbox
+            self.external_locks[target_core].lock();
+            let mut chunk = TaskChunk::default();
+            chunk.tasks[0] = task;
+            chunk.count = 1;
+            let _ = self.external_mailboxes[target_core].push(chunk);
+            self.external_locks[target_core].unlock();
+        }
 
         #[cfg(all(
             feature = "hw-acceleration",
@@ -587,8 +628,6 @@ impl DtaScheduler {
         }
     }
 
-    /// Enqueues a task into the mesh, applying work-deflection if necessary.
-    ///
     /// Enqueues a task into the mesh, applying work-deflection if necessary.
     ///
     /// If `TopologyMode::P2PMesh` is active, deflection is restricted to
@@ -630,32 +669,48 @@ impl DtaScheduler {
         let worker = unsafe { &mut *self.workers[current_core].get() };
 
         let num_polls = worker.polling_order.len();
+        let num_rows = self.mailboxes.len();
+
         for idx in 0..num_polls {
             let i = worker.polling_order[idx];
+            
+            if i >= num_rows {
+                unsafe { libc::printf(b"[Dtact] CRITICAL: worker %zu polling out-of-bounds index %zu (rows=%zu)\n\0".as_ptr().cast(), current_core, i, num_rows); }
+                continue;
+            }
 
-            while let Some(chunk) = self.mailboxes[i][current_core].pop() {
+            let row = &self.mailboxes[i];
+            if current_core >= row.len() {
+                unsafe { libc::printf(b"[Dtact] CRITICAL: worker %zu out of bounds for row %zu (cols=%zu)\n\0".as_ptr().cast(), current_core, i, row.len()); }
+                continue;
+            }
+
+            while let Some(chunk) = row[current_core].pop() {
                 worker.push_batch(&chunk);
             }
+        }
+ 
+        // 2. Poll External Mailbox for external host-thread spawns
+        while let Some(chunk) = self.external_mailboxes[current_core].pop() {
+            worker.push_batch(&chunk);
         }
 
         worker.update_load();
         worker.tick();
     }
 
-    /// Main heartbeat loop for a worker thread with cooperative shutdown.
+    /// Main heartbeat loop for a hardware worker thread with cooperative shutdown.
     ///
-    /// Same as `run_worker`, but periodically checks a shutdown flag to enable
-    /// clean thread termination (critical for test harnesses and process exit).
-    ///
-    /// # Safety
-    /// Same safety requirements as `run_worker`.
+    /// Periodically polls local queues, mailboxes, and external queues for work.
+    /// Supports cooperative shutdown via the provided atomic flag.
     #[inline]
-    pub fn run_worker_with_shutdown(
-        &self,
+    pub fn run_worker_static(
+        scheduler: &DtaScheduler,
         current_core: usize,
         pool: &crate::memory_management::ContextPool,
         shutdown: &core::sync::atomic::AtomicBool,
     ) {
+        unsafe { libc::printf(b"[Dtact] Worker %zu starting (sched=%p, pool=%p)...\n\0".as_ptr().cast(), current_core, scheduler as *const _, pool as *const _); }
         crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(current_core));
         loop {
             if shutdown.load(core::sync::atomic::Ordering::Relaxed) {
@@ -663,14 +718,14 @@ impl DtaScheduler {
             }
 
             unsafe {
-                let worker = &mut *self.workers[current_core].get();
+                let worker = &mut *scheduler.workers[current_core].get();
                 worker.dispatch_loop(pool);
             }
 
-            self.poll_mailboxes(current_core);
+            scheduler.poll_mailboxes(current_core);
 
             unsafe {
-                let worker = &*self.workers[current_core].get();
+                let worker = &*scheduler.workers[current_core].get();
                 if worker.local_queue_len() == 0 {
                     #[cfg(all(feature = "hw-acceleration", target_arch = "aarch64"))]
                     {

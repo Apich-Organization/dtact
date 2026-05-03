@@ -41,7 +41,7 @@ pub const extern "C" fn dtact_default_config() -> dtact_config_t {
 pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
     let cfg = unsafe { &*cfg };
     let _workers = if cfg.workers == 0 {
-        crate::api::topology::current().core_id as usize + 1
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
     } else {
         cfg.workers as usize
     };
@@ -280,8 +280,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
 /// * Panics if the runtime is not initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_await(handle: dtact_handle_t) {
-    let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
-    let handle_gen = (handle.0 >> 48) as u16;
+    let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
+    let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
+    let handle_gen = (handle_val >> 48) as u16;
     let runtime = crate::GLOBAL_RUNTIME
         .get()
         .expect("Runtime not initialized");
@@ -325,6 +326,13 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
 
     // ===== FIBER PATH (called from within a running fiber) =====
     loop {
+        // Clear Notified state before starting check
+        unsafe {
+            (*ctx_ptr)
+                .state
+                .store(crate::memory_management::FiberStatus::Running as u8, core::sync::atomic::Ordering::Release);
+        }
+
         // 0. Check target state and generation
         let current_gen = unsafe {
             (*target_ctx)
@@ -336,6 +344,7 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
                 .state
                 .load(core::sync::atomic::Ordering::Acquire)
         };
+        // unsafe { libc::printf(b"[Dtact] Fiber %u checking Target %u: state=%u\n\0".as_ptr().cast(), (*ctx_ptr).fiber_index, target_ctx_id, status); }
 
         if current_gen != handle_gen
             || status == crate::memory_management::FiberStatus::Initial as u8
@@ -389,14 +398,21 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
             break;
         }
 
-        // 3. Yield the current fiber natively to the scheduler
+        // 3. Try to transition to Yielded and suspend
         unsafe {
             let ctx = &mut *ctx_ptr;
-            ctx.state.store(
-                crate::memory_management::FiberStatus::Yielded as u8,
-                core::sync::atomic::Ordering::Release,
-            );
-            (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
+            if ctx
+                .state
+                .compare_exchange(
+                    crate::memory_management::FiberStatus::Running as u8,
+                    crate::memory_management::FiberStatus::Yielded as u8,
+                    core::sync::atomic::Ordering::Release,
+                    core::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
+            }
         }
     }
 }
@@ -412,19 +428,19 @@ pub extern "C" fn dtact_run(_rt: *mut c_void) {
         .get()
         .expect("Dtact Runtime not initialized");
     let scheduler = &runtime.scheduler;
-    let pool = &runtime.pool;
     let workers_count = scheduler.workers.len();
     let mut handles = alloc::vec::Vec::with_capacity(workers_count);
 
     for i in 0..workers_count {
-        let scheduler_ptr = std::ptr::from_ref(scheduler) as usize;
-        let pool_ptr = std::ptr::from_ref(pool) as usize;
-        let shutdown_ptr = &runtime.shutdown;
-
         let handle = std::thread::spawn(move || {
-            let s = unsafe { &*(scheduler_ptr as *const crate::dta_scheduler::DtaScheduler) };
-            let p = unsafe { &*(pool_ptr as *const crate::memory_management::ContextPool) };
-            s.run_worker_with_shutdown(i, p, shutdown_ptr);
+            if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
+                crate::dta_scheduler::DtaScheduler::run_worker_static(
+                    &runtime.scheduler,
+                    i,
+                    &runtime.pool,
+                    &runtime.shutdown,
+                );
+            }
         });
         handles.push(handle);
     }

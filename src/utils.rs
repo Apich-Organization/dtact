@@ -200,3 +200,41 @@ pub fn get_thread_id() -> u64 {
         tid
     })
 }
+
+/// A lightweight, hardware-optimized SpinLock.
+///
+/// Designed for extremely short critical sections within the scheduler,
+/// utilizing the `PAUSE` instruction to reduce power consumption and
+/// improve memory coherence during contention.
+pub struct SpinLock {
+    locked: core::sync::atomic::AtomicBool,
+}
+
+impl SpinLock {
+    /// Creates a new, unlocked SpinLock.
+    pub const fn new() -> Self {
+        Self {
+            locked: core::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Acquires the lock, spinning if necessary.
+    #[inline(always)]
+    pub fn lock(&self) {
+        while self
+            .locked
+            .swap(true, core::sync::atomic::Ordering::Acquire)
+        {
+            while self.locked.load(core::sync::atomic::Ordering::Relaxed) {
+                core::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Releases the lock.
+    #[inline(always)]
+    pub fn unlock(&self) {
+        self.locked
+            .store(false, core::sync::atomic::Ordering::Release);
+    }
+}

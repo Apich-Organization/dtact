@@ -175,7 +175,7 @@ impl Runtime {
             std::thread::Builder::new()
                 .name(format!("dtact-worker-{my_id}"))
                 .spawn(move || {
-                    sched.run_worker_with_shutdown(my_id, pool, shutdown);
+                    crate::dta_scheduler::DtaScheduler::run_worker_static(sched, my_id, pool, shutdown);
                 })
                 .expect("Failed to spawn Dtact worker thread");
         }

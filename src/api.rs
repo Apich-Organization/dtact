@@ -224,16 +224,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                     ctx.adaptive_spin_count = current_spin.saturating_sub(100).max(200);
 
                     ctx.state.store(
-                        crate::memory_management::FiberStatus::Yielded as u8,
+                        crate::memory_management::FiberStatus::Notified as u8,
                         core::sync::atomic::Ordering::Release,
                     );
-
-                    // RE-ENQUEUE the fiber before swapping so the scheduler runs it again
-                    let ctx_id = ctx.fiber_index;
-                    let current_core =
-                        topology::current().core_id as usize % runtime.scheduler.workers.len();
-                    crate::wake_fiber(current_core, ctx_id);
-
                     (ctx.switch_fn)(&raw mut ctx.regs, &raw const ctx.executor_regs);
                 }
             } else {
@@ -256,8 +249,14 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
         };
 
         let ctx_ptr = pool.get_context_ptr(ctx_id);
-        #[allow(clippy::cast_possible_truncation)]
-        let current_core = topology::current().core_id as usize % runtime.scheduler.workers.len();
+        let current_core = crate::future_bridge::CURRENT_WORKER_ID.with(|c| {
+            let id = c.get();
+            if id < runtime.scheduler.workers.len() {
+                id
+            } else {
+                topology::current().core_id as usize % runtime.scheduler.workers.len()
+            }
+        });
 
         unsafe {
             (*ctx_ptr).state.store(
@@ -371,8 +370,8 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
         crate::wake_fiber(current_core, ctx_id);
 
-        // Handle Layout: [16-bit Generation | 16-bit CoreID | 32-bit ContextID]
-        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32) | ((r#gen & 0xFFFF) << 48))
+        // Handle Layout: [1-bit Valid | 15-bit Generation | 16-bit CoreID | 32-bit ContextID]
+        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32) | ((r#gen & 0xFFFF) << 48) | (1 << 63))
     }
 }
 
@@ -405,11 +404,12 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
 
     // Wake up any fiber waiting for this one (FFI join).
     // MUST happen BEFORE free_context, otherwise the context could be reallocated
-    // and the waiter_handle overwritten before we read it.
+    // and the waiter_handle overwritten before we read
     let waiter = ctx
         .waiter_handle
         .swap(0, core::sync::atomic::Ordering::AcqRel);
     if waiter != 0 {
+        let waiter = waiter & !(1 << 63); // Strip sentinel bit
         let waiter_ctx_id = (waiter & 0xFFFF_FFFF) as u32;
         let target_worker = (waiter >> 32) as usize;
 
@@ -795,8 +795,9 @@ pub async fn yield_now() {
 /// Yields execution to another fiber handle asynchronously.
 #[inline(always)]
 pub async fn yield_to(handle: dtact_handle_t) {
-    let target_ctx_id = (handle.0 & 0xFFFF_FFFF) as u32;
-    let target_core_id = (handle.0 >> 32) as usize;
+    let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
+    let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
+    let target_core_id = (handle_val >> 32) as usize;
     crate::wake_fiber(target_core_id, target_ctx_id);
     yield_now().await;
 }

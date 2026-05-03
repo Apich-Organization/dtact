@@ -34,12 +34,21 @@ overflow-checks = false
 incremental = true
 
 [profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
-opt-level = 3
-strip = true
-debug = false
+# lto = true
+# codegen-units = 1
+# panic = "abort"
+# opt-level = 3
+# strip = true
+# debug = false
+# debug-assertions = false
+# overflow-checks = false
+# incremental = true
+lto = false
+codegen-units = 256
+panic = "unwind"
+opt-level = 0
+strip = false
+debug = true
 debug-assertions = false
 overflow-checks = false
 incremental = true
