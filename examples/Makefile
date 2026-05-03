@@ -1,6 +1,6 @@
 CC = gcc
 # CFLAGS = -Wall -Wextra -O2
-CFLAGS = -Wall -Wextra -g -O0
+CFLAGS = -Wall -Wextra -g -O0 -fsanitize=address
 LDFLAGS = -L../target/release -ldtact -Wl,-rpath,../target/release
 
 all: c_async

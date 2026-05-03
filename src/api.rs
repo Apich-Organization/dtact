@@ -175,9 +175,11 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::useless_let_if_seq)]
     pub fn spawn<F: Future + Send + 'static>(self, fut: F) -> dtact_handle_t {
-        let runtime = crate::GLOBAL_RUNTIME
-            .get()
-            .expect("Dtact Runtime not initialized");
+        let runtime = unsafe {
+            crate::GLOBAL_RUNTIME
+                .as_ref()
+                .expect("Dtact Runtime not initialized")
+        };
         let pool = &runtime.pool;
         let mut fixed_spins: u32 = 0;
 
@@ -375,6 +377,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
     }
 }
 
+#[inline]
 pub(crate) unsafe extern "C" fn fiber_entry_point() {
     let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
     if ctx_ptr.is_null() {
@@ -413,7 +416,7 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         let waiter_ctx_id = (waiter & 0xFFFF_FFFF) as u32;
         let target_worker = (waiter >> 32) as usize;
 
-        if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
+        if let Some(runtime) = unsafe { crate::GLOBAL_RUNTIME.as_ref() } {
             let num_workers = runtime.scheduler.workers.len();
             let target_worker = target_worker % num_workers;
             let current_worker = crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.get());
@@ -644,9 +647,11 @@ pub mod fiber {
         _stack_size_str: &str,
         f: F,
     ) -> dtact_handle_t {
-        let runtime = crate::GLOBAL_RUNTIME
-            .get()
-            .expect("Dtact Runtime not initialized");
+        let runtime = unsafe {
+            crate::GLOBAL_RUNTIME
+                .as_ref()
+                .expect("Dtact Runtime not initialized")
+        };
         let pool = &runtime.pool;
         let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
         let ctx_ptr = pool.get_context_ptr(ctx_id);
@@ -808,7 +813,7 @@ pub mod config {
     /// Sets the work-deflection threshold for a specific hardware worker.
     #[inline(always)]
     pub fn set_deflection_threshold(core_id: usize, threshold: u8) {
-        if let Some(runtime) = crate::GLOBAL_RUNTIME.get()
+        if let Some(runtime) = unsafe { crate::GLOBAL_RUNTIME.as_ref() }
             && core_id < runtime.scheduler.workers.len()
         {
             unsafe {

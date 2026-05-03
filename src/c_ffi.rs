@@ -15,18 +15,25 @@ pub struct dtact_config_t {
     pub workers: u32,
     /// Memory safety level (0-2).
     pub safety_level: u8,
-    /// Topology mode (0: `P2PMesh`, 1: Global).
+    /// Topology mode (0: P2PMesh, 1: Global).
     pub topology_mode: u8,
+    /// Maximum number of concurrent fibers.
+    pub contexts: u32,
+    /// Stack size per fiber in bytes.
+    pub stack_size: u64,
 }
 
 /// Returns the recommended default configuration for the Dtact runtime.
 #[unsafe(no_mangle)]
-pub const extern "C" fn dtact_default_config() -> dtact_config_t {
-    dtact_config_t {
+pub unsafe extern "C" fn dtact_default_config(cfg: *mut dtact_config_t) {
+    let cfg = unsafe { &mut *cfg };
+    *cfg = dtact_config_t {
         workers: 0,       // Auto-detect
         safety_level: 1,  // Safety1
         topology_mode: 0, // P2PMesh
-    }
+        contexts: 4096,
+        stack_size: 2 * 1024 * 1024,
+    };
 }
 
 /// Initializes the global Dtact runtime singleton.
@@ -57,20 +64,31 @@ pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
         _ => TopologyMode::P2PMesh,
     };
 
-    crate::GLOBAL_RUNTIME.get_or_init(|| {
+    unsafe {
+        if !crate::GLOBAL_RUNTIME.is_null() {
+            return crate::GLOBAL_RUNTIME as *mut c_void;
+        }
+
         let scheduler = crate::dta_scheduler::DtaScheduler::new(_workers, topology);
-        let pool = crate::memory_management::ContextPool::new(16384, 2 * 1024 * 1024, safety, 0)
-            .expect("DTA-V3 FFI Initialization Failed");
-        crate::Runtime {
-            scheduler,
-            pool,
+        let pool = crate::memory_management::ContextPool::new(
+            cfg.contexts,
+            cfg.stack_size as usize,
+            safety,
+            0,
+        )
+        .expect("DTA-V3 FFI Initialization Failed");
+
+        let runtime = Box::new(crate::Runtime {
+            scheduler: Box::new(scheduler),
+            pool: Box::new(pool),
             started: core::sync::atomic::AtomicBool::new(false),
             shutdown: core::sync::atomic::AtomicBool::new(false),
-        }
-    });
+        });
 
-    // Return a dummy pointer as "runtime handle" for C
-    core::ptr::null_mut()
+        let ptr = Box::into_raw(runtime);
+        crate::GLOBAL_RUNTIME = ptr;
+        ptr as *mut c_void
+    }
 }
 
 /// Critical failure handler. Aborts the process if a fiber attempts to
@@ -112,9 +130,11 @@ pub unsafe extern "C" fn dtact_fiber_launch(
     func: extern "C" fn(*mut c_void),
     arg: *mut c_void,
 ) -> dtact_handle_t {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
+    let runtime = unsafe {
+        crate::GLOBAL_RUNTIME
+            .as_ref()
+            .expect("Dtact Runtime not initialized")
+    };
     let pool = &runtime.pool;
     let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
 
@@ -202,9 +222,11 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
     arg: *mut c_void,
     cleanup: unsafe extern "C" fn(*mut c_void),
 ) -> dtact_handle_t {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
+    let runtime = unsafe {
+        crate::GLOBAL_RUNTIME
+            .as_ref()
+            .expect("Dtact Runtime not initialized")
+    };
     let pool = &runtime.pool;
     let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
 
@@ -283,9 +305,11 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
     let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
     let handle_gen = (handle_val >> 48) as u16;
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Runtime not initialized");
+    let runtime = unsafe {
+        crate::GLOBAL_RUNTIME
+            .as_ref()
+            .expect("Runtime not initialized")
+    };
     let pool = &runtime.pool;
     let target_ctx = pool.get_context_ptr(target_ctx_id);
 
@@ -421,19 +445,50 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
 /// This call blocks until all hardware worker threads have exited.
 ///
 /// # Panics
-/// * Panics if the runtime is not initialized.
-#[unsafe(no_mangle)]
-pub extern "C" fn dtact_run(_rt: *mut c_void) {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
-    let scheduler = &runtime.scheduler;
-    let workers_count = scheduler.workers.len();
-    let mut handles = alloc::vec::Vec::with_capacity(workers_count);
+/// * Panics if the runtime is not initialized.#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
+    let cfg = unsafe { &*cfg };
+    let _workers = if cfg.workers == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    } else {
+        cfg.workers as usize
+    };
 
+    let safety = match cfg.safety_level {
+        0 => crate::memory_management::SafetyLevel::Safety0,
+        1 => crate::memory_management::SafetyLevel::Safety1,
+        2 => crate::memory_management::SafetyLevel::Safety2,
+        _ => crate::memory_management::SafetyLevel::Safety1,
+    };
+
+    let topology = match cfg.topology_mode {
+        0 => crate::dta_scheduler::TopologyMode::P2PMesh,
+        1 => crate::dta_scheduler::TopologyMode::Global,
+        _ => crate::dta_scheduler::TopologyMode::P2PMesh,
+    };
+
+    let scheduler = crate::dta_scheduler::DtaScheduler::new(_workers, topology);
+    let pool = crate::memory_management::ContextPool::new(
+        cfg.contexts,
+        cfg.stack_size as usize,
+        safety,
+        0,
+    )
+    .expect("DTA-V3 FFI Initialization Failed");
+
+    let mut runtime = Box::new(crate::Runtime {
+        scheduler,
+        pool,
+        started: core::sync::atomic::AtomicBool::new(false),
+        shutdown: core::sync::atomic::AtomicBool::new(false),
+        handles: Vec::new(),
+    });
+
+    // Spawn threads early in init
+    let workers_count = runtime.scheduler.workers.len();
     for i in 0..workers_count {
         let handle = std::thread::spawn(move || {
-            if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
+            if let Some(runtime) = unsafe { crate::GLOBAL_RUNTIME.as_ref() } {
                 crate::dta_scheduler::DtaScheduler::run_worker_static(
                     &runtime.scheduler,
                     i,
@@ -442,20 +497,36 @@ pub extern "C" fn dtact_run(_rt: *mut c_void) {
                 );
             }
         });
-        handles.push(handle);
+        runtime.handles.push(handle);
     }
 
-    for h in handles {
-        let _ = h.join();
+    let ptr = Box::into_raw(runtime);
+    crate::GLOBAL_RUNTIME = ptr;
+    ptr as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dtact_run(_rt: *mut c_void) {
+    if let Some(runtime) = unsafe { crate::GLOBAL_RUNTIME.as_ref() } {
+        runtime.started.store(true, core::sync::atomic::Ordering::Release);
     }
 }
 
-/// Signals the cooperative shutdown of all Dtact worker threads.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_shutdown() {
-    if let Some(runtime) = crate::GLOBAL_RUNTIME.get() {
-        runtime
-            .shutdown
-            .store(true, core::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        if let Some(runtime_ptr) = crate::GLOBAL_RUNTIME.as_mut() {
+            runtime_ptr.shutdown.store(true, core::sync::atomic::Ordering::SeqCst);
+            
+            // Join threads
+            let handles = core::mem::take(&mut runtime_ptr.handles);
+            for h in handles {
+                let _ = h.join();
+            }
+
+            // Drop runtime
+            let _ = Box::from_raw(crate::GLOBAL_RUNTIME);
+            crate::GLOBAL_RUNTIME = core::ptr::null_mut();
+        }
     }
 }

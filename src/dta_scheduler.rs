@@ -73,8 +73,7 @@ impl<T> HugeBuffer<T> {
     #[inline]
     #[must_use]
     pub fn new() -> Self {
-        let size_bytes = core::mem::size_of::<T>();
-
+        let size_bytes = (core::mem::size_of::<T>() + 4095) & !4095;
         #[cfg(unix)]
         unsafe {
             let mut flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
@@ -90,8 +89,7 @@ impl<T> HugeBuffer<T> {
                 0,
             );
             if ptr == libc::MAP_FAILED {
-                // Fallback to aligned std::alloc to prevent mmap exhaustion on QEMU/aarch64
-                let layout = std::alloc::Layout::from_size_align(size_bytes, 64).unwrap();
+                let layout = std::alloc::Layout::from_size_align(size_bytes, 4096).unwrap();
                 let alloc_ptr = std::alloc::alloc_zeroed(layout);
                 assert!(!alloc_ptr.is_null(), "HugeBuffer std::alloc failed");
                 Self {
@@ -100,7 +98,6 @@ impl<T> HugeBuffer<T> {
                     is_mmap: false,
                 }
             } else {
-                core::ptr::write_bytes(ptr, 0, size_bytes);
                 Self {
                     ptr: ptr.cast::<T>(),
                     size_bytes,
@@ -162,7 +159,7 @@ impl<T> Drop for HugeBuffer<T> {
             if self.is_mmap {
                 libc::munmap(self.ptr.cast::<libc::c_void>(), self.size_bytes);
             } else {
-                let layout = std::alloc::Layout::from_size_align(self.size_bytes, 64).unwrap();
+                let layout = std::alloc::Layout::from_size_align(self.size_bytes, 4096).unwrap();
                 std::alloc::dealloc(self.ptr.cast::<u8>(), layout);
             }
         }
@@ -225,7 +222,7 @@ impl Mailbox {
     #[inline(always)]
     #[allow(clippy::result_large_err)]
     pub fn push(&self, chunk: TaskChunk) -> Result<(), TaskChunk> {
-        let current_tail = self.tail.load(Ordering::Relaxed);
+        let current_tail = self.tail.load(Ordering::Acquire);
         let next_tail = (current_tail + 1) & MAILBOX_MASK;
 
         if next_tail == self.head.load(Ordering::Acquire) {
@@ -234,10 +231,10 @@ impl Mailbox {
 
         unsafe {
             let buffer_ptr = (*self.buffer.ptr).get().cast::<TaskChunk>();
-            *buffer_ptr.add(current_tail) = chunk;
+            core::ptr::write(buffer_ptr.add(current_tail), chunk);
         }
 
-        self.tail.store(next_tail, Ordering::Release);
+        self.tail.store(next_tail, Ordering::SeqCst);
 
         #[cfg(all(
             feature = "hw-acceleration",
@@ -263,7 +260,7 @@ impl Mailbox {
     /// Pops a `TaskChunk` from the mailbox.
     #[inline(always)]
     pub fn pop(&self) -> Option<TaskChunk> {
-        let current_head = self.head.load(Ordering::Relaxed);
+        let current_head = self.head.load(Ordering::Acquire);
 
         if current_head == self.tail.load(Ordering::Acquire) {
             return None; // Empty
@@ -275,7 +272,7 @@ impl Mailbox {
         };
 
         let next_head = (current_head + 1) & MAILBOX_MASK;
-        self.head.store(next_head, Ordering::Release);
+        self.head.store(next_head, Ordering::SeqCst);
         Some(chunk)
     }
 }
@@ -483,6 +480,14 @@ impl Worker {
             // fiber_entry_point, because calling free_context from the fiber's own
             // stack creates a use-after-free race: the context could be reallocated
             // by another thread while the fiber is still executing its final instructions.
+           if let Some(runtime) = unsafe { GLOBAL_RUNTIME.as_ref() } {
+        runtime
+            .scheduler
+            .enqueue_task(origin_core, u64::from(fiber_index), fiber_index);
+    } else {
+        panic!("dtact::wake_fiber() invoked before Runtime Initialization");
+    }
+        };
             let state = unsafe {
                 (*target_ptr)
                     .state
@@ -518,8 +523,6 @@ pub struct DtaScheduler {
     pub external_locks: Vec<crate::utils::SpinLock>,
     /// Active topology mode.
     pub topology: TopologyMode,
-    /// Branchless jump table for task enqueuing.
-    pub enqueue_jmp: [fn(&Self, usize, usize, TaskIndex); 2],
 }
 
 unsafe impl Sync for DtaScheduler {}
@@ -556,12 +559,11 @@ impl DtaScheduler {
         }
 
         Self {
-            workers,
-            mailboxes,
-            external_mailboxes,
-            external_locks,
+            workers: workers.into_boxed_slice().into_vec(),
+            mailboxes: mailboxes.into_boxed_slice().into_vec(),
+            external_mailboxes: external_mailboxes.into_boxed_slice().into_vec(),
+            external_locks: external_locks.into_boxed_slice().into_vec(),
             topology,
-            enqueue_jmp: [Self::do_push_local, Self::do_push_remote],
         }
     }
 
@@ -659,8 +661,11 @@ impl DtaScheduler {
             (ccx_base | target_idx) % num_workers
         };
 
-        let jump_idx = usize::from(target_core != source_core);
-        (self.enqueue_jmp[jump_idx])(self, source_core, target_core, task);
+        if target_core == source_core {
+            self.enqueue_local(source_core, target_core, task);
+        } else {
+            self.enqueue_remote(source_core, target_core, task);
+        }
     }
 
     /// Polls all incoming mailboxes for the current core.

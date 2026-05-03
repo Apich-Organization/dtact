@@ -460,7 +460,7 @@ impl ContextPool {
             }
 
             let ctx = self.get_context_ptr(index);
-            let next = unsafe { (*ctx).next_free.load(Ordering::Relaxed) };
+            let next = unsafe { (*ctx).next_free.load(Ordering::Acquire) };
 
             let new_head = (u64::from(r#gen.wrapping_add(1)) << 32) | u64::from(next);
 
@@ -495,7 +495,7 @@ impl ContextPool {
         loop {
             let current_idx = head as u32;
             let r#gen = (head >> 32) as u32;
-            unsafe { (*ctx).next_free.store(current_idx, Ordering::Relaxed) };
+            unsafe { (*ctx).next_free.store(current_idx, Ordering::Release) };
             let new_head = (u64::from(r#gen.wrapping_add(1)) << 32) | u64::from(index);
             match self.free_head.compare_exchange_weak(
                 head,

@@ -12,10 +12,12 @@ typedef struct {
     uint32_t workers;
     uint8_t safety_level;
     uint8_t topology_mode;
+    uint32_t contexts;
+    uint64_t stack_size;
 } dtact_config_t;
 
 // Dtact FFI Prototypes
-extern dtact_config_t dtact_default_config();
+extern void dtact_default_config(dtact_config_t* cfg);
 extern void* dtact_init(const dtact_config_t* cfg);
 extern dtact_handle_t dtact_fiber_launch(void (*func)(void*), void* arg);
 extern void dtact_await(dtact_handle_t handle);
@@ -65,7 +67,8 @@ int main() {
     printf("--- Dtact C-FFI Example ---\n");
     
     // 1. Initialize Runtime
-    dtact_config_t cfg = dtact_default_config();
+    dtact_config_t cfg;
+    dtact_default_config(&cfg);
     cfg.workers = 4;
     void* rt = dtact_init(&cfg);
     

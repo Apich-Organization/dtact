@@ -138,14 +138,11 @@ pub use api::*;
 /// unit to ensure architectural consistency across all worker threads.
 #[doc(hidden)]
 pub struct Runtime {
-    /// The distributed P2P work-deflection scheduler.
     pub scheduler: dta_scheduler::DtaScheduler,
-    /// The lock-free arena for managing fiber stacks and contexts.
     pub pool: memory_management::ContextPool,
-    /// Flag indicating if the worker threads have been started.
     pub started: core::sync::atomic::AtomicBool,
-    /// Cooperative shutdown signal for worker threads.
     pub shutdown: core::sync::atomic::AtomicBool,
+    pub handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl Runtime {
@@ -184,10 +181,9 @@ impl Runtime {
 
 /// Global Singleton for the Runtime Environment.
 ///
-/// This is initialized exactly once per process via `dtact_init` or
-/// implicit autostart triggers in the proc-macro layer.
+/// This is initialized exactly once per process via `dtact_init`.
 #[doc(hidden)]
-pub static GLOBAL_RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
+pub static mut GLOBAL_RUNTIME: *mut Runtime = core::ptr::null_mut();
 
 /// Telemetry: Tracks fibers that failed the 8KB zero-copy check and fell back to heap allocation.
 ///
@@ -208,7 +204,7 @@ pub static HEAP_ESCAPED_SPAWNS: core::sync::atomic::AtomicU64 =
 /// * `fiber_index` - The unique identifier of the fiber in the context pool.
 #[inline(always)]
 pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
-    if let Some(runtime) = GLOBAL_RUNTIME.get() {
+    if let Some(runtime) = unsafe { GLOBAL_RUNTIME.as_ref() } {
         // Submit the fiber back to the mesh.
         runtime
             .scheduler
