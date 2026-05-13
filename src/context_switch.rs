@@ -46,7 +46,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rdi]",
+        "prefetcht0 [rdi]",
         "prefetcht0 [rsi]",
         "prefetcht0 [rsi + 64]",
         "prefetcht0 [rsi + 128]",
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rcx]",
+        "prefetcht0 [rcx]",
         "prefetcht0 [rdx]",
         "prefetcht0 [rdx + 64]",
         "prefetcht0 [rdx + 128]",
@@ -538,7 +538,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rdi]",
+        "prefetcht0 [rdi]",
         "prefetcht0 [rsi]",
         "mov rax, [rsi]",
         "prefetcht0 [rax]",
@@ -579,7 +579,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rcx]",
+        "prefetcht0 [rcx]",
         "prefetcht0 [rdx]",
         "mov rax, [rdx]",
         "prefetcht0 [rax]",
@@ -925,7 +925,7 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rdi]",
+        "prefetcht0 [rdi]",
         "prefetcht0 [rsi]",
         "prefetcht0 [rsi + 64]",
         "prefetcht0 [rsi + 128]",
@@ -968,7 +968,7 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rcx]",
+        "prefetcht0 [rcx]",
         "prefetcht0 [rdx]",
         "prefetcht0 [rdx + 64]",
         "prefetcht0 [rdx + 128]",
@@ -1374,7 +1374,7 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rdi]",
+        "prefetcht0 [rdi]",
         "prefetcht0 [rsi]",
         "prefetcht0 [rsi + 64]",
         "mov rax, [rsi]",
@@ -1413,7 +1413,7 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     restore: *const Registers,
 ) {
     naked_asm!(
-        "prefetchw [rcx]",
+        "prefetcht0 [rcx]",
         "prefetcht0 [rdx]",
         "prefetcht0 [rdx + 64]",
         "mov rax, [rdx]",
