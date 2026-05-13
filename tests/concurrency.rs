@@ -41,6 +41,17 @@ fn test_guard_page_isolation() {
     // If we write far below the context pointer (into the guard page), it should fault.
     // We can't easily catch a segfault in a test, but we can verify the memory layout.
     let (_base, slot_sz, guard_sz, _context_offset) = pool.get_dispatch_layout();
-    assert_eq!(guard_sz, 4096);
-    assert!(slot_sz > 4096 + 8192);
+
+    #[cfg(unix)]
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+    #[cfg(windows)]
+    let page_size = unsafe {
+        let mut info = std::mem::zeroed();
+        windows_sys::Win32::System::SystemInformation::GetSystemInfo(&raw mut info);
+        info.dwPageSize as usize
+    };
+
+    assert_eq!(guard_sz, page_size);
+    let requested_stack_sz = 4096;
+    assert!(slot_sz > requested_stack_sz + 8192);
 }

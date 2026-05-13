@@ -36,6 +36,14 @@ proptest = "1.6"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio = { version = "1.52", features = ["full"] }
 serial_test = "3.0"
+libc = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Diagnostics",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+] }
 
 [build-dependencies]
 cbindgen = "0.29"
