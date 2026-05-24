@@ -2,11 +2,14 @@ name: Continuous Fuzzing
 
 on:
   push:
-    branches: [ main, master, staging, try ]
+    branches: [main, master, staging, try]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
   schedule:
-    - cron: '0 0 * * *' # Daily sanity check
+    - cron: "0 0 * * *" # Daily sanity check
+
+permissions:
+  contents: read
 
 jobs:
   fuzz:
