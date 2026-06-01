@@ -36,7 +36,7 @@ loom = "0.7"
 proptest = "1.6"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio = { version = "1.52", features = ["full"] }
-serial_test = "3.0"
+serial_test = "3.5"
 
 [build-dependencies]
 cbindgen = "0.29"
