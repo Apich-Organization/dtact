@@ -31,6 +31,8 @@ jobs:
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          components: rust-src
 
       - name: Cache cargo bin
         id: cache-cargo-bin
