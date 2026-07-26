@@ -162,11 +162,13 @@ pub unsafe extern "C" fn dtact_fiber_launch(
     func: extern "C" fn(*mut c_void),
     arg: *mut c_void,
 ) -> dtact_handle_t {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
+    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
+        return dtact_handle_t(0);
+    };
     let pool = &runtime.pool;
-    let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
+    let Some(ctx_id) = pool.alloc_context() else {
+        return dtact_handle_t(0);
+    };
 
     let ctx_ptr = pool.get_context_ptr(ctx_id);
     #[allow(clippy::cast_possible_truncation)]
@@ -271,11 +273,13 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
     arg: *mut c_void,
     options: *const dtact_spawn_options_t,
 ) -> dtact_handle_t {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
+    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
+        return dtact_handle_t(0);
+    };
     let pool = &runtime.pool;
-    let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
+    let Some(ctx_id) = pool.alloc_context() else {
+        return dtact_handle_t(0);
+    };
 
     let ctx_ptr = pool.get_context_ptr(ctx_id);
     let current_core = crate::api::topology::current().core_id as usize;
@@ -303,7 +307,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
 
         let allow_deflection = opts.switcher == 0 || opts.switcher == 1;
         (*ctx_ptr).mode = if allow_deflection {
-            let topology = crate::GLOBAL_RUNTIME.get().unwrap().scheduler.topology;
+            let topology = runtime.scheduler.topology;
             match topology {
                 crate::dta_scheduler::TopologyMode::Global => {
                     crate::common_types::TopologyMode::Global
@@ -419,11 +423,13 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
     arg: *mut c_void,
     cleanup: unsafe extern "C" fn(*mut c_void),
 ) -> dtact_handle_t {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
+    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
+        return dtact_handle_t(0);
+    };
     let pool = &runtime.pool;
-    let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
+    let Some(ctx_id) = pool.alloc_context() else {
+        return dtact_handle_t(0);
+    };
 
     let ctx_ptr = pool.get_context_ptr(ctx_id);
     #[allow(clippy::cast_possible_truncation)]
@@ -529,11 +535,13 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
     cleanup: unsafe extern "C" fn(*mut c_void),
     options: *const dtact_spawn_options_t,
 ) -> dtact_handle_t {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
+    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
+        return dtact_handle_t(0);
+    };
     let pool = &runtime.pool;
-    let ctx_id = pool.alloc_context().expect("Context pool exhausted - OOM");
+    let Some(ctx_id) = pool.alloc_context() else {
+        return dtact_handle_t(0);
+    };
 
     let ctx_ptr = pool.get_context_ptr(ctx_id);
     let current_core = crate::api::topology::current().core_id as usize;
@@ -561,7 +569,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
 
         let allow_deflection = opts.switcher == 0 || opts.switcher == 1;
         (*ctx_ptr).mode = if allow_deflection {
-            let topology = crate::GLOBAL_RUNTIME.get().unwrap().scheduler.topology;
+            let topology = runtime.scheduler.topology;
             match topology {
                 crate::dta_scheduler::TopologyMode::Global => {
                     crate::common_types::TopologyMode::Global
@@ -683,9 +691,9 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
     let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
     let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
     let handle_gen = ((handle_val >> 48) & 0x7FFF) as u16; // Mask out sentinel bit
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Runtime not initialized");
+    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
+        return;
+    };
     let pool = &runtime.pool;
     let target_ctx = pool.get_context_ptr(target_ctx_id);
 
@@ -835,9 +843,9 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
 /// * Panics if the runtime is not initialized.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_run(_rt: *mut c_void) {
-    let runtime = crate::GLOBAL_RUNTIME
-        .get()
-        .expect("Dtact Runtime not initialized");
+    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
+        return;
+    };
     let scheduler = &runtime.scheduler;
     let workers_count = scheduler.workers.len();
     let mut handles = alloc::vec::Vec::with_capacity(workers_count);
