@@ -444,7 +444,6 @@ pub struct WorkerState {
     #[cfg(not(target_os = "linux"))]
     waker: std::sync::Arc<mio::Waker>,
 
-    #[allow(dead_code)]
     direct_fd_free: TreiberStack,
 }
 
@@ -763,7 +762,7 @@ pub fn shutdown_runtime() {
                 )
             };
             #[cfg(not(target_os = "linux"))]
-            let _ = state.waker.wake();
+            state.waker.wake();
         }
     }
 }
@@ -1458,10 +1457,10 @@ fn run_mio_worker_loop(worker_idx: usize, state: &WorkerState) {
             break;
         }
 
-        let mut _processed_any = false;
+        let mut processed_any = false;
         for q in state.queues.iter() {
             while let Some(req) = q.pop() {
-                _processed_any = true;
+                processed_any = true;
                 process_mio_request(state, &mut fd_states, req);
             }
         }
@@ -1472,7 +1471,7 @@ fn run_mio_worker_loop(worker_idx: usize, state: &WorkerState) {
         // be processed after that request installs its waker — never
         // before, which would free/reuse the slot out from under it.
         while let Some(slot_idx) = state.cancel_queue.pop() {
-            _processed_any = true;
+            processed_any = true;
             cancel_mio_slot(state, &mut fd_states, slot_idx as usize);
         }
 
@@ -2051,16 +2050,14 @@ impl Future for DtactIoFuture {
                             slot.completed.store(false, Ordering::Relaxed);
                             slot.dropped.store(false, Ordering::Relaxed);
                             slot.origin_fd.store(self.fd, Ordering::Relaxed);
-                            #[allow(clippy::redundant_closure)]
-                            let raw = unsafe {
-                                std::mem::transmute::<
-                                    _,
-                                    &(*const (), *const std::task::RawWakerVTable),
-                                >(cx.waker())
-                            };
+                            let raw = cx.waker().as_raw();
                             slot.lock_waker();
-                            slot.waker_data.store(raw.0 as *mut (), Ordering::Relaxed);
-                            slot.waker_vtable.store(raw.1 as *mut _, Ordering::Relaxed);
+                            slot.waker_data
+                                .store(raw.data() as *mut (), Ordering::Relaxed);
+                            slot.waker_vtable.store(
+                                raw.vtable() as *const RawWakerVTable as *mut _,
+                                Ordering::Relaxed,
+                            );
                             slot.unlock_waker();
 
                             let req = self.create_io_request(idx);
@@ -2082,7 +2079,7 @@ impl Future for DtactIoFuture {
 
                             fence(Ordering::SeqCst);
                             if state.is_sleeping.load(Ordering::SeqCst) {
-                                let _ = state.waker.wake();
+                                state.waker.wake();
                             }
                             self.slot_idx = Some(idx);
                             idx
@@ -2091,14 +2088,9 @@ impl Future for DtactIoFuture {
 
                     let state = &WORKERS.get().unwrap()[self.worker_idx];
                     let slot = &state.slots[slot_idx];
-                    #[allow(clippy::redundant_closure)]
-                    let raw = unsafe {
-                        std::mem::transmute::<_, &(*const (), *const std::task::RawWakerVTable)>(
-                            cx.waker(),
-                        )
-                    };
-                    let new_data = raw.0 as *mut ();
-                    let new_vtable = raw.1 as *mut _;
+                    let raw = cx.waker().as_raw();
+                    let new_data = raw.data() as *mut ();
+                    let new_vtable = raw.vtable() as *const RawWakerVTable as *mut _;
 
                     slot.lock_waker();
                     let old_data = slot.waker_data.load(Ordering::Relaxed);
@@ -2117,7 +2109,7 @@ impl Future for DtactIoFuture {
                         let _ = state.queues[q_idx].push(req);
                         fence(Ordering::SeqCst);
                         if state.is_sleeping.load(Ordering::SeqCst) {
-                            let _ = state.waker.wake();
+                            state.waker.wake();
                         }
                     }
                     Poll::Pending
@@ -2181,7 +2173,7 @@ impl Drop for DtactIoFuture {
         #[cfg(not(target_os = "linux"))]
         {
             if state.is_sleeping.load(Ordering::SeqCst) {
-                let _ = state.waker.wake();
+                state.waker.wake();
             }
         }
     }
@@ -2382,32 +2374,11 @@ impl DtactTcpStream {
             std::net::SocketAddr::V6(_) => libc::AF_INET6,
         };
         let fd = unsafe {
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "watchos"
-            ))]
-            let res = {
-                let s = libc::socket(domain, libc::SOCK_STREAM, 0);
-                if s >= 0 {
-                    libc::fcntl(s, libc::F_SETFL, libc::O_NONBLOCK);
-                    libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
-                }
-                s
-            };
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "watchos"
-            )))]
-            let res = libc::socket(
+            libc::socket(
                 domain,
                 libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
                 0,
-            );
-            res
+            )
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
@@ -3164,32 +3135,11 @@ impl DtactUnixStream {
         let (libc_addr, addr_len) = unix_path_to_libc(path.as_ref())?;
 
         let fd = unsafe {
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "watchos"
-            ))]
-            let res = {
-                let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                if s >= 0 {
-                    libc::fcntl(s, libc::F_SETFL, libc::O_NONBLOCK);
-                    libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
-                }
-                s
-            };
-            #[cfg(not(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "watchos"
-            )))]
-            let res = libc::socket(
+            libc::socket(
                 libc::AF_UNIX,
                 libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
                 0,
-            );
-            res
+            )
         };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
@@ -3408,12 +3358,6 @@ impl DtactUnixListener {
         &self,
     ) -> std::io::Result<(DtactUnixStream, std::os::unix::net::SocketAddr)> {
         // 1. Direct opportunistic check using accept4 natively to avoid later fcntl
-        #[cfg(not(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos"
-        )))]
         let res = unsafe {
             libc::accept4(
                 self.inner.as_raw_fd(),
@@ -3421,24 +3365,6 @@ impl DtactUnixListener {
                 std::ptr::null_mut(),
                 libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             )
-        };
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos"
-        ))]
-        let res = unsafe {
-            let s = libc::accept(
-                self.inner.as_raw_fd(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            if s >= 0 {
-                libc::fcntl(s, libc::F_SETFL, libc::O_NONBLOCK);
-                libc::fcntl(s, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            s
         };
         if res >= 0 {
             let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(res) };
@@ -4246,21 +4172,14 @@ const fn socket_addr_to_libc(
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     let len = match addr {
         std::net::SocketAddr::V4(a) => {
-            let mut sin: libc::sockaddr_in = unsafe { std::mem::zeroed() };
-            sin.sin_family = libc::AF_INET as libc::sa_family_t;
-            sin.sin_port = a.port().to_be();
-            sin.sin_addr = libc::in_addr {
-                s_addr: u32::from_ne_bytes(a.ip().octets()),
+            let sin = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: a.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(a.ip().octets()),
+                },
+                sin_zero: [0; 8],
             };
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "watchos"
-            ))]
-            {
-                sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
-            }
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (&raw const sin).cast::<u8>(),
@@ -4271,23 +4190,15 @@ const fn socket_addr_to_libc(
             std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
         }
         std::net::SocketAddr::V6(a) => {
-            let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-            sin6.sin6_port = a.port().to_be();
-            sin6.sin6_flowinfo = a.flowinfo();
-            sin6.sin6_addr = libc::in6_addr {
-                s6_addr: a.ip().octets(),
+            let sin6 = libc::sockaddr_in6 {
+                sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                sin6_port: a.port().to_be(),
+                sin6_flowinfo: a.flowinfo(),
+                sin6_addr: libc::in6_addr {
+                    s6_addr: a.ip().octets(),
+                },
+                sin6_scope_id: a.scope_id(),
             };
-            sin6.sin6_scope_id = a.scope_id();
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "tvos",
-                target_os = "watchos"
-            ))]
-            {
-                sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-            }
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (&raw const sin6).cast::<u8>(),

@@ -63,7 +63,6 @@ spin = []
 mio = { version = "1.2", features = [
     "os-poll",
     "net",
-    "os-ext",
 ], default-features = false, optional = true }
 dtact = { version = "0.2", path = "../", optional = true }
 dtact-macros = { version = "0.1", path = "../dtact-macros", optional = true }
