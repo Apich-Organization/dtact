@@ -2050,12 +2050,11 @@ impl Future for DtactIoFuture {
                             slot.completed.store(false, Ordering::Relaxed);
                             slot.dropped.store(false, Ordering::Relaxed);
                             slot.origin_fd.store(self.fd, Ordering::Relaxed);
-                            let raw = cx.waker().as_raw();
                             slot.lock_waker();
                             slot.waker_data
-                                .store(raw.data() as *mut (), Ordering::Relaxed);
+                                .store(cx.waker().data() as *mut (), Ordering::Relaxed);
                             slot.waker_vtable.store(
-                                raw.vtable() as *const RawWakerVTable as *mut _,
+                                cx.waker().vtable() as *const RawWakerVTable as *mut _,
                                 Ordering::Relaxed,
                             );
                             slot.unlock_waker();
@@ -2088,9 +2087,8 @@ impl Future for DtactIoFuture {
 
                     let state = &WORKERS.get().unwrap()[self.worker_idx];
                     let slot = &state.slots[slot_idx];
-                    let raw = cx.waker().as_raw();
-                    let new_data = raw.data() as *mut ();
-                    let new_vtable = raw.vtable() as *const RawWakerVTable as *mut _;
+                    let new_data = cx.waker().data() as *mut ();
+                    let new_vtable = cx.waker().vtable() as *const RawWakerVTable as *mut _;
 
                     slot.lock_waker();
                     let old_data = slot.waker_data.load(Ordering::Relaxed);
@@ -3358,6 +3356,7 @@ impl DtactUnixListener {
         &self,
     ) -> std::io::Result<(DtactUnixStream, std::os::unix::net::SocketAddr)> {
         // 1. Direct opportunistic check using accept4 natively to avoid later fcntl
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let res = unsafe {
             libc::accept4(
                 self.inner.as_raw_fd(),
@@ -3365,6 +3364,20 @@ impl DtactUnixListener {
                 std::ptr::null_mut(),
                 libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             )
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let res = unsafe {
+            let fd = libc::accept(
+                self.inner.as_raw_fd(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            if fd >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+                libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+            fd
         };
         if res >= 0 {
             let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(res) };
