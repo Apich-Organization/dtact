@@ -140,5 +140,5 @@ jobs:
             fi
           fi
 
-          cargo test --target ${{ matrix.zig_target }} --no-default-features --no-run
+          cargo build --target ${{ matrix.zig_target }} --no-default-features --tests
           cargo test --target ${{ matrix.platform }} --no-default-features
