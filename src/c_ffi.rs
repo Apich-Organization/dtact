@@ -303,7 +303,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
 
         let allow_deflection = opts.switcher == 0 || opts.switcher == 1;
         (*ctx_ptr).mode = if allow_deflection {
-            let topology = crate::GLOBAL_RUNTIME.get().unwrap().scheduler.topology;
+            let topology = runtime.scheduler.topology;
             match topology {
                 crate::dta_scheduler::TopologyMode::Global => {
                     crate::common_types::TopologyMode::Global
@@ -561,7 +561,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
 
         let allow_deflection = opts.switcher == 0 || opts.switcher == 1;
         (*ctx_ptr).mode = if allow_deflection {
-            let topology = crate::GLOBAL_RUNTIME.get().unwrap().scheduler.topology;
+            let topology = runtime.scheduler.topology;
             match topology {
                 crate::dta_scheduler::TopologyMode::Global => {
                     crate::common_types::TopologyMode::Global
