@@ -123,7 +123,7 @@ fn test_production_context_pool_alloc_free() {
 #[test]
 fn test_production_mailbox_spsc() {
     loom::model(|| {
-        let mailbox = Arc::new(Mailbox::new());
+        let mailbox = Arc::new(Mailbox::new().unwrap());
 
         let m1 = mailbox.clone();
         let producer = thread::spawn(move || {
@@ -153,7 +153,7 @@ fn test_production_mailbox_spsc() {
 #[test]
 fn test_production_warehouse_mpmc() {
     bounded_model(|| {
-        let warehouse = Arc::new(Warehouse::new());
+        let warehouse = Arc::new(Warehouse::new().unwrap());
 
         let w1 = warehouse.clone();
         let producer = thread::spawn(move || {
@@ -182,7 +182,7 @@ fn test_production_warehouse_mpmc() {
 #[test]
 fn test_production_warehouse_two_producers() {
     bounded_model(|| {
-        let warehouse = Arc::new(Warehouse::new());
+        let warehouse = Arc::new(Warehouse::new().unwrap());
 
         let w1 = warehouse.clone();
         let p1 = thread::spawn(move || {

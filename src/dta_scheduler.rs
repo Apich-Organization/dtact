@@ -89,22 +89,12 @@ pub struct HugeBuffer<T> {
 unsafe impl<T> Send for HugeBuffer<T> {}
 unsafe impl<T> Sync for HugeBuffer<T> {}
 
-impl<T> Default for HugeBuffer<T> {
-    #[inline(always)]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T> HugeBuffer<T> {
     /// Allocates a new `HugeBuffer` using OS-specific huge page primitives.
-    ///
-    /// # Panics
-    /// Panics if the OS fails to allocate memory.
     #[inline(never)]
     #[must_use]
     #[allow(clippy::useless_let_if_seq)]
-    pub fn new() -> Self {
+    pub fn new() -> Option<Self> {
         let size_bytes = core::mem::size_of::<T>();
 
         #[cfg(unix)]
@@ -176,23 +166,25 @@ impl<T> HugeBuffer<T> {
                     libc::madvise(ptr, size_bytes, MADV_HUGEPAGE);
                 }
 
-                return Self {
+                return Some(Self {
                     ptr: ptr.cast::<T>(),
                     size_bytes,
                     is_mmap: true,
-                };
+                });
             }
 
             // Tier 3: aligned std::alloc fallback for environments where mmap
             // itself is exhausted (rare — QEMU/aarch64, sandboxed containers).
-            let layout = std::alloc::Layout::from_size_align(size_bytes, 64).unwrap();
+            let layout = std::alloc::Layout::from_size_align(size_bytes, 64).ok()?;
             let alloc_ptr = std::alloc::alloc_zeroed(layout);
-            assert!(!alloc_ptr.is_null(), "HugeBuffer std::alloc failed");
-            Self {
+            if alloc_ptr.is_null() {
+                return None;
+            }
+            Some(Self {
                 ptr: alloc_ptr.cast::<T>(),
                 size_bytes,
                 is_mmap: false,
-            }
+            })
         }
 
         #[cfg(windows)]
@@ -213,13 +205,15 @@ impl<T> HugeBuffer<T> {
                         Memory::MEM_RESERVE | Memory::MEM_COMMIT,
                         Memory::PAGE_READWRITE,
                     );
-                    assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
+                    if ptr.is_null() {
+                        return None;
+                    }
                 }
-                Self {
+                Some(Self {
                     ptr: ptr.cast::<T>(),
                     size_bytes,
                     is_mmap: false,
-                }
+                })
             }
             #[cfg(not(feature = "windows-root"))]
             {
@@ -229,12 +223,14 @@ impl<T> HugeBuffer<T> {
                     Memory::MEM_RESERVE | Memory::MEM_COMMIT,
                     Memory::PAGE_READWRITE,
                 );
-                assert!(!ptr.is_null(), "HugeBuffer VirtualAlloc failed");
-                Self {
+                if ptr.is_null() {
+                    return None;
+                }
+                Some(Self {
                     ptr: ptr.cast::<T>(),
                     size_bytes,
                     is_mmap: false,
-                }
+                })
             }
         }
     }
@@ -248,7 +244,8 @@ impl<T> Drop for HugeBuffer<T> {
             if self.is_mmap {
                 libc::munmap(self.ptr.cast::<libc::c_void>(), self.size_bytes);
             } else {
-                let layout = std::alloc::Layout::from_size_align(self.size_bytes, 64).unwrap();
+                let layout = std::alloc::Layout::from_size_align(self.size_bytes, 64)
+                    .unwrap_or_else(|_| std::process::abort());
                 std::alloc::dealloc(self.ptr.cast::<u8>(), layout);
             }
         }
@@ -280,25 +277,18 @@ pub struct Mailbox {
 unsafe impl Sync for Mailbox {}
 unsafe impl Send for Mailbox {}
 
-impl Default for Mailbox {
-    #[inline(always)]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Mailbox {
     /// Creates a new, empty Mailbox.
     #[inline(never)]
     #[must_use]
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Option<Self> {
+        Some(Self {
             head: AtomicUsize::new(0),
             _pad1: [0; 56],
             tail: AtomicUsize::new(0),
             _pad2: [0; 56],
-            buffer: HugeBuffer::new(),
-        }
+            buffer: HugeBuffer::new()?,
+        })
     }
 
     /// Pushes a `TaskChunk` into the mailbox.
@@ -417,18 +407,11 @@ pub struct Warehouse {
 unsafe impl Sync for Warehouse {}
 unsafe impl Send for Warehouse {}
 
-impl Default for Warehouse {
-    #[inline(always)]
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Warehouse {
     /// Creates an empty warehouse with all slots seq-initialised to their index.
     #[must_use]
     #[inline(never)]
-    pub fn new() -> Self {
+    pub fn new() -> Option<Self> {
         let wh = Self {
             backlog: AtomicU32::new(0),
             _pad0: [0; 60],
@@ -436,7 +419,7 @@ impl Warehouse {
             _pad1: [0; 56],
             head: AtomicUsize::new(0),
             _pad2: [0; 56],
-            slots: HugeBuffer::new(),
+            slots: HugeBuffer::new()?,
         };
         // Initialise sequence numbers: slot i starts at seq=i so the first
         // producer at position i sees diff = 0 and can claim it.
@@ -446,7 +429,7 @@ impl Warehouse {
                 (*base.add(i)).seq.store(i, Ordering::Release);
             }
         }
-        wh
+        Some(wh)
     }
 
     /// Pushes a chunk into the warehouse. Returns `Err(chunk)` if full.
@@ -752,7 +735,7 @@ impl Worker {
     #[inline(never)]
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn new(cpu: CpuLevel, total_cores: usize) -> Self {
+    pub fn new(cpu: CpuLevel, total_cores: usize) -> Option<Self> {
         let mut polling_order = Vec::with_capacity(total_cores - 1);
         let my_core = cpu.core_id as usize;
         let my_ccx = cpu.ccx_id;
@@ -769,7 +752,7 @@ impl Worker {
             }
         }
 
-        Self {
+        Some(Self {
             cpu,
             load_level: AtomicU8::new(0),
             deflection_threshold: AtomicU8::new(80),
@@ -779,9 +762,9 @@ impl Worker {
             _pad0: [0; 32],
             event_signal: AtomicU32::new(0),
             _pad1: [0; 60],
-            local_queue: HugeBuffer::new(),
+            local_queue: HugeBuffer::new()?,
             polling_order,
-        }
+        })
     }
 
     /// Returns the current number of tasks in the local queue.
@@ -1031,14 +1014,14 @@ impl DtaScheduler {
                     numa_id: (i / 64) as u16,
                 },
                 num_workers,
-            )));
+            ).expect("Failed to initialize scheduler structures (Worker)")));
 
             let mut row = Vec::with_capacity(num_workers);
             for _ in 0..num_workers {
-                row.push(Mailbox::new());
+                row.push(Mailbox::new().expect("Failed to initialize scheduler structures (Mailbox row)"));
             }
             mailboxes.push(row);
-            external_mailboxes.push(Mailbox::new());
+            external_mailboxes.push(Mailbox::new().expect("Failed to initialize scheduler structures (External Mailbox)"));
             external_locks.push(crate::utils::SpinLock::new());
         }
 
@@ -1053,7 +1036,7 @@ impl DtaScheduler {
             external_locks,
             topology,
             max_hops,
-            warehouse: Warehouse::new(),
+            warehouse: Warehouse::new().expect("Failed to initialize scheduler structures (Warehouse)"),
         }
     }
 

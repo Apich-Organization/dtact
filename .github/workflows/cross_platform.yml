@@ -46,6 +46,7 @@ jobs:
         with:
           toolchain: 1.91.1
           targets: ${{ matrix.platform }}
+          components: rust-src
 
       - name: Setup Zig
         uses: step-security/setup-zig@1e9fbd457bcc3587b58845344a267f12f151709c # v2.2.2

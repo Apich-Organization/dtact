@@ -4237,7 +4237,16 @@ const fn socket_addr_to_libc(
                 s6_addr: a.ip().octets(),
             };
             sin6.sin6_scope_id = a.scope_id();
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "watchos",
+                target_os = "tvos",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
             {
                 sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
             }
