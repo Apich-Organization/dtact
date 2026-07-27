@@ -1457,10 +1457,10 @@ fn run_mio_worker_loop(worker_idx: usize, state: &WorkerState) {
             break;
         }
 
-        let mut processed_any = false;
+        let mut _processed_any = false;
         for q in state.queues.iter() {
             while let Some(req) = q.pop() {
-                processed_any = true;
+                _processed_any = true;
                 process_mio_request(state, &mut fd_states, req);
             }
         }
@@ -1471,7 +1471,7 @@ fn run_mio_worker_loop(worker_idx: usize, state: &WorkerState) {
         // be processed after that request installs its waker — never
         // before, which would free/reuse the slot out from under it.
         while let Some(slot_idx) = state.cancel_queue.pop() {
-            processed_any = true;
+            _processed_any = true;
             cancel_mio_slot(state, &mut fd_states, slot_idx as usize);
         }
 
@@ -4190,15 +4190,27 @@ const fn socket_addr_to_libc(
             std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
         }
         std::net::SocketAddr::V6(a) => {
-            let sin6 = libc::sockaddr_in6 {
-                sin6_family: libc::AF_INET6 as libc::sa_family_t,
-                sin6_port: a.port().to_be(),
-                sin6_flowinfo: a.flowinfo(),
-                sin6_addr: libc::in6_addr {
-                    s6_addr: a.ip().octets(),
-                },
-                sin6_scope_id: a.scope_id(),
+            let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = a.port().to_be();
+            sin6.sin6_flowinfo = a.flowinfo();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: a.ip().octets(),
             };
+            sin6.sin6_scope_id = a.scope_id();
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "watchos",
+                target_os = "tvos",
+                target_os = "freebsd",
+                target_os = "openbsd",
+                target_os = "netbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            }
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (&raw const sin6).cast::<u8>(),
