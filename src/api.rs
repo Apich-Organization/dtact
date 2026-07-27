@@ -307,9 +307,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
             // Determine where the stack region ends (just below the future).
             // The stack grows DOWNWARD from this address toward buffer_start.
-            let stack_limit: usize;
-
-            if aligned_fut_addr < buffer_start || (aligned_fut_addr + fut_size) > buffer_end {
+            let stack_limit: usize = if aligned_fut_addr < buffer_start || (aligned_fut_addr + fut_size) > buffer_end {
                 // Future exceeds pre-allocated 8KB buffer. Fallback to heap.
                 crate::HEAP_ESCAPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 
@@ -335,7 +333,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 (*ctx_ptr).cleanup_fn = None;
 
                 // Heap path: entire 8KB buffer is available as stack
-                stack_limit = buffer_end;
+                buffer_end
             } else {
                 let fut_ptr = aligned_fut_addr as *mut F;
                 core::ptr::write(fut_ptr, fut);
@@ -351,8 +349,8 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 (*ctx_ptr).closure_ptr = fut_ptr.cast::<()>();
 
                 // Inline path: stack lives below the future
-                stack_limit = aligned_fut_addr;
-            }
+                aligned_fut_addr
+            };
 
             // ABI-compliant stack alignment
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
