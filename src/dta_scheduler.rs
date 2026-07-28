@@ -1384,20 +1384,20 @@ impl DtaScheduler {
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
-        // idx bit-encoding: bit0 = space_ok, bit1 = hops_ok
-        //   00: no space, no hops left  → warehouse
-        //   01: space,    no hops left  → local (we already have room)
-        //   10: no space, hops left     → deflect to peer
-        //   11: space,    hops left     → local (preferred)
-        let idx = usize::from(space_ok) | (usize::from(hops_ok) << 1);
-        type RouteFn = fn(&DtaScheduler, &mut Worker, usize, TaskChunk);
-        const ROUTES: [RouteFn; 4] = [
-            DtaScheduler::route_park,    // 00
-            DtaScheduler::route_local,   // 01
-            DtaScheduler::route_deflect, // 10
-            DtaScheduler::route_local,   // 11
-        ];
-        ROUTES[idx](self, worker, current_core, chunk);
+        //   no space, no hops left  → warehouse
+        //   space,    no hops left  → local (we already have room)
+        //   no space, hops left     → deflect to peer
+        //   space,    hops left     → local (preferred)
+        // Using an if/else block allows the compiler to fully inline these target
+        // functions and generate direct branches, rather than an indirect jump
+        // through a function pointer array which introduces misprediction latency.
+        if space_ok {
+            self.route_local(worker, current_core, chunk);
+        } else if hops_ok {
+            self.route_deflect(worker, current_core, chunk);
+        } else {
+            self.route_park(worker, current_core, chunk);
+        }
     }
 
     #[inline(always)]
