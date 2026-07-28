@@ -245,22 +245,25 @@ pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
     let affinity = unsafe { (*ctx_ptr).affinity };
 
     loop {
-        // Two-entry function-pointer table — branchless after the bool is computed.
-        type EnqFn = fn(
-            &dta_scheduler::DtaScheduler,
-            usize,
-            u64,
-            u32,
-            crate::api::topology::Affinity,
-        ) -> bool;
-        const ENQUEUE_FNS: [EnqFn; 2] = [enqueue_deflect_shim, enqueue_pinned_shim];
-        let success = ENQUEUE_FNS[usize::from(pinned)](
-            &runtime.scheduler,
-            origin_core,
-            u64::from(fiber_index),
-            fiber_index,
-            affinity,
-        );
+        // Direct branches are far better for inlining and branch prediction than
+        // manual function pointer arrays which force a dynamic indirect jump.
+        let success = if pinned {
+            enqueue_pinned_shim(
+                &runtime.scheduler,
+                origin_core,
+                u64::from(fiber_index),
+                fiber_index,
+                affinity,
+            )
+        } else {
+            enqueue_deflect_shim(
+                &runtime.scheduler,
+                origin_core,
+                u64::from(fiber_index),
+                fiber_index,
+                affinity,
+            )
+        };
         if success {
             return;
         }
