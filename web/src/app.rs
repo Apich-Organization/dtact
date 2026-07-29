@@ -59,7 +59,16 @@ pub fn App() -> impl IntoView {
     });
     Effect::new(move |_| {
         let _ = page.get();
-        let _ = js_sys::eval("window.triggerKatex && window.triggerKatex()");
+        if let Some(window) = web_sys::window() {
+            if let Ok(func) =
+                js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("triggerKatex"))
+            {
+                if func.is_function() {
+                    let func: js_sys::Function = func.into();
+                    let _ = func.call0(&window);
+                }
+            }
+        }
     });
 
     view! {
