@@ -307,7 +307,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
 
             // Determine where the stack region ends (just below the future).
             // The stack grows DOWNWARD from this address toward buffer_start.
-            let stack_limit: usize = if aligned_fut_addr < buffer_start || (aligned_fut_addr + fut_size) > buffer_end {
+            let stack_limit: usize = if aligned_fut_addr < buffer_start
+                || (aligned_fut_addr + fut_size) > buffer_end
+            {
                 // Future exceeds pre-allocated 8KB buffer. Fallback to heap.
                 crate::HEAP_ESCAPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 

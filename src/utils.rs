@@ -161,6 +161,15 @@ pub fn get_thread_id() -> u64 {
             unsafe {
                 tid = u64::from(windows_sys::Win32::System::Threading::GetCurrentThreadId());
             }
+            #[cfg(target_os = "macos")]
+            unsafe {
+                tid = u64::from(libc::pthread_mach_thread_np(libc::pthread_self()));
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+            {
+                // Fallback for other platforms
+                tid = 1;
+            }
             c.set(tid);
         }
         tid

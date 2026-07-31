@@ -121,6 +121,7 @@ pub struct DtactFile {
 }
 
 impl DtactFile {
+    /// Open a file.
     pub async fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let file = spawn_blocking(move || std::fs::File::open(&path)).await?;
@@ -129,6 +130,7 @@ impl DtactFile {
         })
     }
 
+    /// Create a file.
     pub async fn create(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let file = spawn_blocking(move || std::fs::File::create(&path)).await?;
@@ -137,6 +139,7 @@ impl DtactFile {
         })
     }
 
+    /// Open a file with options.
     pub async fn open_with(
         path: impl Into<PathBuf>,
         opts: std::fs::OpenOptions,
@@ -164,6 +167,7 @@ impl DtactFile {
         .await
     }
 
+    /// Write to a file.
     pub async fn write(&self, buf: Vec<u8>) -> io::Result<(usize, Vec<u8>)> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || {
@@ -194,6 +198,7 @@ impl DtactFile {
         .await
     }
 
+    /// Write to a file at an offset.
     pub async fn write_at(&self, buf: Vec<u8>, offset: u64) -> io::Result<(usize, Vec<u8>)> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || {
@@ -207,6 +212,7 @@ impl DtactFile {
         .await
     }
 
+    /// Sync a file.
     pub async fn sync_all(&self) -> io::Result<()> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || {
@@ -219,6 +225,7 @@ impl DtactFile {
         .await
     }
 
+    /// Get file metadata.
     pub async fn metadata(&self) -> io::Result<std::fs::Metadata> {
         let inner = Arc::clone(&self.inner);
         spawn_blocking(move || {
@@ -269,6 +276,7 @@ fn write_at_impl(file: &std::fs::File, buf: &[u8], offset: u64) -> io::Result<us
     file.seek_write(buf, offset)
 }
 
+/// Get file metadata.
 pub async fn metadata(path: impl Into<PathBuf>) -> io::Result<std::fs::Metadata> {
     let path = path.into();
     spawn_blocking(move || std::fs::metadata(&path)).await
@@ -285,11 +293,13 @@ pub async fn read_dir(path: impl Into<PathBuf>) -> io::Result<Vec<std::fs::DirEn
     .await
 }
 
+/// Create a directory and all parent directories.
 pub async fn create_dir_all(path: impl Into<PathBuf>) -> io::Result<()> {
     let path = path.into();
     spawn_blocking(move || std::fs::create_dir_all(&path)).await
 }
 
+/// Remove a file.
 pub async fn remove_file(path: impl Into<PathBuf>) -> io::Result<()> {
     let path = path.into();
     spawn_blocking(move || std::fs::remove_file(&path)).await
