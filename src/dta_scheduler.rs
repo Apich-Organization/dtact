@@ -244,8 +244,7 @@ impl<T> Drop for HugeBuffer<T> {
             if self.is_mmap {
                 libc::munmap(self.ptr.cast::<libc::c_void>(), self.size_bytes);
             } else {
-                let layout = std::alloc::Layout::from_size_align(self.size_bytes, 64)
-                    .unwrap_or_else(|_| std::process::abort());
+                let layout = std::alloc::Layout::from_size_align_unchecked(self.size_bytes, 64);
                 std::alloc::dealloc(self.ptr.cast::<u8>(), layout);
             }
         }
