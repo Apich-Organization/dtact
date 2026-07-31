@@ -16,7 +16,7 @@ categories = ["asynchronous", "concurrency"]
 keywords = ["async", "futures", "non-blocking", "runtime", "concurrency"]
 license = "MIT or Apache-2.0"
 description = "Dtact: A non-preemptive, stackful coroutine runtime featuring a lock-free context arena, P2P mesh scheduling, and architecture-specific assembly switchers. Designed for hardware-level control and non-blocking heterogeneous orchestration."
-rust-version = "1.90.0"
+rust-version = "1.93.1"
 
 [dependencies]
 dtact-macros = { path = "./dtact-macros", version = "0.1" }
@@ -39,7 +39,7 @@ loom = "0.7"
 proptest = "1.6"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tokio = { version = "1.52", features = ["full"] }
-serial_test = "3.0"
+serial_test = "4.0"
 dtact-util = { path = "./dtact-util", version = "0.2" }
 
 [build-dependencies]

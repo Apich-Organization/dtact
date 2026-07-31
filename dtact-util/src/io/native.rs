@@ -2051,14 +2051,14 @@ impl Future for DtactIoFuture {
                             slot.completed.store(false, Ordering::Relaxed);
                             slot.dropped.store(false, Ordering::Relaxed);
                             slot.origin_fd.store(self.fd, Ordering::Relaxed);
-                            let raw = unsafe { std::mem::transmute::<_, &(*mut (), *const RawWakerVTable)>(cx.waker()) };
+                            let raw = unsafe {
+                                std::mem::transmute::<_, &(*mut (), *const RawWakerVTable)>(
+                                    cx.waker(),
+                                )
+                            };
                             slot.lock_waker();
-                            slot.waker_data
-                                .store(raw.0, Ordering::Relaxed);
-                            slot.waker_vtable.store(
-                                raw.1 as *mut _,
-                                Ordering::Relaxed,
-                            );
+                            slot.waker_data.store(raw.0, Ordering::Relaxed);
+                            slot.waker_vtable.store(raw.1 as *mut _, Ordering::Relaxed);
                             slot.unlock_waker();
 
                             let req = self.create_io_request(idx);
@@ -2089,7 +2089,9 @@ impl Future for DtactIoFuture {
 
                     let state = &WORKERS.get().unwrap()[self.worker_idx];
                     let slot = &state.slots[slot_idx];
-                    let raw = unsafe { std::mem::transmute::<_, &(*mut (), *const RawWakerVTable)>(cx.waker()) };
+                    let raw = unsafe {
+                        std::mem::transmute::<_, &(*mut (), *const RawWakerVTable)>(cx.waker())
+                    };
                     let new_data = raw.0;
                     let new_vtable = raw.1 as *mut _;
 
@@ -2375,7 +2377,12 @@ impl DtactTcpStream {
             std::net::SocketAddr::V6(_) => libc::AF_INET6,
         };
         let fd = unsafe {
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos"
+            ))]
             let res = {
                 let s = libc::socket(domain, libc::SOCK_STREAM, 0);
                 if s >= 0 {
@@ -2384,7 +2391,12 @@ impl DtactTcpStream {
                 }
                 s
             };
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos")))]
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos"
+            )))]
             let res = libc::socket(
                 domain,
                 libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
@@ -3147,7 +3159,12 @@ impl DtactUnixStream {
         let (libc_addr, addr_len) = unix_path_to_libc(path.as_ref())?;
 
         let fd = unsafe {
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos"
+            ))]
             let res = {
                 let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
                 if s >= 0 {
@@ -3156,7 +3173,12 @@ impl DtactUnixStream {
                 }
                 s
             };
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos")))]
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos"
+            )))]
             let res = libc::socket(
                 libc::AF_UNIX,
                 libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
@@ -3381,7 +3403,12 @@ impl DtactUnixListener {
         &self,
     ) -> std::io::Result<(DtactUnixStream, std::os::unix::net::SocketAddr)> {
         // 1. Direct opportunistic check using accept4 natively to avoid later fcntl
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        )))]
         let res = unsafe {
             libc::accept4(
                 self.inner.as_raw_fd(),
@@ -3390,7 +3417,12 @@ impl DtactUnixListener {
                 libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
             )
         };
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        ))]
         let res = unsafe {
             let s = libc::accept(
                 self.inner.as_raw_fd(),
@@ -4215,7 +4247,12 @@ const fn socket_addr_to_libc(
             sin.sin_addr = libc::in_addr {
                 s_addr: u32::from_ne_bytes(a.ip().octets()),
             };
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "tvos", target_os = "watchos"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "tvos",
+                target_os = "watchos"
+            ))]
             {
                 sin.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
             }

@@ -1006,21 +1006,30 @@ impl DtaScheduler {
         let mut external_locks = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
-            workers.push(UnsafeCell::new(Worker::new(
-                CpuLevel {
-                    core_id: i as u16,
-                    ccx_id: (i / 8) as u16,
-                    numa_id: (i / 64) as u16,
-                },
-                num_workers,
-            ).expect("Failed to initialize scheduler structures (Worker)")));
+            workers.push(UnsafeCell::new(
+                Worker::new(
+                    CpuLevel {
+                        core_id: i as u16,
+                        ccx_id: (i / 8) as u16,
+                        numa_id: (i / 64) as u16,
+                    },
+                    num_workers,
+                )
+                .expect("Failed to initialize scheduler structures (Worker)"),
+            ));
 
             let mut row = Vec::with_capacity(num_workers);
             for _ in 0..num_workers {
-                row.push(Mailbox::new().expect("Failed to initialize scheduler structures (Mailbox row)"));
+                row.push(
+                    Mailbox::new()
+                        .expect("Failed to initialize scheduler structures (Mailbox row)"),
+                );
             }
             mailboxes.push(row);
-            external_mailboxes.push(Mailbox::new().expect("Failed to initialize scheduler structures (External Mailbox)"));
+            external_mailboxes.push(
+                Mailbox::new()
+                    .expect("Failed to initialize scheduler structures (External Mailbox)"),
+            );
             external_locks.push(crate::utils::SpinLock::new());
         }
 
@@ -1035,7 +1044,8 @@ impl DtaScheduler {
             external_locks,
             topology,
             max_hops,
-            warehouse: Warehouse::new().expect("Failed to initialize scheduler structures (Warehouse)"),
+            warehouse: Warehouse::new()
+                .expect("Failed to initialize scheduler structures (Warehouse)"),
         }
     }
 
