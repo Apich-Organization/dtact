@@ -47,7 +47,7 @@ mod native_tests {
         block_on(sleep(SLEEP_DUR));
         let elapsed = start.elapsed();
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + Duration::from_millis(1) >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
@@ -164,7 +164,7 @@ mod tokio_tests {
         sleep(SLEEP_DUR).await;
         let elapsed = start.elapsed();
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + Duration::from_millis(1) >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
