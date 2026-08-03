@@ -1,0 +1,3 @@
+## 2026-08-03 - [Redundant Atomic Loads in Local Queue Operations]
+**Learning:** Calling abstractions like `local_queue_len()` in hot paths can introduce redundant atomic loads (e.g. reloading `local_tail` when it was already loaded just prior, or repeatedly loading an immutable `local_head` inside a polling loop).
+**Action:** When operating on the local queue thread, cache immutable atomics (like `local_head` when only consuming, or when pushing but not popping) outside loops, and manually calculate queue length inline using already loaded values to avoid redundant reads. Pass pre-calculated lengths into nested dispatch functions (like `route_chunk`).
