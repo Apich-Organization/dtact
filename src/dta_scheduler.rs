@@ -1307,7 +1307,11 @@ impl DtaScheduler {
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
 
         while drained < cap {
-            let cur_len = worker.local_tail.load(Ordering::Relaxed).wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
+            let cur_len = worker
+                .local_tail
+                .load(Ordering::Relaxed)
+                .wrapping_sub(fixed_head)
+                & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
                 break;
             }
@@ -1395,7 +1399,13 @@ impl DtaScheduler {
     /// call after the index is computed.
     #[inline(always)]
     #[allow(clippy::items_after_statements)]
-    fn route_chunk(&self, worker: &mut Worker, current_core: usize, chunk: TaskChunk, local_len: usize) {
+    fn route_chunk(
+        &self,
+        worker: &mut Worker,
+        current_core: usize,
+        chunk: TaskChunk,
+        local_len: usize,
+    ) {
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
