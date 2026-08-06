@@ -1304,7 +1304,11 @@ impl DtaScheduler {
         let mut drained = 0usize;
         while drained < cap {
             // Only reload local_tail; fixed_head is constant here.
-            let cur_len = worker.local_tail.load(Ordering::Relaxed).wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
+            let cur_len = worker
+                .local_tail
+                .load(Ordering::Relaxed)
+                .wrapping_sub(fixed_head)
+                & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
                 break;
             }
@@ -1399,7 +1403,11 @@ impl DtaScheduler {
         chunk: TaskChunk,
         fixed_head: usize,
     ) {
-        let local_len = worker.local_tail.load(Ordering::Relaxed).wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
+        let local_len = worker
+            .local_tail
+            .load(Ordering::Relaxed)
+            .wrapping_sub(fixed_head)
+            & LOCAL_QUEUE_MASK;
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
