@@ -1,0 +1,3 @@
+## 2025-02-18 - Avoid Redundant Atomic Loads in Queue Polling / Operations
+**Learning:** Functions checking queue length (like `drain_warehouse`, `route_chunk`, and `push_local`) redundantly called `local_queue_len()`, which always fetches both `local_head` and `local_tail`. In scopes where the queue is only pushed to and not popped from, `local_head` is immutable and should be cached.
+**Action:** When working on SPSC/MPMC queues, carefully analyze the loop and function scopes. If one side of the queue (head or tail) cannot be changed by the current thread, hoist its atomic load out of the loop or calculation, passing the cached value downward to avoid redundant read operations.
