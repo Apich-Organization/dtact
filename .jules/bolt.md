@@ -1,0 +1,3 @@
+## 2024-05-24 - Hoisting Immutable Atomic Reads
+**Learning:** In the Dtact scheduler (`src/dta_scheduler.rs`), the `local_head` pointer is immutable within the scope of a worker draining its queues or polling mailboxes, because only the worker thread itself consumes from its local queue. The codebase previously re-read this atomic variable on every queue-length calculation inside hot loops (like `drain_warehouse` and `poll_mailboxes`).
+**Action:** When calculating queue lengths or capacities inside loops that do not push/pop the queue head, hoist the atomic read of `local_head` out of the loop. Pass this cached `fixed_head` downward to helper functions (e.g., `route_chunk`) to replace redundant atomic reads with cheap register math.
