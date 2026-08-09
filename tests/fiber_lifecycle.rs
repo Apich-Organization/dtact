@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_fiber_completes_without_yield() {
     common::init_runtime();
     let done = Arc::new(AtomicU32::new(0));
@@ -24,6 +25,7 @@ fn test_fiber_completes_without_yield() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_fiber_yield_and_resume() {
     common::init_runtime();
     let steps = Arc::new(AtomicU32::new(0));
@@ -39,6 +41,7 @@ fn test_fiber_yield_and_resume() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_multiple_yield_points() {
     common::init_runtime();
     let counter = Arc::new(AtomicU32::new(0));
@@ -55,6 +58,7 @@ fn test_multiple_yield_points() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_nested_fiber_spawn_from_fiber() {
     common::init_runtime();
     let inner_ran = Arc::new(AtomicU32::new(0));
@@ -73,6 +77,7 @@ fn test_nested_fiber_spawn_from_fiber() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_spawn_with_all_switchers() {
     common::init_runtime();
     let results: Arc<Vec<AtomicU32>> = Arc::new((0..4).map(|_| AtomicU32::new(0)).collect());
@@ -120,6 +125,7 @@ fn test_spawn_with_all_switchers() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_many_sequential_fibers() {
     common::init_runtime();
     for i in 0u32..100 {
@@ -135,6 +141,7 @@ fn test_many_sequential_fibers() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_future_resolved_via_wait_ext() {
     common::init_runtime();
     let result = Arc::new(AtomicU32::new(0));

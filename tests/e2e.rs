@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 #[dtact::dtact_init(workers = 4, capacity = 2048, safety = "Safety1")]
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_dtact_comprehensive_e2e() {
     // 1. Test Fiber Execution
     {

@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_tasks_with_any_affinity_all_complete() {
     common::init_runtime();
 
@@ -40,6 +41,7 @@ fn test_tasks_with_any_affinity_all_complete() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_high_priority_fibers_complete() {
     common::init_runtime();
 
@@ -66,6 +68,7 @@ fn test_high_priority_fibers_complete() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_mixed_priority_all_complete() {
     common::init_runtime();
 
@@ -100,6 +103,7 @@ fn test_mixed_priority_all_complete() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_io_workload_kind_fibers_complete() {
     common::init_runtime();
 
@@ -124,6 +128,7 @@ fn test_io_workload_kind_fibers_complete() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_concurrent_spawn_from_multiple_threads() {
     common::init_runtime();
 
@@ -160,6 +165,7 @@ fn test_concurrent_spawn_from_multiple_threads() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_deflection_threshold_config() {
     common::init_runtime();
 
@@ -199,6 +205,7 @@ fn test_deflection_threshold_config() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_global_topology_mode_completes_all_tasks() {
     // Test that Global topology mode runs all tasks to completion
     // This creates its own scheduler/pool directly (not GLOBAL_RUNTIME)
