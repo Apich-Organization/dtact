@@ -77,6 +77,7 @@ fn test_dtact_default_spawn_options_values() {
 #[test]
 #[cfg_attr(miri, ignore)]
 #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_c_ffi_fiber_launch_basic() {
     common::init_runtime();
 
@@ -92,6 +93,7 @@ fn test_c_ffi_fiber_launch_basic() {
 #[test]
 #[cfg_attr(miri, ignore)]
 #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_c_ffi_fiber_launch_noop() {
     common::init_runtime();
     let handle = unsafe { dtact_fiber_launch(noop_fiber, core::ptr::null_mut()) };
@@ -101,6 +103,7 @@ fn test_c_ffi_fiber_launch_noop() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 #[cfg(not(feature = "hw-acceleration"))]
 fn test_c_ffi_fiber_launch_ext_all_priorities() {
     common::init_runtime();
@@ -126,6 +129,7 @@ fn test_c_ffi_fiber_launch_ext_all_priorities() {
 #[test]
 #[cfg_attr(miri, ignore)]
 #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_c_ffi_fiber_launch_ext_all_kinds() {
     common::init_runtime();
     let counter = Arc::new(AtomicU32::new(0));
@@ -144,6 +148,7 @@ fn test_c_ffi_fiber_launch_ext_all_kinds() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 #[cfg(not(feature = "hw-acceleration"))]
 fn test_c_ffi_fiber_launch_with_cleanup_called() {
     common::init_runtime();
@@ -203,6 +208,7 @@ fn test_c_ffi_fiber_launch_with_cleanup_called() {
 #[test]
 #[cfg_attr(miri, ignore)]
 #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_c_ffi_multiple_fibers_complete() {
     common::init_runtime();
 
@@ -225,6 +231,7 @@ fn test_c_ffi_multiple_fibers_complete() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 #[cfg(not(feature = "hw-acceleration"))]
 fn test_c_ffi_handle_sentinel_bit_set() {
     common::init_runtime();

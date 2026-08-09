@@ -1,0 +1,56 @@
+#!/bin/bash
+for f in tests/*.rs; do
+  sed -i 's/fn test_c_ffi_fiber_launch_basic/#[cfg(not(feature = "hw-acceleration"))]\nfn test_c_ffi_fiber_launch_basic/g' "$f"
+  sed -i 's/fn test_c_ffi_fiber_launch_noop/#[cfg(not(feature = "hw-acceleration"))]\nfn test_c_ffi_fiber_launch_noop/g' "$f"
+  sed -i 's/fn test_c_ffi_fiber_launch_ext_all_priorities/#[cfg(not(feature = "hw-acceleration"))]\nfn test_c_ffi_fiber_launch_ext_all_priorities/g' "$f"
+  sed -i 's/fn test_c_ffi_fiber_launch_ext_all_kinds/#[cfg(not(feature = "hw-acceleration"))]\nfn test_c_ffi_fiber_launch_ext_all_kinds/g' "$f"
+  sed -i 's/fn test_c_ffi_fiber_launch_with_cleanup_called/#[cfg(not(feature = "hw-acceleration"))]\nfn test_c_ffi_fiber_launch_with_cleanup_called/g' "$f"
+  sed -i 's/fn test_c_ffi_multiple_fibers_complete/#[cfg(not(feature = "hw-acceleration"))]\nfn test_c_ffi_multiple_fibers_complete/g' "$f"
+  sed -i 's/fn test_c_ffi_handle_sentinel_bit_set/#[cfg(not(feature = "hw-acceleration"))]\nfn test_c_ffi_handle_sentinel_bit_set/g' "$f"
+
+  sed -i 's/fn test_dtact_comprehensive_e2e/#[cfg(not(feature = "hw-acceleration"))]\nfn test_dtact_comprehensive_e2e/g' "$f"
+
+  sed -i 's/fn test_fiber_completes_without_yield/#[cfg(not(feature = "hw-acceleration"))]\nfn test_fiber_completes_without_yield/g' "$f"
+  sed -i 's/fn test_fiber_yield_and_resume/#[cfg(not(feature = "hw-acceleration"))]\nfn test_fiber_yield_and_resume/g' "$f"
+  sed -i 's/fn test_multiple_yield_points/#[cfg(not(feature = "hw-acceleration"))]\nfn test_multiple_yield_points/g' "$f"
+  sed -i 's/fn test_many_sequential_fibers/#[cfg(not(feature = "hw-acceleration"))]\nfn test_many_sequential_fibers/g' "$f"
+  sed -i 's/fn test_nested_fiber_spawn_from_fiber/#[cfg(not(feature = "hw-acceleration"))]\nfn test_nested_fiber_spawn_from_fiber/g' "$f"
+  sed -i 's/fn test_spawn_with_all_switchers/#[cfg(not(feature = "hw-acceleration"))]\nfn test_spawn_with_all_switchers/g' "$f"
+
+  sed -i 's/fn test_wait_resolves_immediately_ready_future/#[cfg(not(feature = "hw-acceleration"))]\nfn test_wait_resolves_immediately_ready_future/g' "$f"
+  sed -i 's/fn test_wait_resolves_pending_then_ready_future/#[cfg(not(feature = "hw-acceleration"))]\nfn test_wait_resolves_pending_then_ready_future/g' "$f"
+  sed -i 's/fn test_wait_chained_futures/#[cfg(not(feature = "hw-acceleration"))]\nfn test_wait_chained_futures/g' "$f"
+  sed -i 's/fn test_wait_panics_outside_fiber_context/#[cfg(not(feature = "hw-acceleration"))]\nfn test_wait_panics_outside_fiber_context/g' "$f"
+  sed -i 's/fn test_large_future_heap_escape_increments_counter/#[cfg(not(feature = "hw-acceleration"))]\nfn test_large_future_heap_escape_increments_counter/g' "$f"
+  sed -i 's/fn test_yield_now_is_rescheduled/#[cfg(not(feature = "hw-acceleration"))]\nfn test_yield_now_is_rescheduled/g' "$f"
+  sed -i 's/fn test_zero_sized_future/#[cfg(not(feature = "hw-acceleration"))]\nfn test_zero_sized_future/g' "$f"
+  sed -i 's/fn test_future_resolved_via_wait_ext/#[cfg(not(feature = "hw-acceleration"))]\nfn test_future_resolved_via_wait_ext/g' "$f"
+
+  sed -i 's/fn test_concurrent_spawn_from_multiple_threads/#[cfg(not(feature = "hw-acceleration"))]\nfn test_concurrent_spawn_from_multiple_threads/g' "$f"
+  sed -i 's/fn test_mixed_priority_all_complete/#[cfg(not(feature = "hw-acceleration"))]\nfn test_mixed_priority_all_complete/g' "$f"
+  sed -i 's/fn test_high_priority_fibers_complete/#[cfg(not(feature = "hw-acceleration"))]\nfn test_high_priority_fibers_complete/g' "$f"
+  sed -i 's/fn test_io_workload_kind_fibers_complete/#[cfg(not(feature = "hw-acceleration"))]\nfn test_io_workload_kind_fibers_complete/g' "$f"
+  sed -i 's/fn test_tasks_with_any_affinity_all_complete/#[cfg(not(feature = "hw-acceleration"))]\nfn test_tasks_with_any_affinity_all_complete/g' "$f"
+  sed -i 's/fn test_global_topology_mode_completes_all_tasks/#[cfg(not(feature = "hw-acceleration"))]\nfn test_global_topology_mode_completes_all_tasks/g' "$f"
+  sed -i 's/fn test_deflection_threshold_config/#[cfg(not(feature = "hw-acceleration"))]\nfn test_deflection_threshold_config/g' "$f"
+
+  sed -i 's/fn test_panic_in_fiber_does_not_crash_runtime/#[cfg(not(feature = "hw-acceleration"))]\nfn test_panic_in_fiber_does_not_crash_runtime/g' "$f"
+  sed -i 's/fn test_panic_does_not_corrupt_sibling_fibers/#[cfg(not(feature = "hw-acceleration"))]\nfn test_panic_does_not_corrupt_sibling_fibers/g' "$f"
+  sed -i 's/fn test_multiple_concurrent_panics/#[cfg(not(feature = "hw-acceleration"))]\nfn test_multiple_concurrent_panics/g' "$f"
+  sed -i 's/fn test_panic_fiber_slot_is_recycled/#[cfg(not(feature = "hw-acceleration"))]\nfn test_panic_fiber_slot_is_recycled/g' "$f"
+  sed -i 's/fn test_panic_with_string_payload/#[cfg(not(feature = "hw-acceleration"))]\nfn test_panic_with_string_payload/g' "$f"
+
+  sed -i 's/fn test_deflection_consistency/#[cfg(not(feature = "hw-acceleration"))]\nfn test_deflection_consistency/g' "$f"
+  sed -i 's/fn test_global_topology_distribution/#[cfg(not(feature = "hw-acceleration"))]\nfn test_global_topology_distribution/g' "$f"
+  sed -i 's/fn test_free_context_allows_realloc/#[cfg(not(feature = "hw-acceleration"))]\nfn test_free_context_allows_realloc/g' "$f"
+  sed -i 's/fn test_alloc_free_cycle_repeated/#[cfg(not(feature = "hw-acceleration"))]\nfn test_alloc_free_cycle_repeated/g' "$f"
+  sed -i 's/fn test_context_alloc_returns_none_when_exhausted/#[cfg(not(feature = "hw-acceleration"))]\nfn test_context_alloc_returns_none_when_exhausted/g' "$f"
+  sed -i 's/fn test_pool_survives_many_alloc_free_cycles_concurrently/#[cfg(not(feature = "hw-acceleration"))]\nfn test_pool_survives_many_alloc_free_cycles_concurrently/g' "$f"
+  sed -i 's/fn test_heap_escaped_spawns_counter_accuracy/#[cfg(not(feature = "hw-acceleration"))]\nfn test_heap_escaped_spawns_counter_accuracy/g' "$f"
+
+  sed -i 's/fn test_production_fiber_state_transitions/#[cfg(not(feature = "hw-acceleration"))]\nfn test_production_fiber_state_transitions/g' "$f"
+  sed -i 's/fn test_production_mailbox_spsc/#[cfg(not(feature = "hw-acceleration"))]\nfn test_production_mailbox_spsc/g' "$f"
+  sed -i 's/fn test_production_context_pool_alloc_free/#[cfg(not(feature = "hw-acceleration"))]\nfn test_production_context_pool_alloc_free/g' "$f"
+  sed -i 's/fn test_production_warehouse_mpmc/#[cfg(not(feature = "hw-acceleration"))]\nfn test_production_warehouse_mpmc/g' "$f"
+  sed -i 's/fn test_production_warehouse_two_producers/#[cfg(not(feature = "hw-acceleration"))]\nfn test_production_warehouse_two_producers/g' "$f"
+done

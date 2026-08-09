@@ -7,6 +7,7 @@ proptest! {
     #[cfg_attr(miri, ignore)]
     #[test]
     #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_deflection_consistency(
         source_core in 0usize..64usize,
         flow_id in 0u64..10000u64,
@@ -52,6 +53,7 @@ fn test_deflection_consistency(
     #[cfg_attr(miri, ignore)]
     #[test]
     #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_global_topology_distribution(
         source_core in 0usize..64usize,
         flow_id in 0u64..10000u64

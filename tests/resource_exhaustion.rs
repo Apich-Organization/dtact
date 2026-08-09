@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 #[test]
 #[cfg_attr(miri, ignore)]
 #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_context_alloc_returns_none_when_exhausted() {
     let pool = ContextPool::new(4, 131_072, SafetyLevel::Safety0, 0).expect("pool creation failed");
 
@@ -37,6 +38,7 @@ fn test_context_alloc_returns_none_when_exhausted() {
 #[test]
 #[cfg_attr(miri, ignore)]
 #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_free_context_allows_realloc() {
     // Verifies ABA protection indirectly: alloc → free → re-alloc must succeed
     // and the slot index may be reused (free-list is a stack, so the same slot
@@ -62,6 +64,7 @@ fn test_free_context_allows_realloc() {
 #[test]
 #[cfg_attr(miri, ignore)]
 #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_alloc_free_cycle_repeated() {
     let pool = ContextPool::new(2, 131_072, SafetyLevel::Safety0, 0).expect("pool creation failed");
 
@@ -74,6 +77,7 @@ fn test_alloc_free_cycle_repeated() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 #[cfg(not(feature = "hw-acceleration"))]
 fn test_heap_escaped_spawns_counter_accuracy() {
     common::init_runtime();
@@ -112,6 +116,7 @@ fn test_heap_escaped_spawns_counter_accuracy() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
 #[cfg(not(feature = "hw-acceleration"))]
 fn test_pool_survives_many_alloc_free_cycles_concurrently() {
     let pool = Arc::new(
