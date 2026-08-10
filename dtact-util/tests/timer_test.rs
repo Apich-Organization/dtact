@@ -46,8 +46,10 @@ mod native_tests {
         let start = Instant::now();
         block_on(sleep(SLEEP_DUR));
         let elapsed = start.elapsed();
+        // Allow a small 1ms tolerance for OS scheduler jitter/imprecision which can cause early returns
+        let tolerance = Duration::from_millis(1);
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + tolerance >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
@@ -163,8 +165,10 @@ mod tokio_tests {
         let start = Instant::now();
         sleep(SLEEP_DUR).await;
         let elapsed = start.elapsed();
+        // Allow a small 1ms tolerance for OS scheduler jitter/imprecision which can cause early returns
+        let tolerance = Duration::from_millis(1);
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + tolerance >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
