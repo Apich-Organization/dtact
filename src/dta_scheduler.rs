@@ -1392,7 +1392,13 @@ impl DtaScheduler {
     /// call after the index is computed.
     #[inline(always)]
     #[allow(clippy::items_after_statements)]
-    fn route_chunk(&self, worker: &mut Worker, current_core: usize, chunk: TaskChunk, fixed_head: usize) {
+    fn route_chunk(
+        &self,
+        worker: &mut Worker,
+        current_core: usize,
+        chunk: TaskChunk,
+        fixed_head: usize,
+    ) {
         let tail = worker.local_tail.load(Ordering::Relaxed);
         let local_len = tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
