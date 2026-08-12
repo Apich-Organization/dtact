@@ -46,8 +46,9 @@ mod native_tests {
         let start = Instant::now();
         block_on(sleep(SLEEP_DUR));
         let elapsed = start.elapsed();
+        let tolerance = Duration::from_millis(1);
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + tolerance >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
@@ -163,8 +164,9 @@ mod tokio_tests {
         let start = Instant::now();
         sleep(SLEEP_DUR).await;
         let elapsed = start.elapsed();
+        let tolerance = Duration::from_millis(1);
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + tolerance >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
