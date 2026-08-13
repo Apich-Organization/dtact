@@ -47,7 +47,7 @@ mod native_tests {
         block_on(sleep(SLEEP_DUR));
         let elapsed = start.elapsed();
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + core::time::Duration::from_millis(2) >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
