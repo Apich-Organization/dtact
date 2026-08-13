@@ -1351,7 +1351,7 @@ impl DtaScheduler {
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        self.route_chunk(worker, current_core, chunk);
+                        self.route_chunk(worker, current_core, chunk, fixed_head);
                     }
                     None => break,
                 }
@@ -1372,7 +1372,7 @@ impl DtaScheduler {
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    self.route_chunk(worker, current_core, chunk);
+                    self.route_chunk(worker, current_core, chunk, fixed_head);
                 }
                 None => break,
             }
@@ -1386,10 +1386,19 @@ impl DtaScheduler {
     /// 4-way branchless chunk router. The function-pointer table makes the
     /// hot routes (cases 01 and 11 → `push_local`) collapse to a single indirect
     /// call after the index is computed.
+    ///
+    /// Accepts `fixed_head` to avoid redundant atomic loads of `local_head` via `local_queue_len()`.
     #[inline(always)]
     #[allow(clippy::items_after_statements)]
-    fn route_chunk(&self, worker: &mut Worker, current_core: usize, chunk: TaskChunk) {
-        let local_len = worker.local_queue_len();
+    fn route_chunk(
+        &self,
+        worker: &mut Worker,
+        current_core: usize,
+        chunk: TaskChunk,
+        fixed_head: usize,
+    ) {
+        let tail = worker.local_tail.load(Ordering::Relaxed);
+        let local_len = tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 

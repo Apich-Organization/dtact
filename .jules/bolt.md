@@ -1,0 +1,3 @@
+## 2025-02-09 - Avoid redundant SPSC queue atomic loads in scheduler
+**Learning:** In SPSC queue loop logic (e.g. pulling chunks into SPSC local queue), repeatedly calling a function like `local_queue_len()` will re-load `local_head` via atomic relaxed load, even if the current loop execution is the only thing that could write to `local_head`.
+**Action:** Always hoist immutable (from the perspective of the current execution context) atomic variables (like SPSC `local_head` when only pushing to the queue, or `local_tail` when only popping) and pass the cached value down into helper functions instead of re-evaluating the full length calculation.
