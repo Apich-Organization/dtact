@@ -12,7 +12,7 @@ use dtact_util::ffi::process::*;
 use dtact_util::ffi::signal::*;
 use dtact_util::ffi::stream::*;
 use dtact_util::ffi::timer::*;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 
 fn last_error() -> Option<String> {
     let p = unsafe { dtact_util_last_error_message() };
@@ -145,7 +145,7 @@ fn fs_positional_read_write_and_remove() {
 fn io_lookup_host_resolves_loopback() {
     unsafe {
         let host = CString::new("localhost:80").unwrap();
-        let mut out = [0i8; 256];
+        let mut out = [0 as c_char; 256];
         let n = dtact_util_io_lookup_host(host.as_ptr(), out.as_mut_ptr(), out.len());
         assert!(n >= 1, "{:?}", last_error());
         let joined = CStr::from_ptr(out.as_ptr()).to_str().unwrap();
@@ -270,7 +270,7 @@ fn io_udp_send_recv_roundtrip() {
         assert_eq!(sent, msg.len() as isize, "{:?}", last_error());
 
         let mut buf = [0u8; 16];
-        let mut out_addr = [0i8; 64];
+        let mut out_addr = [0 as c_char; 64];
         let n = dtact_util_io_udp_recv_from(
             a,
             buf.as_mut_ptr(),
@@ -539,7 +539,7 @@ fn io_unix_datagram_send_recv_roundtrip() {
         assert_eq!(sent, msg.len() as isize, "{:?}", last_error());
 
         let mut buf = [0u8; 16];
-        let mut out_addr = [0i8; 256];
+        let mut out_addr = [0 as c_char; 256];
         let n = dtact_util_io_unix_datagram_recv_from(
             a,
             buf.as_mut_ptr(),

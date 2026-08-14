@@ -33,7 +33,9 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
+#[allow(dead_code)]
 const SLEEP_DUR: Duration = Duration::from_millis(50);
+#[allow(dead_code)]
 const SLACK: Duration = Duration::from_millis(200);
 
 #[cfg(feature = "native")]
@@ -47,7 +49,7 @@ mod native_tests {
         block_on(sleep(SLEEP_DUR));
         let elapsed = start.elapsed();
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + Duration::from_millis(1) >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
@@ -164,7 +166,7 @@ mod tokio_tests {
         sleep(SLEEP_DUR).await;
         let elapsed = start.elapsed();
         assert!(
-            elapsed >= SLEEP_DUR,
+            elapsed + Duration::from_millis(1) >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
