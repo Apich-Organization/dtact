@@ -1310,7 +1310,9 @@ impl DtaScheduler {
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
 
         while drained < cap {
-            if worker.local_queue_len_with_head(fixed_head) + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
+            if worker.local_queue_len_with_head(fixed_head) + CHUNK_SIZE
+                > LOCAL_QUEUE_HIGH_WATERMARK
+            {
                 break;
             }
             match self.warehouse.pop() {
@@ -1349,7 +1351,8 @@ impl DtaScheduler {
 
             loop {
                 // Only reload local_tail; fixed_head is constant here.
-                if worker.local_queue_len_with_head(fixed_head) + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
+                if worker.local_queue_len_with_head(fixed_head) + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY
+                {
                     break;
                 }
                 match row[current_core].pop() {
@@ -1387,7 +1390,13 @@ impl DtaScheduler {
     /// call after the index is computed.
     #[inline(always)]
     #[allow(clippy::items_after_statements)]
-    fn route_chunk(&self, worker: &mut Worker, current_core: usize, chunk: TaskChunk, fixed_head: usize) {
+    fn route_chunk(
+        &self,
+        worker: &mut Worker,
+        current_core: usize,
+        chunk: TaskChunk,
+        fixed_head: usize,
+    ) {
         let local_len = worker.local_queue_len_with_head(fixed_head);
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
