@@ -415,11 +415,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     naked_asm!(
         "prefetch.w 0(a0)",
         "prefetch.r 0(a1)",
-        "prefetch.r 64(a1)",
-        "prefetch.r 128(a1)",
         "ld a2, 0(a1)",
         "prefetch.r 0(a2)",
-        "prefetch.r 64(a2)",
         "sd sp, 0(a0)",
         "sd s0, 8(a0)",
         "sd s1, 16(a0)",
@@ -842,10 +839,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_no_float(
     naked_asm!(
         "prefetch.w 0(a0)",
         "prefetch.r 0(a1)",
-        "prefetch.r 64(a1)",
         "ld a2, 0(a1)",
         "prefetch.r 0(a2)",
-        "prefetch.r 64(a2)",
         "sd sp, 0(a0)",
         "sd s0, 8(a0)",
         "sd s1, 16(a0)",
@@ -1298,8 +1293,6 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
     naked_asm!(
         "prefetch.w 0(a0)",
         "prefetch.r 0(a1)",
-        "prefetch.r 64(a1)",
-        "prefetch.r 128(a1)",
         "ld a2, 0(a1)",
         "prefetch.r 0(a2)",
         "sd sp, 0(a0)",
@@ -1738,10 +1731,8 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     naked_asm!(
         "prefetch.w 0(a0)",
         "prefetch.r 0(a1)",
-        "prefetch.r 64(a1)",
         "ld a2, 0(a1)",
         "prefetch.r 0(a2)",
-        "prefetch.r 64(a2)",
         "sd sp, 0(a0)",
         "sd s0, 8(a0)",
         "sd s1, 16(a0)",
