@@ -1,0 +1,3 @@
+## 2024-05-19 - [Performance Improvement: Hoist immutable local_head atomic loads in scheduler loops]
+**Learning:** In the Dtact scheduler (`src/dta_scheduler.rs`), the `local_head` pointer is immutable and can be safely cached to minimize redundant atomic operations in loops (e.g. `drain_warehouse` and `poll_mailboxes`). However, passing pre-calculated queue lengths to helper functions like `route_chunk` can be dangerous since those functions push to the queue.
+**Action:** Pass the hoisted cached immutable pointers (like `fixed_head`) downward to helper functions, and let them compute the queue length safely using `local_tail.load()`.
