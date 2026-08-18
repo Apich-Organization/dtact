@@ -774,6 +774,14 @@ impl Worker {
         tail.wrapping_sub(head) & LOCAL_QUEUE_MASK
     }
 
+    /// Returns the current number of tasks in the local queue, given a pre-loaded head value.
+    /// Used to avoid redundant atomic loads of `local_head` in hot loops.
+    #[inline(always)]
+    pub fn local_queue_len_with_head(&self, head: usize) -> usize {
+        let tail = self.local_tail.load(Ordering::Relaxed);
+        tail.wrapping_sub(head) & LOCAL_QUEUE_MASK
+    }
+
     /// Updates the `load_level` based on the current queue length.
     #[inline(always)]
     pub fn update_load(&self) {
@@ -1300,8 +1308,11 @@ impl DtaScheduler {
         // warehouse while peers also want to help.
         let cap = 64usize;
         let mut drained = 0usize;
+
+        let fixed_head = worker.local_head.load(Ordering::Relaxed);
+
         while drained < cap {
-            if worker.local_queue_len() + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
+            if worker.local_queue_len_with_head(fixed_head) + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
                 break;
             }
             match self.warehouse.pop() {
@@ -1340,18 +1351,14 @@ impl DtaScheduler {
 
             loop {
                 // Only reload local_tail; fixed_head is constant here.
-                let cur_len = worker
-                    .local_tail
-                    .load(Ordering::Relaxed)
-                    .wrapping_sub(fixed_head)
-                    & LOCAL_QUEUE_MASK;
+                let cur_len = worker.local_queue_len_with_head(fixed_head);
                 if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                     break;
                 }
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        self.route_chunk(worker, current_core, chunk);
+                        self.route_chunk(worker, current_core, chunk, fixed_head);
                     }
                     None => break,
                 }
@@ -1361,18 +1368,14 @@ impl DtaScheduler {
         // Poll the external mailbox last so external injection naturally yields
         // to internal CCX traffic when both are active.
         loop {
-            let cur_len = worker
-                .local_tail
-                .load(Ordering::Relaxed)
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
+            let cur_len = worker.local_queue_len_with_head(fixed_head);
             if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                 break;
             }
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    self.route_chunk(worker, current_core, chunk);
+                    self.route_chunk(worker, current_core, chunk, fixed_head);
                 }
                 None => break,
             }
@@ -1388,8 +1391,8 @@ impl DtaScheduler {
     /// call after the index is computed.
     #[inline(always)]
     #[allow(clippy::items_after_statements)]
-    fn route_chunk(&self, worker: &mut Worker, current_core: usize, chunk: TaskChunk) {
-        let local_len = worker.local_queue_len();
+    fn route_chunk(&self, worker: &mut Worker, current_core: usize, chunk: TaskChunk, fixed_head: usize) {
+        let local_len = worker.local_queue_len_with_head(fixed_head);
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
