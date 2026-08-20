@@ -1296,12 +1296,19 @@ impl DtaScheduler {
     #[inline(never)]
     pub fn drain_warehouse(&self, current_core: usize) -> bool {
         let worker = unsafe { &mut *self.workers[current_core].get() };
+        // local_head is immutable during this function — cache it once.
+        let fixed_head = worker.local_head.load(Ordering::Relaxed);
         // Cap draining per call so a single worker doesn't monopolise the
         // warehouse while peers also want to help.
         let cap = 64usize;
         let mut drained = 0usize;
         while drained < cap {
-            if worker.local_queue_len() + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
+            let local_len = worker
+                .local_tail
+                .load(Ordering::Relaxed)
+                .wrapping_sub(fixed_head)
+                & LOCAL_QUEUE_MASK;
+            if local_len + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
                 break;
             }
             match self.warehouse.pop() {
@@ -1351,7 +1358,7 @@ impl DtaScheduler {
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        self.route_chunk(worker, current_core, chunk);
+                        self.route_chunk(worker, current_core, fixed_head, chunk);
                     }
                     None => break,
                 }
@@ -1372,7 +1379,7 @@ impl DtaScheduler {
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    self.route_chunk(worker, current_core, chunk);
+                    self.route_chunk(worker, current_core, fixed_head, chunk);
                 }
                 None => break,
             }
@@ -1388,8 +1395,18 @@ impl DtaScheduler {
     /// call after the index is computed.
     #[inline(always)]
     #[allow(clippy::items_after_statements)]
-    fn route_chunk(&self, worker: &mut Worker, current_core: usize, chunk: TaskChunk) {
-        let local_len = worker.local_queue_len();
+    fn route_chunk(
+        &self,
+        worker: &mut Worker,
+        current_core: usize,
+        fixed_head: usize,
+        chunk: TaskChunk,
+    ) {
+        let local_len = worker
+            .local_tail
+            .load(Ordering::Relaxed)
+            .wrapping_sub(fixed_head)
+            & LOCAL_QUEUE_MASK;
         let space_ok = (local_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
