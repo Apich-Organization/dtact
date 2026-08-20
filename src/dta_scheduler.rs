@@ -1161,7 +1161,12 @@ impl DtaScheduler {
         let target = if self.topology == TopologyMode::Global
             && matches!(affinity, crate::api::topology::Affinity::Any)
         {
-            (source + h1 + h2) % n
+            let deflect_target = (source + h1 + h2) % n;
+            // Branchless conditional selection: if deflect_mask is all 1s (load > threshold),
+            // this evaluates to deflect_target. If deflect_mask is 0 (load <= threshold),
+            // this evaluates to source. This avoids cross-core deflection under low load
+            // without incurring misprediction latency.
+            source ^ ((source ^ deflect_target) & deflect_mask)
         } else if matches!(affinity, crate::api::topology::Affinity::SameNUMA) {
             let numa_base = source & !63;
             let local_idx = source & 63;
