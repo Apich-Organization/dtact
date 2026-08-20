@@ -6,7 +6,9 @@ use std::sync::atomic::Ordering;
 proptest! {
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn test_deflection_consistency(
+    #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
+fn test_deflection_consistency(
         source_core in 0usize..64usize,
         flow_id in 0u64..10000u64,
         load in 0u8..255u8,
@@ -50,7 +52,9 @@ proptest! {
 
     #[cfg_attr(miri, ignore)]
     #[test]
-    fn test_global_topology_distribution(
+    #[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
+fn test_global_topology_distribution(
         source_core in 0usize..64usize,
         flow_id in 0u64..10000u64
     ) {

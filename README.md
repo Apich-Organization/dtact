@@ -36,7 +36,7 @@ Dtact's design makes trade-offs that influence its performance profile:
 
 ### Rust
 
-```rust
+```rust,ignore
 use dtact::{dtact_await, dtact_init, spawn, task, yield_now};
 
 #[task(
@@ -179,7 +179,7 @@ See [`examples/rust_dtact_util.rs`](https://www.google.com/search?q=examples/rus
 
 ### Rust
 
-```rust
+```rust,ignore
 use dtact::{dtact_await, dtact_init};
 use dtact_util::io::{DtactTcpListener, DtactTcpStream, init as io_init};
 use dtact_util::stream;

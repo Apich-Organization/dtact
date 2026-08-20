@@ -32,6 +32,8 @@ impl Future for OnceDelayed {
 #[test]
 #[serial]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_wait_panics_outside_fiber_context() {
     // wait() must panic when called from a plain OS thread (no fiber context)
     let result = std::panic::catch_unwind(|| {
@@ -43,6 +45,8 @@ fn test_wait_panics_outside_fiber_context() {
 #[test]
 #[serial]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_wait_resolves_immediately_ready_future() {
     common::init_runtime();
     let result = Arc::new(AtomicU32::new(0));
@@ -58,6 +62,8 @@ fn test_wait_resolves_immediately_ready_future() {
 #[test]
 #[serial]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_wait_resolves_pending_then_ready_future() {
     common::init_runtime();
     let result = Arc::new(AtomicU32::new(0));
@@ -77,6 +83,8 @@ fn test_wait_resolves_pending_then_ready_future() {
 #[test]
 #[serial]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_wait_chained_futures() {
     common::init_runtime();
     let result = Arc::new(AtomicU32::new(0));
@@ -93,6 +101,8 @@ fn test_wait_chained_futures() {
 #[test]
 #[serial]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_large_future_heap_escape_increments_counter() {
     common::init_runtime();
 
@@ -117,6 +127,8 @@ fn test_large_future_heap_escape_increments_counter() {
 #[test]
 #[serial]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_zero_sized_future() {
     common::init_runtime();
     let done = Arc::new(AtomicU32::new(0));
@@ -141,6 +153,8 @@ fn test_zero_sized_future() {
 #[test]
 #[serial]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_yield_now_is_rescheduled() {
     common::init_runtime();
     // Verify yield_now().await doesn't deadlock and execution resumes

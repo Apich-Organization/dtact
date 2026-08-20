@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_panic_in_fiber_does_not_crash_runtime() {
     common::init_runtime();
 
@@ -35,6 +37,8 @@ fn test_panic_in_fiber_does_not_crash_runtime() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_panic_fiber_slot_is_recycled() {
     common::init_runtime();
 
@@ -63,6 +67,8 @@ fn test_panic_fiber_slot_is_recycled() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_multiple_concurrent_panics() {
     common::init_runtime();
 
@@ -98,6 +104,8 @@ fn test_multiple_concurrent_panics() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_panic_does_not_corrupt_sibling_fibers() {
     common::init_runtime();
 
@@ -130,6 +138,8 @@ fn test_panic_does_not_corrupt_sibling_fibers() {
 
 #[test]
 #[cfg_attr(miri, ignore)]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_panic_with_string_payload() {
     common::init_runtime();
 

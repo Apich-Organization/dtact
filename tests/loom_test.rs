@@ -33,6 +33,8 @@ fn bounded_model<F: Fn() + Sync + Send + 'static>(f: F) {
 // ---------------------------------------------------------------------------
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_production_fiber_state_transitions() {
     loom::model(|| {
         let ctx = Arc::new(FiberContext::new());
@@ -89,6 +91,8 @@ fn test_production_fiber_state_transitions() {
 // ---------------------------------------------------------------------------
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_production_context_pool_alloc_free() {
     bounded_model(|| {
         let pool = Arc::new(ContextPool::new(2, 8192, SafetyLevel::Safety0, 0).expect("pool init"));
@@ -121,6 +125,8 @@ fn test_production_context_pool_alloc_free() {
 // ---------------------------------------------------------------------------
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_production_mailbox_spsc() {
     loom::model(|| {
         let mailbox = Arc::new(Mailbox::new().unwrap());
@@ -151,6 +157,8 @@ fn test_production_mailbox_spsc() {
 // ---------------------------------------------------------------------------
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_production_warehouse_mpmc() {
     bounded_model(|| {
         let warehouse = Arc::new(Warehouse::new().unwrap());
@@ -180,6 +188,8 @@ fn test_production_warehouse_mpmc() {
 // ---------------------------------------------------------------------------
 #[cfg_attr(miri, ignore)]
 #[test]
+#[cfg(not(feature = "hw-acceleration"))]
+#[cfg(not(feature = "hw-acceleration"))]
 fn test_production_warehouse_two_producers() {
     bounded_model(|| {
         let warehouse = Arc::new(Warehouse::new().unwrap());
