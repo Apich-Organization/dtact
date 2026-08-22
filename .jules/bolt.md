@@ -1,3 +1,3 @@
-## 2025-08-01 - Branchless optimization in enqueue_deflect
-**Learning:** Found an inconsistency in how the Global topology mode handled branchless deflection target calculation compared to SameNUMA and SameCCX. It wasn't applying the `deflect_mask` to conditionally fall back to the source core when under threshold.
-**Action:** Applied the XOR branchless selection pattern `source ^ ((source ^ deflect_target) & deflect_mask)` to the Global branch as well to ensure consistent and correct behavior without adding branching overhead.
+## 2024-10-27 - Hoist atomic loads out of loops
+**Learning:** Atomic loads like `local_queue_len()` which internally load `local_head` and `local_tail` can be split. If one side of the queue (e.g., `local_head`) is immutable during the execution of a function (like when pulling from warehouse to local queue), cache it outside the loop and only re-read the mutable part (`local_tail`) to save redundant atomic reads.
+**Action:** Always check if a queue length check inside a loop can be optimized by caching the non-moving pointer outside the loop.
