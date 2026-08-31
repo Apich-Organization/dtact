@@ -563,6 +563,7 @@ pub mod topology {
     /// Performs a raw hardware topology discovery via CPUID/MPIDR.
     #[inline(always)]
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn current_raw() -> CpuLevel {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -638,11 +639,11 @@ pub mod topology {
             unsafe {
                 core::arch::asm!("csrr {}, mhartid", out(reg) hart_id, options(nomem, nostack, preserves_flags));
             }
-            return CpuLevel {
+            CpuLevel {
                 core_id: (hart_id & 0xFFFF) as u16,
                 ccx_id: (hart_id >> 16) as u16,
                 numa_id: 0,
-            };
+            }
         }
 
         #[cfg(any(
