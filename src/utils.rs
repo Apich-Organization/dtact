@@ -65,7 +65,9 @@ pub fn get_cpu_fast() -> u32 {
     }
     #[cfg(all(not(target_arch = "x86_64"), target_os = "linux"))]
     unsafe {
-        libc::sched_getcpu() as u32
+        #[allow(clippy::cast_sign_loss)]
+        let cpu = libc::sched_getcpu() as u32;
+        cpu
     }
     #[cfg(not(any(target_arch = "x86_64", target_os = "linux")))]
     {
