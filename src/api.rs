@@ -621,11 +621,11 @@ pub mod topology {
             unsafe {
                 core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
             }
-            return CpuLevel {
+            CpuLevel {
                 core_id: (mpidr & 0xFF) as u16,
                 ccx_id: ((mpidr >> 8) & 0xFF) as u16,
                 numa_id: ((mpidr >> 16) & 0xFF) as u16,
-            };
+            }
         }
 
         // `mhartid` is a Machine-mode privileged register. Reading it from User-mode
