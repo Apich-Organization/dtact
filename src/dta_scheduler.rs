@@ -776,8 +776,9 @@ impl Worker {
 
     /// Updates the `load_level` based on the current queue length.
     #[inline(always)]
-    pub fn update_load(&self) {
-        let queue_len = self.local_queue_len();
+    pub fn update_load(&self, fixed_head: usize) {
+        let tail = self.local_tail.load(Ordering::Relaxed);
+        let queue_len = tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
         #[allow(clippy::cast_possible_truncation)]
         let load = core::cmp::min((queue_len * 100) >> 13, 100) as u8;
         self.load_level.store(load, Ordering::Relaxed);
@@ -808,7 +809,8 @@ impl Worker {
     #[inline(always)]
     pub fn push_local(&self, task: TaskIndex) -> bool {
         let tail = self.local_tail.load(Ordering::Relaxed);
-        if self.local_queue_len() >= LOCAL_QUEUE_CAPACITY - 1 {
+        let head = self.local_head.load(Ordering::Relaxed);
+        if tail.wrapping_sub(head) & LOCAL_QUEUE_MASK >= LOCAL_QUEUE_CAPACITY - 1 {
             return false;
         }
         unsafe {
@@ -878,15 +880,12 @@ impl Worker {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
         let mut head = self.local_head.load(Ordering::Relaxed);
 
-        if head == self.local_tail.load(Ordering::Relaxed) {
+        let mut tail = self.local_tail.load(Ordering::Relaxed);
+        if head == tail {
             return false;
         }
 
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
-            }
-
             let task = unsafe {
                 let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
                 *buffer_ptr.add(head)
@@ -958,6 +957,11 @@ impl Worker {
                 );
                 // Return to allow mailbox polling and prevent live-locks on high contention.
                 return true;
+            }
+
+            tail = self.local_tail.load(Ordering::Relaxed);
+            if head == tail {
+                break;
             }
         }
 
@@ -1392,7 +1396,7 @@ impl DtaScheduler {
             }
         }
 
-        worker.update_load();
+        worker.update_load(fixed_head);
         worker.tick();
         received_any
     }
