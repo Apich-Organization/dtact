@@ -880,12 +880,15 @@ impl Worker {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
         let mut head = self.local_head.load(Ordering::Relaxed);
 
-        let mut tail = self.local_tail.load(Ordering::Relaxed);
-        if head == tail {
+        if head == self.local_tail.load(Ordering::Relaxed) {
             return false;
         }
 
         loop {
+            if head == self.local_tail.load(Ordering::Relaxed) {
+                break;
+            }
+
             let task = unsafe {
                 let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
                 *buffer_ptr.add(head)
@@ -957,11 +960,6 @@ impl Worker {
                 );
                 // Return to allow mailbox polling and prevent live-locks on high contention.
                 return true;
-            }
-
-            tail = self.local_tail.load(Ordering::Relaxed);
-            if head == tail {
-                break;
             }
         }
 
