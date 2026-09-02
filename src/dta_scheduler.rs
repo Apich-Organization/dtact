@@ -808,7 +808,10 @@ impl Worker {
     #[inline(always)]
     pub fn push_local(&self, task: TaskIndex) -> bool {
         let tail = self.local_tail.load(Ordering::Relaxed);
-        if self.local_queue_len() >= LOCAL_QUEUE_CAPACITY - 1 {
+        let head = self.local_head.load(Ordering::Relaxed);
+
+        let cur_len = tail.wrapping_sub(head) & LOCAL_QUEUE_MASK;
+        if cur_len >= LOCAL_QUEUE_CAPACITY - 1 {
             return false;
         }
         unsafe {
@@ -827,26 +830,25 @@ impl Worker {
     /// stays under `LOCAL_QUEUE_CAPACITY`. The `route_chunk` / `drain_warehouse`
     /// paths enforce this via `LOCAL_QUEUE_HIGH_WATERMARK`.
     #[inline]
-    pub fn push_batch(&mut self, chunk: &TaskChunk) {
+    pub fn push_batch(&mut self, chunk: &TaskChunk, current_tail: usize) -> usize {
         let count = chunk.count as usize;
-        let tail = self.local_tail.load(Ordering::Relaxed);
-        let end_idx = tail.wrapping_add(count);
+        let end_idx = current_tail.wrapping_add(count);
 
         if end_idx <= LOCAL_QUEUE_CAPACITY {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     chunk.tasks.as_ptr(),
-                    (*self.local_queue.ptr).as_mut_ptr().add(tail),
+                    (*self.local_queue.ptr).as_mut_ptr().add(current_tail),
                     count,
                 );
             }
         } else {
-            let first_part = LOCAL_QUEUE_CAPACITY - tail;
+            let first_part = LOCAL_QUEUE_CAPACITY - current_tail;
             let second_part = count - first_part;
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     chunk.tasks.as_ptr(),
-                    (*self.local_queue.ptr).as_mut_ptr().add(tail),
+                    (*self.local_queue.ptr).as_mut_ptr().add(current_tail),
                     first_part,
                 );
                 core::ptr::copy_nonoverlapping(
@@ -857,8 +859,9 @@ impl Worker {
             }
         }
         // Relaxed: push_batch is only called from the local worker thread.
-        self.local_tail
-            .store(end_idx & LOCAL_QUEUE_MASK, Ordering::Relaxed);
+        let new_tail = end_idx & LOCAL_QUEUE_MASK;
+        self.local_tail.store(new_tail, Ordering::Relaxed);
+        new_tail
     }
 
     /// Primary execution loop for the worker thread.
@@ -1308,19 +1311,16 @@ impl DtaScheduler {
 
         // local_head is immutable during this function — cache it once.
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
+        let mut current_tail = worker.local_tail.load(Ordering::Relaxed);
 
         while drained < cap {
-            let cur_len = worker
-                .local_tail
-                .load(Ordering::Relaxed)
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
+            let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
                 break;
             }
             match self.warehouse.pop() {
                 Some(chunk) => {
-                    worker.push_batch(&chunk);
+                    current_tail = worker.push_batch(&chunk, current_tail);
                     drained += 1;
                 }
                 None => break,
@@ -1345,6 +1345,7 @@ impl DtaScheduler {
 
         // local_head is immutable during this function — cache it once.
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
+        let mut current_tail = worker.local_tail.load(Ordering::Relaxed);
         let mut received_any = false;
 
         let num_polls = worker.polling_order.len();
@@ -1354,18 +1355,15 @@ impl DtaScheduler {
 
             loop {
                 // Only reload local_tail; fixed_head is constant here.
-                let cur_len = worker
-                    .local_tail
-                    .load(Ordering::Relaxed)
-                    .wrapping_sub(fixed_head)
-                    & LOCAL_QUEUE_MASK;
+                let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
                 if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                     break;
                 }
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        self.route_chunk(worker, current_core, chunk, fixed_head);
+                        current_tail =
+                            self.route_chunk(worker, current_core, chunk, fixed_head, current_tail);
                     }
                     None => break,
                 }
@@ -1375,18 +1373,15 @@ impl DtaScheduler {
         // Poll the external mailbox last so external injection naturally yields
         // to internal CCX traffic when both are active.
         loop {
-            let cur_len = worker
-                .local_tail
-                .load(Ordering::Relaxed)
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
+            let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                 break;
             }
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    self.route_chunk(worker, current_core, chunk, fixed_head);
+                    current_tail =
+                        self.route_chunk(worker, current_core, chunk, fixed_head, current_tail);
                 }
                 None => break,
             }
@@ -1408,12 +1403,9 @@ impl DtaScheduler {
         current_core: usize,
         chunk: TaskChunk,
         fixed_head: usize,
-    ) {
-        let cur_len = worker
-            .local_tail
-            .load(Ordering::Relaxed)
-            .wrapping_sub(fixed_head)
-            & LOCAL_QUEUE_MASK;
+        current_tail: usize,
+    ) -> usize {
+        let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
         let space_ok = (cur_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
@@ -1425,18 +1417,26 @@ impl DtaScheduler {
         // functions and generate direct branches, rather than an indirect jump
         // through a function pointer array which introduces misprediction latency.
         if space_ok {
-            self.route_local(worker, current_core, chunk);
+            self.route_local(worker, current_core, chunk, current_tail)
         } else if hops_ok {
             self.route_deflect(worker, current_core, chunk);
+            current_tail
         } else {
             self.route_park(worker, current_core, chunk);
+            current_tail
         }
     }
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk) {
-        worker.push_batch(&chunk);
+    fn route_local(
+        &self,
+        worker: &mut Worker,
+        _core: usize,
+        chunk: TaskChunk,
+        current_tail: usize,
+    ) -> usize {
+        worker.push_batch(&chunk, current_tail)
     }
 
     /// This code path utilizes branchless programming to eliminate mispredictions.
