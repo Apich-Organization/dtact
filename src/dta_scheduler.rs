@@ -860,8 +860,7 @@ impl Worker {
         }
         // Relaxed: push_batch is only called from the local worker thread.
         let new_tail = end_idx & LOCAL_QUEUE_MASK;
-        self.local_tail
-            .store(new_tail, Ordering::Relaxed);
+        self.local_tail.store(new_tail, Ordering::Relaxed);
         new_tail
     }
 
@@ -1315,9 +1314,7 @@ impl DtaScheduler {
         let mut current_tail = worker.local_tail.load(Ordering::Relaxed);
 
         while drained < cap {
-            let cur_len = current_tail
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
+            let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
                 break;
             }
@@ -1358,16 +1355,15 @@ impl DtaScheduler {
 
             loop {
                 // Only reload local_tail; fixed_head is constant here.
-                let cur_len = current_tail
-                    .wrapping_sub(fixed_head)
-                    & LOCAL_QUEUE_MASK;
+                let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
                 if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                     break;
                 }
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        current_tail = self.route_chunk(worker, current_core, chunk, fixed_head, current_tail);
+                        current_tail =
+                            self.route_chunk(worker, current_core, chunk, fixed_head, current_tail);
                     }
                     None => break,
                 }
@@ -1377,16 +1373,15 @@ impl DtaScheduler {
         // Poll the external mailbox last so external injection naturally yields
         // to internal CCX traffic when both are active.
         loop {
-            let cur_len = current_tail
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
+            let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                 break;
             }
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    current_tail = self.route_chunk(worker, current_core, chunk, fixed_head, current_tail);
+                    current_tail =
+                        self.route_chunk(worker, current_core, chunk, fixed_head, current_tail);
                 }
                 None => break,
             }
@@ -1410,9 +1405,7 @@ impl DtaScheduler {
         fixed_head: usize,
         current_tail: usize,
     ) -> usize {
-        let cur_len = current_tail
-            .wrapping_sub(fixed_head)
-            & LOCAL_QUEUE_MASK;
+        let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
         let space_ok = (cur_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
@@ -1436,7 +1429,13 @@ impl DtaScheduler {
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk, current_tail: usize) -> usize {
+    fn route_local(
+        &self,
+        worker: &mut Worker,
+        _core: usize,
+        chunk: TaskChunk,
+        current_tail: usize,
+    ) -> usize {
         worker.push_batch(&chunk, current_tail)
     }
 
