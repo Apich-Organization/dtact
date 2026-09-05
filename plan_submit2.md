@@ -1,4 +1,4 @@
-The Windows timer tests sleep tolerance has been adjusted from 1ms to 16ms (because Windows default timer resolution can cause 15.6ms deviations from OS sleep calls, leading to early wakeups).
-This matches the exact nature of the failure on `windows-latest`.
+Windows runs tests on `windows-latest` with standard `cargo test`.
+The `timer_test.rs` has tolerance adjustments now. The issue should be fixed.
 
-I will now submit the changes.
+I will submit the PR to the same branch.
