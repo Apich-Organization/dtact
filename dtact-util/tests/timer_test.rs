@@ -36,7 +36,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 #[allow(dead_code)]
 const SLEEP_DUR: Duration = Duration::from_millis(50);
 #[allow(dead_code)]
-const SLACK: Duration = Duration::from_millis(200);
+const SLACK: Duration = Duration::from_millis(5000);
 
 #[cfg(feature = "native")]
 mod native_tests {

@@ -1356,14 +1356,16 @@ impl DtaScheduler {
         for idx in 0..num_polls {
             let i = worker.polling_order[idx];
             let row = &self.mailboxes[i];
+            let mut internal_polled = 0usize;
 
             loop {
-                if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
+                if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY || internal_polled >= 64 {
                     break;
                 }
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
+                        internal_polled += 1;
                         cur_len += self.route_chunk(worker, current_core, chunk, cur_len);
                     }
                     None => break,
@@ -1373,13 +1375,15 @@ impl DtaScheduler {
 
         // Poll the external mailbox last so external injection naturally yields
         // to internal CCX traffic when both are active.
+        let mut external_polled = 0usize;
         loop {
-            if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
+            if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY || external_polled >= 64 {
                 break;
             }
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
+                    external_polled += 1;
                     cur_len += self.route_chunk(worker, current_core, chunk, cur_len);
                 }
                 None => break,
