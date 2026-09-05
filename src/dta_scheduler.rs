@@ -1345,6 +1345,11 @@ impl DtaScheduler {
 
         // local_head is immutable during this function — cache it once.
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
+        let mut cur_len = worker
+            .local_tail
+            .load(Ordering::Relaxed)
+            .wrapping_sub(fixed_head)
+            & LOCAL_QUEUE_MASK;
         let mut received_any = false;
 
         let num_polls = worker.polling_order.len();
@@ -1353,19 +1358,13 @@ impl DtaScheduler {
             let row = &self.mailboxes[i];
 
             loop {
-                // Only reload local_tail; fixed_head is constant here.
-                let cur_len = worker
-                    .local_tail
-                    .load(Ordering::Relaxed)
-                    .wrapping_sub(fixed_head)
-                    & LOCAL_QUEUE_MASK;
                 if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                     break;
                 }
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        self.route_chunk(worker, current_core, chunk, fixed_head);
+                        cur_len += self.route_chunk(worker, current_core, chunk, cur_len);
                     }
                     None => break,
                 }
@@ -1375,18 +1374,13 @@ impl DtaScheduler {
         // Poll the external mailbox last so external injection naturally yields
         // to internal CCX traffic when both are active.
         loop {
-            let cur_len = worker
-                .local_tail
-                .load(Ordering::Relaxed)
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                 break;
             }
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    self.route_chunk(worker, current_core, chunk, fixed_head);
+                    cur_len += self.route_chunk(worker, current_core, chunk, cur_len);
                 }
                 None => break,
             }
@@ -1407,13 +1401,8 @@ impl DtaScheduler {
         worker: &mut Worker,
         current_core: usize,
         chunk: TaskChunk,
-        fixed_head: usize,
-    ) {
-        let cur_len = worker
-            .local_tail
-            .load(Ordering::Relaxed)
-            .wrapping_sub(fixed_head)
-            & LOCAL_QUEUE_MASK;
+        cur_len: usize,
+    ) -> usize {
         let space_ok = (cur_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
@@ -1425,25 +1414,28 @@ impl DtaScheduler {
         // functions and generate direct branches, rather than an indirect jump
         // through a function pointer array which introduces misprediction latency.
         if space_ok {
-            self.route_local(worker, current_core, chunk);
+            self.route_local(worker, current_core, chunk)
         } else if hops_ok {
-            self.route_deflect(worker, current_core, chunk);
+            self.route_deflect(worker, current_core, chunk)
         } else {
-            self.route_park(worker, current_core, chunk);
+            self.route_park(worker, current_core, chunk)
         }
     }
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk) {
+    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk) -> usize {
+        let count = chunk.count as usize;
         worker.push_batch(&chunk);
+        count
     }
 
     /// This code path utilizes branchless programming to eliminate mispredictions.
     /// Mark with `#[inline(always)]` to ensure the compiler optimizes the call site performance.
     #[inline(always)]
-    fn route_park(&self, _worker: &mut Worker, _core: usize, chunk: TaskChunk) {
+    fn route_park(&self, _worker: &mut Worker, _core: usize, chunk: TaskChunk) -> usize {
         let _ = self.park_in_warehouse(chunk);
+        0
     }
 
     /// This code path utilizes branchless programming to eliminate mispredictions.
@@ -1454,7 +1446,12 @@ impl DtaScheduler {
     /// is filtered out of `Worker::polling_order`), so anything routed there
     /// is permanently stranded.
     #[inline(always)]
-    fn route_deflect(&self, _worker: &mut Worker, current_core: usize, mut chunk: TaskChunk) {
+    fn route_deflect(
+        &self,
+        _worker: &mut Worker,
+        current_core: usize,
+        mut chunk: TaskChunk,
+    ) -> usize {
         chunk.hop_count = chunk.hop_count.saturating_add(1);
         let n = self.workers.len();
         let mut target = (current_core.wrapping_add(1 + chunk.hop_count as usize * 7)) % n;
@@ -1467,6 +1464,7 @@ impl DtaScheduler {
                 let _ = self.park_in_warehouse(c);
             }
         }
+        0
     }
 
     /// Main heartbeat loop for a hardware worker thread with cooperative shutdown.
