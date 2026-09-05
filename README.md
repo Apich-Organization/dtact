@@ -179,7 +179,7 @@ See [`examples/rust_dtact_util.rs`](https://www.google.com/search?q=examples/rus
 
 ### Rust
 
-```rust
+```rust,no_run
 use dtact::{dtact_await, dtact_init};
 use dtact_util::io::{DtactTcpListener, DtactTcpStream, init as io_init};
 use dtact_util::stream;

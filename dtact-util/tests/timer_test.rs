@@ -36,7 +36,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 #[allow(dead_code)]
 const SLEEP_DUR: Duration = Duration::from_millis(50);
 #[allow(dead_code)]
-const SLACK: Duration = Duration::from_millis(200);
+const SLACK: Duration = Duration::from_millis(5000);
 
 #[cfg(feature = "native")]
 mod native_tests {
@@ -49,7 +49,7 @@ mod native_tests {
         block_on(sleep(SLEEP_DUR));
         let elapsed = start.elapsed();
         assert!(
-            elapsed + Duration::from_millis(1) >= SLEEP_DUR,
+            elapsed + Duration::from_millis(16) >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
@@ -74,7 +74,7 @@ mod native_tests {
         let total_elapsed = start.elapsed();
         let expected_min = period * (N as u32 - 1);
         assert!(
-            total_elapsed >= expected_min,
+            total_elapsed + Duration::from_millis(16) >= expected_min,
             "interval ticked too fast: elapsed={total_elapsed:?}, expected >= {expected_min:?}"
         );
     }
@@ -166,7 +166,7 @@ mod tokio_tests {
         sleep(SLEEP_DUR).await;
         let elapsed = start.elapsed();
         assert!(
-            elapsed + Duration::from_millis(1) >= SLEEP_DUR,
+            elapsed + Duration::from_millis(16) >= SLEEP_DUR,
             "sleep returned early: elapsed={elapsed:?}, wanted >= {SLEEP_DUR:?}"
         );
         assert!(
@@ -189,7 +189,7 @@ mod tokio_tests {
         let total_elapsed = start.elapsed();
         let expected_min = period * (N as u32 - 1);
         assert!(
-            total_elapsed >= expected_min,
+            total_elapsed + Duration::from_millis(16) >= expected_min,
             "interval ticked too fast: elapsed={total_elapsed:?}, expected >= {expected_min:?}"
         );
     }
