@@ -880,7 +880,7 @@ pub extern "C" fn dtact_shutdown() {
 
         // Bump event_signal to break workers out of WFE/umwait standby.
         // Workers spinning in non-hw-accel mode will see shutdown on their next loop iteration.
-        for worker_cell in &runtime.scheduler.workers {
+        for worker_cell in &*runtime.scheduler.workers {
             let worker = unsafe { &*worker_cell.get() };
             worker
                 .event_signal
