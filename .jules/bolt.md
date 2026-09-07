@@ -1,3 +1,0 @@
-## 2026-09-07 - Track local_tail locally in poll_mailboxes
-**Learning:** In the highly contested `poll_mailboxes` loop within the Dtact scheduler, redundantly loading `local_tail` in every iteration to perform capacity checks causes unnecessary atomic operations, even if it is a `Relaxed` read, since the thread itself is the only one pushing tasks to the local queue.
-**Action:** Always check if a loop repeatedly reads an atomic variable representing a state mutated exclusively by the thread executing the loop. If so, hoist the load outside the loop, compute the state delta inside the loop (e.g., number of tasks added), and manually accumulate the state locally, avoiding redundant atomic loads without compromising queue safety limits.

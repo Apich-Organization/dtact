@@ -1308,19 +1308,18 @@ impl DtaScheduler {
 
         // local_head is immutable during this function — cache it once.
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
+        let mut current_tail = worker.local_tail.load(Ordering::Relaxed);
 
         while drained < cap {
-            let cur_len = worker
-                .local_tail
-                .load(Ordering::Relaxed)
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
+            let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE > LOCAL_QUEUE_HIGH_WATERMARK {
                 break;
             }
             match self.warehouse.pop() {
                 Some(chunk) => {
+                    let count = chunk.count as usize;
                     worker.push_batch(&chunk);
+                    current_tail = current_tail.wrapping_add(count);
                     drained += 1;
                 }
                 None => break,
