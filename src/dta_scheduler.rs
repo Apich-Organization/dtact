@@ -1335,16 +1335,16 @@ impl DtaScheduler {
     /// Returns `true` if at least one chunk was received from any mailbox,
     /// allowing the caller to detect activity without extra queue-length reads.
     ///
-    /// `local_head` is cached once before the polling loops because it does
-    /// not change here (we are only pushing work, not consuming). Only
-    /// `local_tail` is re-loaded per iteration, halving the atomic reads in
-    /// the capacity check compared to calling `local_queue_len()` each time.
+    /// `local_head` and `local_tail` are cached once before the polling loops.
+    /// Because we are the only thread pushing to the local queue, we can track
+    /// `local_tail` locally by accumulating the number of tasks added, completely
+    /// eliminating redundant atomic reads in the loop condition.
     #[inline(always)]
     pub fn poll_mailboxes(&self, current_core: usize) -> bool {
         let worker = unsafe { &mut *self.workers[current_core].get() };
 
-        // local_head is immutable during this function — cache it once.
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
+        let mut current_tail = worker.local_tail.load(Ordering::Relaxed);
         let mut received_any = false;
 
         let num_polls = worker.polling_order.len();
@@ -1353,19 +1353,15 @@ impl DtaScheduler {
             let row = &self.mailboxes[i];
 
             loop {
-                // Only reload local_tail; fixed_head is constant here.
-                let cur_len = worker
-                    .local_tail
-                    .load(Ordering::Relaxed)
-                    .wrapping_sub(fixed_head)
-                    & LOCAL_QUEUE_MASK;
+                let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
                 if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                     break;
                 }
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        self.route_chunk(worker, current_core, chunk, fixed_head);
+                        let added = self.route_chunk(worker, current_core, chunk, cur_len);
+                        current_tail = current_tail.wrapping_add(added);
                     }
                     None => break,
                 }
@@ -1375,18 +1371,15 @@ impl DtaScheduler {
         // Poll the external mailbox last so external injection naturally yields
         // to internal CCX traffic when both are active.
         loop {
-            let cur_len = worker
-                .local_tail
-                .load(Ordering::Relaxed)
-                .wrapping_sub(fixed_head)
-                & LOCAL_QUEUE_MASK;
+            let cur_len = current_tail.wrapping_sub(fixed_head) & LOCAL_QUEUE_MASK;
             if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                 break;
             }
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    self.route_chunk(worker, current_core, chunk, fixed_head);
+                    let added = self.route_chunk(worker, current_core, chunk, cur_len);
+                    current_tail = current_tail.wrapping_add(added);
                 }
                 None => break,
             }
@@ -1407,14 +1400,10 @@ impl DtaScheduler {
         worker: &mut Worker,
         current_core: usize,
         chunk: TaskChunk,
-        fixed_head: usize,
-    ) {
-        let cur_len = worker
-            .local_tail
-            .load(Ordering::Relaxed)
-            .wrapping_sub(fixed_head)
-            & LOCAL_QUEUE_MASK;
-        let space_ok = (cur_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
+        cur_len: usize,
+    ) -> usize {
+        let count = chunk.count as usize;
+        let space_ok = (cur_len + count) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
 
         //   no space, no hops left  → warehouse
@@ -1426,10 +1415,13 @@ impl DtaScheduler {
         // through a function pointer array which introduces misprediction latency.
         if space_ok {
             self.route_local(worker, current_core, chunk);
+            count
         } else if hops_ok {
             self.route_deflect(worker, current_core, chunk);
+            0
         } else {
             self.route_park(worker, current_core, chunk);
+            0
         }
     }
 
