@@ -45,11 +45,10 @@ pub fn load_theme() -> Theme {
 
 /// Applies the current theme to the document root element.
 pub fn apply_theme(theme: Theme) {
-    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-        if let Some(root) = doc.document_element() {
+    if let Some(doc) = web_sys::window().and_then(|w| w.document())
+        && let Some(root) = doc.document_element() {
             let _ = root.set_attribute("data-theme", theme.attr());
         }
-    }
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item("dtact_theme", theme.attr());
     }
