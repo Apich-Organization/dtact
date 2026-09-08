@@ -1,0 +1,3 @@
+## 2025-02-18 - Optimize redundant atomic loads in SPSC loops
+**Learning:** In high-frequency SPSC polling loops (like the scheduler mailboxes), the mutator thread was redundantly loading its own atomic tail pointer (`local_tail`) inside the loop, leading to suboptimal performance because the compiler cannot hoist the load when it doesn't know it's safe.
+**Action:** When a thread is the sole mutator of a state (like pushing to its own local queue), load the atomic state once before the loop, track the delta (e.g. counting tasks pushed via return values from helper functions), and accumulate it locally to avoid repeatedly reading the atomic variable.
