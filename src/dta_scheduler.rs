@@ -1446,7 +1446,12 @@ impl DtaScheduler {
     /// is filtered out of `Worker::polling_order`), so anything routed there
     /// is permanently stranded.
     #[inline(always)]
-    fn route_deflect(&self, _worker: &mut Worker, current_core: usize, mut chunk: TaskChunk) -> usize {
+    fn route_deflect(
+        &self,
+        _worker: &mut Worker,
+        current_core: usize,
+        mut chunk: TaskChunk,
+    ) -> usize {
         chunk.hop_count = chunk.hop_count.saturating_add(1);
         let n = self.workers.len();
         let mut target = (current_core.wrapping_add(1 + chunk.hop_count as usize * 7)) % n;
