@@ -1,0 +1,3 @@
+## 2024-05-18 - Avoid redundant atomic reads in SPSC/MPMC queues
+**Learning:** In hot polling loops (`poll_mailboxes`, `drain_warehouse`), repeatedly reading `local_tail` using `AtomicUsize::load(Ordering::Relaxed)` can be expensive even if it is only mutated by the current thread.
+**Action:** When tracking changes to the queue length during a batch pop/push operation in high-frequency loops, compute the length locally (`cur_len`) outside the loop and increment it locally by the exact delta of tasks added instead of repeating the atomic read. This minimizes memory bandwidth usage without bypassing safety bounds.
