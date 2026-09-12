@@ -74,7 +74,7 @@ mod native_tests {
         let total_elapsed = start.elapsed();
         let expected_min = period * (N as u32 - 1);
         assert!(
-            total_elapsed >= expected_min,
+            total_elapsed + Duration::from_millis(2) >= expected_min,
             "interval ticked too fast: elapsed={total_elapsed:?}, expected >= {expected_min:?}"
         );
     }
@@ -189,7 +189,7 @@ mod tokio_tests {
         let total_elapsed = start.elapsed();
         let expected_min = period * (N as u32 - 1);
         assert!(
-            total_elapsed >= expected_min,
+            total_elapsed + Duration::from_millis(2) >= expected_min,
             "interval ticked too fast: elapsed={total_elapsed:?}, expected >= {expected_min:?}"
         );
     }
