@@ -170,7 +170,10 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 
 /// Switches execution context while preserving floating-point state (Unix AArch64).
 ///
-/// Implements BTI and PAC protection. Preserves x19-x30 and SIMD d8-d15 (q8-q15 saved).
+/// Implements BTI and PAC protection. Preserves x19-x30, SIMD d8-d15
+/// (q8-q15 saved), and FPCR (the exception-trap-enable/rounding-mode
+/// control register — stored at offset 104, the gap between the GPR block
+/// ending at 96+8 and the SIMD block starting at 128).
 ///
 /// # Arguments
 /// * `save` (x0): Pointer to `Registers`.
@@ -206,6 +209,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "stp x29, x30, [x0, 80]",
         "mov x9, sp",
         "str x9, [x0, 96]",
+        "mrs x9, fpcr",
+        "str x9, [x0, 104]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -216,6 +221,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "ldp x25, x26, [x1, 48]",
         "ldp x27, x28, [x1, 64]",
         "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 104]",
+        "msr fpcr, x9",
         "ldr x9, [x1, 96]",
         "mov sp, x9",
         "ldp d8,  d9,  [x1, 128]",
@@ -228,7 +235,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 
 /// Switches execution context while preserving floating-point state (Unix AArch64).
 ///
-/// Implements BTI and PAC protection. Preserves x19-x30 and SIMD d8-d15 (q8-q15 saved).
+/// Implements BTI and PAC protection. Preserves x19-x30, SIMD d8-d15
+/// (q8-q15 saved), and FPCR (stored at offset 104 — see the non-hardened
+/// variant's doc comment above for why that offset is safe to use).
 ///
 /// # Arguments
 /// * `save` (x0): Pointer to `Registers`.
@@ -266,6 +275,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "stp x29, x30, [x0, 80]",
         "mov x9, sp",
         "str x9, [x0, 96]",
+        "mrs x9, fpcr",
+        "str x9, [x0, 104]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -276,6 +287,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "ldp x25, x26, [x1, 48]",
         "ldp x27, x28, [x1, 64]",
         "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 104]",
+        "msr fpcr, x9",
         "ldr x9, [x1, 96]",
         "mov sp, x9",
         "ldp d8,  d9,  [x1, 128]",
@@ -291,6 +304,9 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 ///
 /// Adheres to Apple Silicon's security model by using BTI and PAC.
 /// This implementation signs the link register using the SP as a modifier.
+/// Also preserves FPCR (stored at offset 104 — see
+/// `switch_context_cross_thread_float`'s plain-Unix doc comment above for
+/// why that offset is safe to use).
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
@@ -319,6 +335,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "stp x29, x30, [x0, 80]",
         "mov x9, sp",
         "str x9, [x0, 96]",
+        "mrs x9, fpcr",
+        "str x9, [x0, 104]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -333,6 +351,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "ldp x25, x26, [x1, 48]",
         "ldp x27, x28, [x1, 64]",
         "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 104]",
+        "msr fpcr, x9",
         "ldr x9, [x1, 96]",
         "mov sp, x9",
         "autiasp",
@@ -343,7 +363,10 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 /// Switches execution context while preserving floating-point and Windows TEB state (AArch64).
 ///
 /// Complies with the Windows on ARM64 ABI, preserving x18 (TEB pointer) and updating
-/// stack metadata fields within the TEB.
+/// stack metadata fields within the TEB. Also preserves FPCR — stored at
+/// offset 192 (`extended_state` byte 64, right after the d8-d15 block)
+/// rather than the 104/112/120 gap the other AArch64 variants use for it,
+/// since this variant's TEB fields already occupy that gap entirely.
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
@@ -378,6 +401,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "str x9, [x0, #112]",
         "ldr x9, [x18, #0x12C8]",
         "str x9, [x0, #120]",
+        "mrs x9, fpcr",
+        "str x9, [x0, #192]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -386,6 +411,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "ldp d10, d11, [x1, 144]",
         "ldp d12, d13, [x1, 160]",
         "ldp d14, d15, [x1, 176]",
+        "ldr x9, [x1, #192]",
+        "msr fpcr, x9",
         "ldr x9, [x1, #104]",
         "str x9, [x18, #0x08]",
         "ldr x9, [x1, #112]",
@@ -406,6 +433,16 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 }
 
 /// RISC-V 64-bit switch with hardware-level prefetching.
+///
+/// Preserves `fcsr` (rounding mode / accumulated exception flags) at
+/// offset 112 — the gap between the GPR block ending at 104+8 and the
+/// `fs0`-`fs11` block starting at 128. RISC-V's F/D extension never traps
+/// on floating-point exceptions (they only ever accumulate as sticky
+/// `fflags` bits, checked by software), so unlike the `x86_64`/AArch64
+/// fixes in this file this isn't closing a crash hazard — it's purely
+/// correctness/determinism: without this, a fiber that changes the
+/// rounding mode would leak that change to whatever runs next on this
+/// thread instead of it reverting when the fiber switches out.
 #[cfg(all(target_arch = "riscv64", unix, feature = "hw-acceleration"))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_cross_thread_float(
@@ -434,6 +471,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "sd s10, 88(a0)",
         "sd s11, 96(a0)",
         "sd ra, 104(a0)",
+        "frcsr t0",
+        "sd t0, 112(a0)",
         "fsd fs0, 128(a0)",
         "fsd fs1, 136(a0)",
         "fsd fs2, 144(a0)",
@@ -460,6 +499,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "ld s10, 88(a1)",
         "ld s11, 96(a1)",
         "ld ra, 104(a1)",
+        "ld t0, 112(a1)",
+        "fscsr t0",
         "fld fs0, 128(a1)",
         "fld fs1, 136(a1)",
         "fld fs2, 144(a1)",
@@ -476,6 +517,11 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     );
 }
 
+/// RISC-V 64-bit switch without hardware-level prefetching.
+///
+/// Preserves `fcsr` at offset 112 — see the hw-acceleration variant above
+/// for why this is a determinism fix, not a crash fix (RISC-V never traps
+/// floating-point exceptions).
 #[cfg(all(target_arch = "riscv64", unix, not(feature = "hw-acceleration")))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_cross_thread_float(
@@ -497,6 +543,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "sd s10, 88(a0)",
         "sd s11, 96(a0)",
         "sd ra, 104(a0)",
+        "frcsr t0",
+        "sd t0, 112(a0)",
         "fsd fs0, 128(a0)",
         "fsd fs1, 136(a0)",
         "fsd fs2, 144(a0)",
@@ -523,6 +571,8 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
         "ld s10, 88(a1)",
         "ld s11, 96(a1)",
         "ld ra, 104(a1)",
+        "ld t0, 112(a1)",
+        "fscsr t0",
         "fld fs0, 128(a1)",
         "fld fs1, 136(a1)",
         "fld fs2, 144(a1)",
@@ -1062,7 +1112,9 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 
 /// Lightweight context switch for fibers pinned to the current thread (Unix AArch64).
 ///
-/// Skips TIB/TEB metadata preservation but maintains BTI and PAC security.
+/// Skips TIB/TEB metadata preservation but maintains BTI and PAC security,
+/// and preserves FPCR (offset 104 — see `switch_context_cross_thread_float`'s
+/// plain-Unix doc comment above for why that offset is safe to use).
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
@@ -1094,6 +1146,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "stp x29, x30, [x0, 80]",
         "mov x9, sp",
         "str x9, [x0, 96]",
+        "mrs x9, fpcr",
+        "str x9, [x0, 104]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -1104,6 +1158,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "ldp x25, x26, [x1, 48]",
         "ldp x27, x28, [x1, 64]",
         "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 104]",
+        "msr fpcr, x9",
         "ldr x9, [x1, 96]",
         "mov sp, x9",
         "ldp d8,  d9,  [x1, 128]",
@@ -1116,7 +1172,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 
 /// Lightweight context switch for fibers pinned to the current thread (Unix AArch64).
 ///
-/// Skips TIB/TEB metadata preservation but maintains BTI and PAC security.
+/// Skips TIB/TEB metadata preservation but maintains BTI and PAC security,
+/// and preserves FPCR (offset 104).
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
@@ -1150,6 +1207,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "stp x29, x30, [x0, 80]",
         "mov x9, sp",
         "str x9, [x0, 96]",
+        "mrs x9, fpcr",
+        "str x9, [x0, 104]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -1160,6 +1219,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "ldp x25, x26, [x1, 48]",
         "ldp x27, x28, [x1, 64]",
         "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 104]",
+        "msr fpcr, x9",
         "ldr x9, [x1, 96]",
         "mov sp, x9",
         "ldp d8,  d9,  [x1, 128]",
@@ -1172,6 +1233,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 }
 
 /// macOS AArch64: PAC-compliant same-thread float switch.
+///
+/// Also preserves FPCR (offset 104).
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
@@ -1200,6 +1263,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "stp x29, x30, [x0, 80]",
         "mov x9, sp",
         "str x9, [x0, 96]",
+        "mrs x9, fpcr",
+        "str x9, [x0, 104]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -1210,6 +1275,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "ldp x25, x26, [x1, 48]",
         "ldp x27, x28, [x1, 64]",
         "ldp x29, x30, [x1, 80]",
+        "ldr x9, [x1, 104]",
+        "msr fpcr, x9",
         "ldr x9, [x1, 96]",
         "mov sp, x9",
         "ldp d8,  d9,  [x1, 128]",
@@ -1223,7 +1290,10 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 
 /// Context switch for same-thread fibers with TEB and float state (Windows AArch64).
 ///
-/// Preserves TEB stack metadata, callee-saved GPRs, and d8-d15.
+/// Preserves TEB stack metadata, callee-saved GPRs, d8-d15, and FPCR
+/// (offset 192 — see `switch_context_cross_thread_float`'s Windows AArch64
+/// doc comment above for why that offset, not the 104/112/120 gap the
+/// other AArch64 variants use).
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
@@ -1257,6 +1327,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "str x9, [x0, #112]",
         "ldr x9, [x18, #0x12C8]",
         "str x9, [x0, #120]",
+        "mrs x9, fpcr",
+        "str x9, [x0, #192]",
         "stp d8,  d9,  [x0, 128]",
         "stp d10, d11, [x0, 144]",
         "stp d12, d13, [x0, 160]",
@@ -1265,6 +1337,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "ldp d10, d11, [x1, 144]",
         "ldp d12, d13, [x1, 160]",
         "ldp d14, d15, [x1, 176]",
+        "ldr x9, [x1, #192]",
+        "msr fpcr, x9",
         "ldr x9, [x1, #104]",
         "str x9, [x18, #0x08]",
         "ldr x9, [x1, #112]",
@@ -1316,6 +1390,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "sd s10, 88(a0)",
         "sd s11, 96(a0)",
         "sd ra, 104(a0)",
+        "frcsr t0",
+        "sd t0, 112(a0)",
         "fsd fs0, 128(a0)",
         "fsd fs1, 136(a0)",
         "fsd fs2, 144(a0)",
@@ -1342,6 +1418,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "ld s10, 88(a1)",
         "ld s11, 96(a1)",
         "ld ra, 104(a1)",
+        "ld t0, 112(a1)",
+        "fscsr t0",
         "fld fs0, 128(a1)",
         "fld fs1, 136(a1)",
         "fld fs2, 144(a1)",
@@ -1359,6 +1437,9 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 }
 
 /// Lightweight context switch for fibers pinned to the current thread (RISC-V 64).
+///
+/// Preserves `fcsr` at offset 112 (see the hw-acceleration
+/// `switch_context_cross_thread_float` doc comment for why).
 ///
 /// # Arguments
 /// * `save` (a0): Pointer to `Registers`.
@@ -1384,6 +1465,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "sd s10, 88(a0)",
         "sd s11, 96(a0)",
         "sd ra, 104(a0)",
+        "frcsr t0",
+        "sd t0, 112(a0)",
         "fsd fs0, 128(a0)",
         "fsd fs1, 136(a0)",
         "fsd fs2, 144(a0)",
@@ -1410,6 +1493,8 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
         "ld s10, 88(a1)",
         "ld s11, 96(a1)",
         "ld ra, 104(a1)",
+        "ld t0, 112(a1)",
+        "fscsr t0",
         "fld fs0, 128(a1)",
         "fld fs1, 136(a1)",
         "fld fs2, 144(a1)",

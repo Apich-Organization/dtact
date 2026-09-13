@@ -30,12 +30,60 @@ pub(crate) struct Registers {
 }
 
 impl Registers {
-    /// Creates a new, zeroed register set.
+    /// Creates a new register set, with a sane default MXCSR on `x86_64`.
+    ///
+    /// # The bug this fixes
+    /// The `*_float` switchers in `context_switch.rs` (both cross-thread
+    /// and same-thread; the `*_no_float` switchers never touch this state
+    /// at all — that is the entire point of "no float") store the SSE
+    /// control word (MXCSR) inside `gprs` on `x86_64` — Unix at `gprs[8]`
+    /// (byte offset 64), Windows at `gprs[14]` (byte offset 112, alongside
+    /// the extra TIB/XMM6-15 state that ABI requires) — and `ldmxcsr` it
+    /// into the live CPU register on every switch. MXCSR's six
+    /// exception-mask bits use **inverted** polarity from what a zeroed
+    /// word usually means: `1` = masked (disabled, the safe default), `0`
+    /// = unmasked (that exception class traps immediately on the next
+    /// occurrence). A context that has never yet been switched into — i.e.
+    /// every freshly allocated `FiberContext` slot, the common case for
+    /// any newly spawned fiber — previously carried a zeroed `gprs`, so
+    /// its first dispatch loaded MXCSR `0x00000000`: every exception class
+    /// unmasked, including "precision" (inexact), which fires on nearly
+    /// every non-exact floating-point result. The very first non-trivial
+    /// float operation that fiber (or, transitively, anything running on
+    /// that same OS thread before it switches back) performs then
+    /// reliably raises `SIGFPE`.
+    ///
+    /// `0x1F80` is the standard SSE reset value: all six exception classes
+    /// masked, round-to-nearest, denormals-are-zero/flush-to-zero off —
+    /// the same default every thread on the process's main stack already
+    /// runs under, so a first-ever fiber dispatch now behaves identically
+    /// to ordinary code instead of silently arming a crash.
+    ///
+    /// `AArch64`'s FPCR and RISC-V's `fcsr` do not have this hazard: `AArch64`
+    /// FPCR's trap-enable bits default to *disabled* at `0` (the opposite
+    /// polarity from MXCSR, so zero-init is already safe there), and
+    /// RISC-V's F/D extension does not trap floating-point exceptions at
+    /// all in the base ISA (they only accumulate as sticky `fflags` bits,
+    /// checked by software, never delivered as a signal) — so neither
+    /// needs the equivalent of this fix.
     #[must_use]
     #[inline(always)]
     pub(crate) const fn new() -> Self {
+        // `mut` is only exercised on `x86_64` (the two `cfg` blocks below);
+        // AArch64 and RISC-V need no special-cased slot, since neither has
+        // this hazard (see the module-level doc comment above).
+        #[allow(unused_mut)]
+        let mut gprs = [0u64; 16];
+        #[cfg(all(target_arch = "x86_64", unix))]
+        {
+            gprs[8] = 0x0000_0000_0000_1F80;
+        }
+        #[cfg(all(target_arch = "x86_64", windows))]
+        {
+            gprs[14] = 0x0000_0000_0000_1F80;
+        }
         Self {
-            gprs: [0; 16],
+            gprs,
             extended_state: [0; 512],
         }
     }
