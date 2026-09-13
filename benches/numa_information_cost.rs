@@ -69,6 +69,8 @@ impl Workload {
     }
 }
 
+type TopologyFactory = fn(usize) -> Topology;
+
 struct RunResult {
     snapshot: Snapshot,
     elapsed: Duration,
@@ -234,9 +236,6 @@ fn main() {
          claim (load-balance quality across workers), independent of acquisition cost."
     );
 
-    type TopologyFactory = fn(usize) -> Topology;
-
-    let worker_counts = [8usize, 16, 32, 64];
     let topologies: [(&str, TopologyFactory); 2] = [
         ("flat", Topology::flat),
         ("dual_socket", Topology::dual_socket),
@@ -247,11 +246,47 @@ fn main() {
         Workload::Uts(UtsParams::unbalanced()),
     ];
 
+    let physical_cores = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
+
+    println!(
+        "\n# === Section 1: N <= {physical_cores} (this machine's physical core count) ===\n\
+         # Every worker gets its own real core: 1:1 with the paper's implicit\n\
+         # assumption that a \"worker\" is a hardware execution context, not an\n\
+         # oversubscribed OS thread. This is the primary comparison for validating\n\
+         # the acquisition-cost closed forms (beta_DTA, beta_WS) and the gamma*\n\
+         # crossover claim."
+    );
+    let in_core_counts: Vec<usize> = [2usize, 4, 6, 8]
+        .into_iter()
+        .filter(|&n| n <= physical_cores)
+        .collect();
     print_header();
-    for &n in &worker_counts {
-        for (topo_name, topo_fn) in topologies {
+    run_sweep(&in_core_counts, &topologies, &workloads);
+
+    println!(
+        "\n# === Section 2: N > {physical_cores} (oversubscription stress test) ===\n\
+         # OS-thread oversubscription, not real additional parallelism. Included\n\
+         # to characterize how each scheduler's *implementation* (not the paper's\n\
+         # cost model, which only speaks to acquisition cost per completed task)\n\
+         # degrades when there are more schedulable workers than hardware\n\
+         # contexts to run them on. A large gap between the two schedulers here\n\
+         # is a scalability finding about the code, separate from the\n\
+         # information-acquisition-rate claim Section 1 addresses."
+    );
+    let oversubscribed_counts = [16usize, 32, 64];
+    print_header();
+    run_sweep(&oversubscribed_counts, &topologies, &workloads);
+}
+
+fn run_sweep(
+    worker_counts: &[usize],
+    topologies: &[(&str, TopologyFactory)],
+    workloads: &[Workload],
+) {
+    for &n in worker_counts {
+        for &(topo_name, topo_fn) in topologies {
             let topology = topo_fn(n);
-            for workload in workloads {
+            for &workload in workloads {
                 let dta = run_dta(topology, workload);
                 print_row(
                     n,

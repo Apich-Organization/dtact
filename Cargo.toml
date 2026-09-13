@@ -112,3 +112,13 @@ harness = false
 name = "numa_information_cost"
 harness = false
 required-features = ["benchmark"]
+
+[[bench]]
+name = "dta_task_overhead"
+harness = false
+required-features = ["benchmark"]
+
+[[bench]]
+name = "dta_deflect_overhead"
+harness = false
+required-features = ["benchmark"]

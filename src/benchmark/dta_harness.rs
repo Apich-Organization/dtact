@@ -32,6 +32,42 @@ use super::workloads::TaskSpawner;
 /// both sides of the comparison store and invoke tasks identically.
 pub type Task = Box<dyn FnOnce(&DtaHarness) + Send>;
 
+/// Upper bound on how many free-list nodes one batch refill/donate moves
+/// per CAS. Mirrors `MAX_LOCAL_BATCH` in `src/memory_management.rs`, kept
+/// as a separate constant since this file deliberately doesn't depend on
+/// production `ContextPool` internals (see `TaskSlab`'s doc comment).
+const MAX_LOCAL_BATCH: usize = 32;
+/// Maximum number of distinct worker ids that get a private batch cache.
+/// Mirrors `MAX_CACHED_WORKERS` in `src/memory_management.rs`.
+const MAX_CACHED_WORKERS: usize = 128;
+
+/// A per-worker cache of free [`TaskSlab`] indices, sitting in front of the
+/// shared free list to amortize its CAS cost — mirrors
+/// `memory_management::LocalFreeCache`; kept as a separate type (rather
+/// than reused across the module boundary) for the same reason `TaskSlab`
+/// as a whole is a parallel implementation rather than a dependency on
+/// production `ContextPool`: this benchmark's own per-task cost must stand
+/// on its own, not accidentally inherit unrelated production code changes.
+///
+/// # Safety invariant
+/// Never touched by more than one thread at a time: only ever accessed via
+/// `TaskSlab::local_caches[worker_id]`, where `worker_id` comes from
+/// [`crate::future_bridge::CURRENT_WORKER_ID`] — set once, for its whole
+/// life, by [`DtaHarness::worker_loop`].
+struct LocalFreeCache {
+    slots: [u32; MAX_LOCAL_BATCH * 2],
+    len: u32,
+}
+
+impl LocalFreeCache {
+    const fn new() -> Self {
+        Self {
+            slots: [0; MAX_LOCAL_BATCH * 2],
+            len: 0,
+        }
+    }
+}
+
 /// A fixed-capacity slot table mapping [`TaskIndex`] to a pending [`Task`]
 /// closure, with a lock-free free-list — the same generation-free CAS-loop
 /// free-list pattern `ContextPool::alloc_context`/`free_context` use in
@@ -41,14 +77,18 @@ pub type Task = Box<dyn FnOnce(&DtaHarness) + Send>;
 /// would tax every DTA-side task cycle with a lock/unlock pair that
 /// `crossbeam-deque` (storing its boxed task directly, lock-free) never
 /// pays on the WS side, unfairly biasing the wall-clock comparison this
-/// module exists to make.
+/// module exists to make. As of the per-worker `LocalFreeCache` above, it
+/// also mirrors `ContextPool`'s batched-refill/donate optimization, so this
+/// benchmark stays an accurate proxy for `ContextPool`'s real cost rather
+/// than a stale, pessimistic one.
 ///
 /// # Safety invariant
 /// A slot index is, at every point in time, owned by exactly one of: the
-/// free list, or whichever call to [`Self::store`] most recently produced
-/// it (until the matching [`Self::take`] call, after which it returns to
-/// the free list). The free-list CAS protocol below enforces this, so the
-/// `UnsafeCell` access in `store`/`take` never races.
+/// free list (shared or a worker's local cache), or whichever call to
+/// [`Self::store`] most recently produced it (until the matching
+/// [`Self::take`] call, after which it returns to a free list). The
+/// free-list CAS protocol below enforces this, so the `UnsafeCell` access
+/// in `store`/`take` never races.
 ///
 /// Deliberately excluded from the [`AcquisitionMeter`]: the preprint's β
 /// model is about scheduling information-acquisition cost, not the
@@ -59,6 +99,8 @@ struct TaskSlab {
     free_head: AtomicU64,
     next_free: Vec<AtomicU64>,
     bump: AtomicU64,
+    local_caches: Box<[UnsafeCell<LocalFreeCache>]>,
+    batch_size: u32,
 }
 
 // SAFETY: see the struct-level safety invariant — `UnsafeCell` access in
@@ -67,26 +109,84 @@ unsafe impl Sync for TaskSlab {}
 
 impl TaskSlab {
     fn new(capacity: usize) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        let batch_size = ((capacity / 8) as u32).clamp(1, MAX_LOCAL_BATCH as u32);
+        let local_caches = (0..MAX_CACHED_WORKERS)
+            .map(|_| UnsafeCell::new(LocalFreeCache::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             slots: (0..capacity).map(|_| UnsafeCell::new(None)).collect(),
             free_head: AtomicU64::new(u64::MAX),
             next_free: (0..capacity).map(|_| AtomicU64::new(u64::MAX)).collect(),
             bump: AtomicU64::new(0),
+            local_caches,
+            batch_size,
         }
     }
 
-    /// Stores `task` in a free slot and returns its index.
+    /// Stores `task` in a free slot and returns its index. Pops from this
+    /// worker's local batch cache when possible (see [`LocalFreeCache`]),
+    /// falling back to the shared free list directly (one CAS,
+    /// [`Self::pop_global`]) for callers with no cache slot of their own,
+    /// and finally bump-allocating a fresh slot when nothing has been
+    /// freed yet.
     ///
     /// # Panics
     /// Panics if the slab's fixed capacity is exhausted (a run that needs
     /// more concurrently in-flight tasks than the harness was configured
     /// for — raise the capacity passed to [`DtaHarness::new`]).
     fn store(&self, task: Task) -> TaskIndex {
-        // Try the free-list first (Treiber-stack pop).
+        let worker_id = crate::future_bridge::CURRENT_WORKER_ID.with(core::cell::Cell::get);
+        let claimed = if worker_id < MAX_CACHED_WORKERS {
+            // SAFETY: see `LocalFreeCache`'s doc comment — `worker_id`
+            // uniquely identifies the one live OS thread that ever touches
+            // this slot.
+            let cache = unsafe { &mut *self.local_caches[worker_id].get() };
+            if cache.len == 0 {
+                self.refill_batch(cache);
+            }
+            if cache.len > 0 {
+                cache.len -= 1;
+                Some(cache.slots[cache.len as usize] as usize)
+            } else {
+                None
+            }
+        } else {
+            self.pop_global()
+        };
+
+        let idx = claimed.unwrap_or_else(|| {
+            // Free list (and this worker's cache) empty: bump-allocate a
+            // fresh slot — never handed out before, so no other caller can
+            // be touching it.
+            let bumped = self.bump.fetch_add(1, Ordering::Relaxed);
+            #[allow(clippy::cast_possible_truncation)]
+            let bumped_usize = bumped as usize;
+            assert!(
+                bumped_usize < self.slots.len(),
+                "DtaHarness TaskSlab exhausted ({} slots) — raise the capacity",
+                self.slots.len()
+            );
+            bumped_usize
+        });
+
+        // SAFETY: `idx` was either just claimed exclusively from a free
+        // list/cache, or freshly bump-allocated — either way, no other
+        // caller can be touching this slot.
+        unsafe { *self.slots[idx].get() = Some(task) };
+        #[allow(clippy::cast_possible_truncation)]
+        let idx_u32 = idx as TaskIndex;
+        idx_u32
+    }
+
+    /// Uncached single-node pop directly from the shared free list, one CAS
+    /// per call — today's original `store` free-list step, unchanged.
+    fn pop_global(&self) -> Option<usize> {
         let mut head = self.free_head.load(Ordering::Acquire);
         loop {
             if head == u64::MAX {
-                break;
+                return None;
             }
             #[allow(clippy::cast_possible_truncation)]
             let idx = head as usize;
@@ -97,35 +197,108 @@ impl TaskSlab {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    // SAFETY: winning this CAS is what grants exclusive
-                    // ownership of slot `idx` (struct-level invariant).
-                    unsafe { *self.slots[idx].get() = Some(task) };
-                    #[allow(clippy::cast_possible_truncation)]
-                    return idx as TaskIndex;
-                }
+                Ok(_) => return Some(idx),
                 Err(actual) => head = actual,
             }
         }
-        // Free-list empty: bump-allocate a fresh slot.
-        let idx = self.bump.fetch_add(1, Ordering::Relaxed);
-        #[allow(clippy::cast_possible_truncation)]
-        let idx_usize = idx as usize;
-        assert!(
-            idx_usize < self.slots.len(),
-            "DtaHarness TaskSlab exhausted ({} slots) — raise the capacity",
-            self.slots.len()
-        );
-        // SAFETY: a freshly bump-allocated index has never been handed out
-        // before, so no other caller can be touching this slot.
-        unsafe { *self.slots[idx_usize].get() = Some(task) };
-        #[allow(clippy::cast_possible_truncation)]
-        let idx_u32 = idx as TaskIndex;
-        idx_u32
     }
 
-    /// Takes ownership of the task at `index`, returning it to the free
-    /// list for reuse.
+    /// Uncached single-node push directly onto the shared free list, one
+    /// CAS per call — today's original `take` free-list step, unchanged.
+    fn push_global(&self, index: TaskIndex) {
+        let idx = index as usize;
+        let mut head = self.free_head.load(Ordering::Relaxed);
+        loop {
+            self.next_free[idx].store(head, Ordering::Relaxed);
+            match self.free_head.compare_exchange_weak(
+                head,
+                u64::from(index),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => head = actual,
+            }
+        }
+    }
+
+    /// Refills `cache` from the shared free list: walks up to
+    /// `self.batch_size` `next_free` links, then swings `free_head` past
+    /// the whole run with **one** CAS. Mirrors
+    /// `memory_management::ContextPool::refill_batch`.
+    fn refill_batch(&self, cache: &mut LocalFreeCache) {
+        let want = self.batch_size as usize;
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            if head == u64::MAX {
+                return; // shared list exhausted
+            }
+            let mut cursor = head;
+            let mut collected = 0usize;
+            while collected < want && cursor != u64::MAX {
+                #[allow(clippy::cast_possible_truncation)]
+                let cursor_u32 = cursor as u32;
+                cache.slots[collected] = cursor_u32;
+                collected += 1;
+                #[allow(clippy::cast_possible_truncation)]
+                let cursor_usize = cursor as usize;
+                cursor = self.next_free[cursor_usize].load(Ordering::Relaxed);
+            }
+            // `cursor` is now the first node NOT claimed (possibly u64::MAX).
+            let cas = self.free_head.compare_exchange_weak(
+                head,
+                cursor,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            if cas.is_ok() {
+                #[allow(clippy::cast_possible_truncation)]
+                let collected_u32 = collected as u32;
+                cache.len = collected_u32;
+                return;
+            }
+            // List changed under us — fall through to retry the walk from the fresh head.
+        }
+    }
+
+    /// Donates `self.batch_size` slots from `cache` back to the shared free
+    /// list with **one** CAS. Mirrors
+    /// `memory_management::ContextPool::donate_batch`.
+    fn donate_batch(&self, cache: &mut LocalFreeCache) {
+        let n = self.batch_size as usize;
+        debug_assert!(cache.len as usize >= n);
+        let start = cache.len as usize - n;
+
+        for i in start..start + n - 1 {
+            let idx = cache.slots[i] as usize;
+            self.next_free[idx].store(u64::from(cache.slots[i + 1]), Ordering::Relaxed);
+        }
+        let chain_head = cache.slots[start];
+        let tail_idx = cache.slots[start + n - 1] as usize;
+
+        let mut head = self.free_head.load(Ordering::Relaxed);
+        loop {
+            self.next_free[tail_idx].store(head, Ordering::Relaxed);
+            match self.free_head.compare_exchange_weak(
+                head,
+                u64::from(chain_head),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => head = actual,
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let n_u32 = n as u32;
+        cache.len -= n_u32;
+    }
+
+    /// Takes ownership of the task at `index`, returning it to this
+    /// worker's local batch cache (see [`LocalFreeCache`]) — donating a
+    /// batch back to the shared free list when the cache fills up. Callers
+    /// with no cache slot of their own fall back to [`Self::push_global`]
+    /// directly.
     fn take(&self, index: TaskIndex) -> Task {
         let idx = index as usize;
         // SAFETY: the caller holds `index` because it was just popped from
@@ -135,18 +308,18 @@ impl TaskSlab {
         let task = unsafe { &mut *self.slots[idx].get() }
             .take()
             .expect("DtaHarness TaskSlab: double-take on a task index");
-        let mut head = self.free_head.load(Ordering::Relaxed);
-        loop {
-            self.next_free[idx].store(head, Ordering::Relaxed);
-            match self.free_head.compare_exchange_weak(
-                head,
-                index.into(),
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => head = actual,
+
+        let worker_id = crate::future_bridge::CURRENT_WORKER_ID.with(core::cell::Cell::get);
+        if worker_id < MAX_CACHED_WORKERS {
+            // SAFETY: see `LocalFreeCache`'s doc comment.
+            let cache = unsafe { &mut *self.local_caches[worker_id].get() };
+            if cache.len as usize == 2 * self.batch_size as usize {
+                self.donate_batch(cache);
             }
+            cache.slots[cache.len as usize] = index;
+            cache.len += 1;
+        } else {
+            self.push_global(index);
         }
         task
     }
@@ -303,6 +476,52 @@ impl DtaHarness {
             }
         }
     }
+}
+
+/// Measures the real, single-threaded (uncontended) cost of one
+/// [`TaskSlab::store`] + [`TaskSlab::take`] round trip on the *cached* fast
+/// path (worker id 0, mirroring `ContextPool`'s per-worker
+/// `LocalFreeCache` optimization) — the indirection every DTA-harness task
+/// pays that a directly-stored `crossbeam-deque` task (the WS baseline)
+/// does not, and which the preprint's `β_DTA` formula (`paper/main.tex` eq.
+/// `beta_dta_num`, a flat `c_SPSC` per task) does not model at all: the
+/// paper's cost accounting is about moving a task *reference* between
+/// workers' queues, not about resolving that reference to its payload.
+/// This exists to let `benches/numa_information_cost.rs` attribute how
+/// much of DTA's measured wall-clock overhead (over the WS baseline) this
+/// specific indirection tax accounts for, separate from the
+/// scheduling/mailbox traffic itself.
+///
+/// Uses a 64-slot capacity (`batch_size = 8`, see `TaskSlab::new`) so the
+/// cached path's batching actually engages rather than degenerating to the
+/// same per-op-CAS cost a tiny pool would clamp down to.
+///
+/// Returns the mean nanoseconds per store+take round trip over
+/// `iterations` repetitions on the calling thread (single-threaded: the
+/// free list's CAS loop never actually contends with itself here, so this
+/// is TaskSlab's *best-case* cost — a lower bound on its real contribution
+/// under concurrent load).
+#[doc(hidden)]
+#[must_use]
+#[allow(unused_must_use)]
+pub fn microbench_slab_roundtrip_ns(iterations: u32) -> f64 {
+    let slab = TaskSlab::new(64);
+    crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(0));
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        let idx = slab.store(Box::new(|_: &DtaHarness| {}));
+        // The closure is never invoked: only the store+take round trip
+        // (allocation/free-list bookkeeping) is under measurement here, not
+        // task execution. `black_box` still forces the compiler to treat
+        // the returned `Task` as observed so the store/take pair can't be
+        // optimized away.
+        core::hint::black_box(slab.take(idx));
+    }
+    let elapsed = start.elapsed();
+    crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(usize::MAX));
+    #[allow(clippy::cast_precision_loss)]
+    let ns = elapsed.as_secs_f64() * 1e9 / f64::from(iterations);
+    ns
 }
 
 impl TaskSpawner for DtaHarness {
