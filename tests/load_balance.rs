@@ -3,6 +3,7 @@
 mod common;
 
 use dtact::{Affinity, Priority, WorkloadKind, dtact_await, spawn, spawn_with, yield_now};
+use serial_test::serial;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -158,7 +159,13 @@ fn test_concurrent_spawn_from_multiple_threads() {
     );
 }
 
+/// `#[serial]` because this test mutates the process-wide deflection
+/// threshold on every worker — without it, this can race with
+/// `test_synchronous_burst_spawn_spreads_across_workers` (also `#[serial]`,
+/// also a threshold-mutating test) restoring/overwriting each other's
+/// setting mid-run and producing spurious failures in either test.
 #[test]
+#[serial]
 #[cfg_attr(miri, ignore)]
 fn test_deflection_threshold_config() {
     common::init_runtime();
@@ -194,6 +201,116 @@ fn test_deflection_threshold_config() {
     // Restore default threshold
     for i in 0..num_workers {
         dtact::config::set_deflection_threshold(i, 128);
+    }
+}
+
+/// Regression test for a scheduler-level fix: a single fiber that
+/// synchronously fans out many independent child fibers (no yield point in
+/// between) used to serialize the *entire* burst onto one worker,
+/// regardless of the deflection threshold — because `load_level` was only
+/// ever refreshed between full local-queue drains, so `enqueue_deflect`
+/// kept consulting a stale, pre-burst reading no matter how large the
+/// self-created backlog actually grew. `Worker::push_local` — the one
+/// choke point every same-core enqueue funnels through, whether from many
+/// separately-dispatched fibers or one fiber's own tight spawn loop — now
+/// refreshes `load_level` every `LOAD_REFRESH_PERIOD` pushes, specifically
+/// so a long synchronous fan-out gets a chance to notice its own backlog
+/// and start deflecting.
+///
+/// `#[serial]` because this test mutates the process-wide deflection
+/// threshold on every worker, which would otherwise race with other tests
+/// sharing `GLOBAL_RUNTIME` in this binary.
+#[test]
+#[serial]
+#[cfg_attr(miri, ignore)]
+fn test_synchronous_burst_spawn_spreads_across_workers() {
+    common::init_runtime();
+
+    let num_workers = dtact::GLOBAL_RUNTIME
+        .get()
+        .map(|r| r.scheduler.workers.len())
+        .unwrap_or(1);
+
+    // Very low threshold, deliberately: this test's runtime (`common::
+    // init_runtime`) sizes its `ContextPool` at only 512 contexts, so a
+    // synchronous spawn burst here self-limits into ~511-child waves (pool
+    // exhaustion forces the spawning fiber to yield back to the scheduler,
+    // which drains the wave before resuming it) — the queue depth within
+    // one wave never gets much beyond ~511. `load = (queue_len*100)>>13`
+    // needs `queue_len >= 82` to exceed threshold 1, comfortably inside
+    // that per-wave ceiling with room for multiple `LOAD_REFRESH_PERIOD`
+    // (32-push) checkpoints above threshold before the wave ends — a
+    // higher threshold here would be testing this test's own pool-capacity
+    // ceiling as much as the fix. This is about confirming deflection
+    // *can* engage mid-burst at all, not about tuning the
+    // production-default threshold (80).
+    for i in 0..num_workers {
+        dtact::config::set_deflection_threshold(i, 1);
+    }
+
+    const CHILDREN: u32 = 6000;
+    // `dtact::api::topology::current_core()` queries the real *hardware*
+    // CPU core the OS happens to have this thread on right now — unrelated
+    // to, and not stable with, DTA's own worker-thread indexing (worker
+    // threads are never pinned via `sched_setaffinity`). What identifies
+    // "which DTA worker ran this fiber" is which of the `dtact-worker-N`
+    // OS threads (each spawned once, for the process's lifetime, in
+    // `Runtime::start`) executed it — so track OS thread identity instead.
+    let threads_used: Arc<std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>> =
+        Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let done = Arc::new(AtomicU32::new(0));
+
+    let threads_root = threads_used.clone();
+    let done_root = done.clone();
+    let root = spawn(async move {
+        for _ in 0..CHILDREN {
+            let threads = threads_root.clone();
+            let d = done_root.clone();
+            // Fire-and-forget: independent, dependency-free children —
+            // structurally a Bag-of-Tasks, just arriving as one internal
+            // burst rather than externally, one at a time.
+            // `Affinity::Any` is required to exercise `enqueue_deflect` at
+            // all — the builder's default, `Affinity::SameCore`, is by
+            // design routed via `enqueue_pinned`, which never deflects
+            // regardless of load (that is the entire meaning of "pinned").
+            let _handle = dtact::SpawnBuilder::<dtact::CrossThreadNoFloat>::new()
+                .affinity(Affinity::Any)
+                .spawn(async move {
+                    threads
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(std::thread::current().id());
+                    d.fetch_add(1, Ordering::Relaxed);
+                });
+        }
+    });
+    dtact_await(root);
+
+    // Children are fire-and-forget (not individually awaited above), so
+    // wait for them to actually finish before inspecting which threads ran.
+    let start = std::time::Instant::now();
+    while done.load(Ordering::Relaxed) < CHILDREN {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "timed out waiting for {} of {CHILDREN} burst-spawned children to complete",
+            done.load(Ordering::Relaxed)
+        );
+        std::thread::yield_now();
+    }
+
+    let workers_used = threads_used
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len();
+    assert!(
+        workers_used > 1,
+        "a {CHILDREN}-task synchronous burst from one fiber landed entirely \
+         on {workers_used} worker thread(s) instead of spreading"
+    );
+
+    // Restore the documented production default (`Worker::new`).
+    for i in 0..num_workers {
+        dtact::config::set_deflection_threshold(i, 80);
     }
 }
 

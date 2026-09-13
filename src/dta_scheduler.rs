@@ -29,6 +29,105 @@ pub const LOCAL_QUEUE_MASK: usize = LOCAL_QUEUE_CAPACITY - 1;
 /// one full chunk on top.
 pub const LOCAL_QUEUE_HIGH_WATERMARK: usize = LOCAL_QUEUE_CAPACITY - LOCAL_QUEUE_CAPACITY / 8;
 
+/// How many same-core enqueues [`Worker::push_local`] accepts before
+/// refreshing `load_level`.
+///
+/// Must be a power of two (checked via `trailing_zeros`, matching the
+/// style of [`Worker::tick`]'s periodic threshold adjustment).
+///
+/// Without this, `load_level` — and therefore `enqueue_deflect`'s
+/// stay-local-vs-deflect decision — is only ever refreshed *between* full
+/// drains of a worker's local queue (inside `poll_mailboxes`, called after
+/// `Worker::dispatch_loop` returns). Two related patterns both defeat that:
+/// a fiber that spawns many children in one synchronous burst (a single
+/// `push_local` storm from one `switch_fn` call, which `dispatch_loop`'s
+/// outer loop never gets to observe mid-storm), and a recursive fan-out
+/// where each child is its own separately-dispatched fiber that itself
+/// spawns more children before ever yielding (many small `dispatch_loop`
+/// iterations, none of which return to the outer scheduler loop until the
+/// whole subtree drains). Either way — still a Bag-of-Tasks in the sense of
+/// having no inter-task dependencies, just arriving as one internal burst
+/// rather than a temporally-spread external one — the *entire* burst can
+/// run to completion on a single worker: every `enqueue_deflect` call along
+/// the way reads the same pre-burst `load_level`, which never reflects the
+/// backlog the burst is itself creating, so it never crosses
+/// `deflection_threshold` and nothing ever gets deflected, no matter how
+/// large that backlog actually gets. Refreshing inside `push_local` itself
+/// — the one choke point both patterns funnel through — catches both.
+/// 32 enqueues is frequent enough to catch a growing backlog well before it
+/// threatens `LOCAL_QUEUE_CAPACITY`, while being far too infrequent (one
+/// extra `local_tail`/`local_head` load, one `store`, every 32 pushes) to
+/// show up against the cost of the pushes themselves.
+pub const LOAD_REFRESH_PERIOD: u32 = 32;
+
+/// The worker count `Worker::new`'s N-aware load scale is calibrated against.
+///
+/// At exactly this many total workers, [`Worker::update_load`]'s
+/// absolute-backlog signal behaves identically to the crate's original
+/// fixed `queue_len >> 13` formula (i.e. "100% load" at `queue_len =
+/// 8192`) — the configuration this project's own tests and benchmarks have
+/// actually been tuned and validated against. See
+/// [`LOAD_SCALE_REFERENCE_SHIFT`] for why: N above this reference gets a
+/// *smaller* absolute trigger point (each worker's fair share of a burst
+/// shrinks as there are more peers to share it with), N below gets a
+/// *larger* one, and N at the reference is untouched.
+pub const LOAD_SCALE_REFERENCE_N: usize = 8;
+
+/// The `>>` shift `Worker::update_load` used unconditionally before the
+/// N-aware fix — see [`LOAD_SCALE_REFERENCE_N`].
+///
+/// `u8`: shift amounts for a `usize`/`u64` value never need more than a
+/// handful of bits, and [`Worker`] packs this into the same cache line as
+/// several other small fields — no reason to spend 4 bytes representing a
+/// number that never exceeds [`LOAD_SCALE_SHIFT_MAX`].
+pub const LOAD_SCALE_REFERENCE_SHIFT: u8 = 13;
+
+/// Clamp on `Worker::update_load`'s per-worker absolute-backlog shift.
+///
+/// Keeps pathological worker counts (a single-worker degenerate run, or a
+/// hypothetical many-thousand-way deployment) from pushing the "100% load"
+/// queue depth to somewhere absurd (respectively: never, or after a
+/// literal handful of tasks). `1 << 17` (`LOCAL_QUEUE_CAPACITY`) and `1 <<
+/// 4` bound the trigger's absolute queue depth to `[16, 131072]`
+/// regardless of `N`.
+pub const LOAD_SCALE_SHIFT_MIN: u8 = 4;
+/// See [`LOAD_SCALE_SHIFT_MIN`].
+pub const LOAD_SCALE_SHIFT_MAX: u8 = 17;
+
+/// EWMA decay rate `Worker::update_load` uses to track a worker's own
+/// recent-normal queue depth.
+///
+/// The standard `ewma += α·(sample − ewma)` update — the same form as
+/// TCP's RTT estimator. Smaller values adapt faster (more weight on the
+/// newest sample) but track transient spikes more readily as "the new
+/// normal"; larger values are slower to adapt but more resistant to being
+/// dragged around by a single burst. A plain `f32` constant, computed via
+/// [`f32::algebraic_mul`]/[`f32::algebraic_add`]/[`f32::algebraic_sub`] in
+/// `update_load` rather than hand-rolled fixed-point integer arithmetic —
+/// simpler, and those methods let the compiler reassociate/fuse the
+/// expression the way it could for any other floating-point code, without
+/// the strict IEEE-754 ordering `+`/`-`/`*` would otherwise force on an
+/// already-approximate estimator.
+pub const EWMA_ALPHA: f32 = 0.125;
+
+/// Floor under the EWMA baseline used when computing the relative-anomaly
+/// signal.
+///
+/// Without it, a worker with a near-zero recent history (freshly started,
+/// or idle for a while — exactly the state a burst typically starts from)
+/// would divide by (approximately) zero; instead it reacts to even a
+/// modest queue depth as maximally anomalous, which is the correct
+/// behaviour for that case: an idle worker suddenly holding *any*
+/// meaningful backlog *is* anomalous relative to its own recent history.
+pub const EWMA_MIN_BASELINE: f32 = 4.0;
+
+/// How many multiples of a worker's own recent-average queue depth counts
+/// as fully anomalous (maps to a 100% relative-load signal).
+///
+/// E.g. `3` means "queue depth at 3× my own recent normal is as urgent as
+/// being at the absolute capacity ceiling."
+pub const EWMA_ANOMALY_MULTIPLIER: f32 = 3.0;
+
 /// Warehouse capacity in chunks. 32 768 chunks × 32 tasks = 1 048 576 tasks of
 /// emergency back-pressure storage. Must be a power of two for bitwise masking.
 pub const WAREHOUSE_CAPACITY: usize = 32_768;
@@ -688,10 +787,50 @@ pub struct CpuLevel {
 
 pub use crate::common_types::TopologyMode;
 
+/// Computes the per-worker absolute-backlog `>>` shift for a scheduler of
+/// `total_cores` workers (see [`LOAD_SCALE_REFERENCE_N`]).
+///
+/// `100%` load is defined as `queue_len == 1 << shift`. We want that point
+/// to scale as `1/N` (each worker's fair share of a fixed-size burst
+/// shrinks as there are more peers to share it with), anchored so
+/// `total_cores == LOAD_SCALE_REFERENCE_N` reproduces
+/// `LOAD_SCALE_REFERENCE_SHIFT` exactly (the crate's original, validated
+/// `N=8` behaviour). Since both the reference and the shift are powers of
+/// two, "scale the 100%-point by `N / reference`" is just "shift by
+/// `ceil(log2(N)) - ceil(log2(reference))`", computed once here rather
+/// than needing a runtime division in the hot [`Worker::update_load`] path.
+#[inline(always)]
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+fn load_scale_shift_for(total_cores: usize) -> u8 {
+    const fn ceil_log2(n: usize) -> u8 {
+        if n <= 1 {
+            0
+        } else {
+            (usize::BITS - (n - 1).leading_zeros()) as u8
+        }
+    }
+    let reference_log2 = ceil_log2(LOAD_SCALE_REFERENCE_N);
+    let n_log2 = ceil_log2(total_cores.max(1));
+    // `strict_add`: `LOAD_SCALE_REFERENCE_SHIFT + reference_log2` is a
+    // small, fixed compile-time-knowable sum (13 + a handful of log2 bits)
+    // that can never legitimately overflow `u8` — panicking loudly if it
+    // somehow did is preferable to silently wrapping. The subsequent
+    // `saturating_sub`/`clamp` are the actual, intentionally-saturating
+    // policy: larger N subtracts more, shrinking the shift (and thus the
+    // 100%-point `1 << shift`), exactly the "smaller fair share at larger
+    // N" behaviour this function exists for.
+    LOAD_SCALE_REFERENCE_SHIFT
+        .strict_add(reference_log2)
+        .saturating_sub(n_log2)
+        .clamp(LOAD_SCALE_SHIFT_MIN, LOAD_SCALE_SHIFT_MAX)
+}
+
 /// Execution unit managed by a single OS thread.
 ///
 /// Cache-line layout (repr C, 64-byte aligned):
-///   Line 0 (0–63):   cpu, `load_level`, `deflection_threshold`, `local_head`, `local_tail`, ticks
+///   Line 0 (0–63):   cpu, `load_level`, `deflection_threshold`, `local_head`, `local_tail`, ticks,
+///                     `queue_ewma`, `push_count`, `load_scale_shift`
 ///   Line 1 (64–127): `event_signal` — isolated to prevent false-sharing with line 0
 ///                     (`signal_worker` on remote cores writes here; local worker reads line 0)
 ///   Line 2+ (128+):  `local_queue` buffer, `polling_order`
@@ -709,9 +848,38 @@ pub struct Worker {
     pub local_tail: AtomicUsize,
     /// Total scheduler ticks executed.
     pub ticks: u64,
+    /// Exponential moving average of this worker's own recent
+    /// `local_queue_len()`, used as the "recent normal" baseline for the
+    /// relative-anomaly half of `load_level` (see [`EWMA_ALPHA`]). Plain
+    /// `Cell`, not atomic: only the owning worker thread ever reads or
+    /// writes it (every call site of [`Worker::push_local`] and
+    /// `poll_mailboxes` runs on this worker's own thread), so it needs no
+    /// atomicity, just the interior mutability to be updatable through
+    /// `&self`. Declared before the smaller `push_count`/`load_scale_shift`
+    /// fields below so `repr(C)` doesn't need to insert alignment padding
+    /// between them (`f32` needs 4-byte alignment; placing it last among
+    /// same-line fields could otherwise strand it on an unaligned offset).
+    queue_ewma: core::cell::Cell<f32>,
+    /// Count of same-core enqueues since the last `load_level` refresh
+    /// (see [`LOAD_REFRESH_PERIOD`]). `u16`, not `u32`: the periodic
+    /// `trailing_zeros` check only ever cares about low-order bits, so a
+    /// smaller counter that wraps more often costs nothing but one extra
+    /// (harmless — `update_load` is idempotent) refresh every 65 536
+    /// pushes, in exchange for using a third less of this cache line. Plain
+    /// `Cell`, not atomic, for the same reason as `queue_ewma`.
+    push_count: core::cell::Cell<u16>,
+    /// Precomputed `>>` shift for the absolute-backlog half of
+    /// `load_level` (see [`LOAD_SCALE_REFERENCE_N`]), derived once from
+    /// this worker's `total_cores` at construction. `u8`: shift amounts
+    /// never exceed [`LOAD_SCALE_SHIFT_MAX`], so a full word would only
+    /// waste cache-line space. Plain field, not atomic: fixed for the
+    /// worker's entire lifetime, and never read or written by any other
+    /// thread.
+    load_scale_shift: u8,
     // Fill cache line 0 to 64 bytes.
-    // cpu(6) + load_level(1) + deflection_threshold(1) + local_head(8) + local_tail(8) + ticks(8) = 32
-    _pad0: [u8; 32],
+    // cpu(6) + load_level(1) + deflection_threshold(1) + local_head(8) + local_tail(8) + ticks(8)
+    //   + queue_ewma(4) + push_count(2) + load_scale_shift(1) = 39
+    _pad0: [u8; 25],
 
     /// Counter for hardware-assisted wakeups (WFE/umonitor).
     /// Isolated on its own cache line: remote workers write here via `signal_worker`,
@@ -758,7 +926,10 @@ impl Worker {
             local_head: AtomicUsize::new(0),
             local_tail: AtomicUsize::new(0),
             ticks: 0,
-            _pad0: [0; 32],
+            queue_ewma: core::cell::Cell::new(0.0),
+            push_count: core::cell::Cell::new(0),
+            load_scale_shift: load_scale_shift_for(total_cores),
+            _pad0: [0; 25],
             event_signal: AtomicU32::new(0),
             _pad1: [0; 60],
             local_queue: HugeBuffer::new()?,
@@ -783,10 +954,58 @@ impl Worker {
     /// scheduler tick. Returns the freshly computed load so callers that need
     /// it right after (e.g. [`Worker::tick`]) can reuse it instead of
     /// re-issuing an atomic load against the value this call just stored.
+    ///
+    /// `load_level` is `max` of two independent signals:
+    /// * an **absolute-backlog** signal, `queue_len` scaled against a
+    ///   per-worker, N-aware `100%` point ([`load_scale_shift_for`]) —
+    ///   a fixed, deterministic ceiling that alone is enough to guarantee
+    ///   deflection eventually triggers no matter what the second signal
+    ///   does (the property [`Worker::tick`]'s bounded-dispatch-round
+    ///   reasoning can rely on without needing to model the EWMA at all);
+    /// * a **relative-anomaly** signal comparing `queue_len` against this
+    ///   worker's own EWMA-tracked recent-normal depth, which reacts fast
+    ///   to a burst hitting a previously idle-or-light worker regardless of
+    ///   `N`, and — unlike the absolute signal alone — does *not* mistake
+    ///   sustained, uniformly-high load across every worker for unfairness
+    ///   (each worker's own baseline rises to match real sustained load,
+    ///   so it stops looking anomalous, whereas the absolute signal has no
+    ///   way to distinguish "busy because unfairly loaded" from "busy
+    ///   because the whole system genuinely is").
+    ///
+    /// Taking the `max` means the relative signal can only make deflection
+    /// trigger *earlier* than the absolute ceiling alone would, never
+    /// later — so it can only improve on the deterministic guarantee, not
+    /// weaken it.
     #[inline(always)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     pub fn update_load(&self, queue_len: usize) -> u8 {
-        #[allow(clippy::cast_possible_truncation)]
-        let load = core::cmp::min((queue_len * 100) >> 13, 100) as u8;
+        // EWMA update: ewma += EWMA_ALPHA * (sample - ewma). `algebraic_*`
+        // rather than the plain `+`/`-`/`*` operators: this is the one
+        // place on the scheduling hot path doing real floating-point work,
+        // and the algebraic family lets the compiler reassociate/fuse
+        // (e.g. into an FMA) the way it could for any other arithmetic
+        // expression, without the strict IEEE-754 evaluation-order
+        // guarantees `+`/`-`/`*` carry (guarantees this EWMA has no
+        // correctness dependency on, since it's already an approximation).
+        let sample = queue_len as f32;
+        let ewma_prev = self.queue_ewma.get();
+        let ewma_new =
+            ewma_prev.algebraic_add(EWMA_ALPHA.algebraic_mul(sample.algebraic_sub(ewma_prev)));
+        self.queue_ewma.set(ewma_new);
+
+        let absolute_pct =
+            core::cmp::min((queue_len as u64 * 100) >> self.load_scale_shift, 100) as f32;
+
+        let baseline = ewma_new.max(EWMA_MIN_BASELINE);
+        let relative_pct = (sample.algebraic_mul(100.0)
+            / baseline.algebraic_mul(EWMA_ANOMALY_MULTIPLIER))
+        .min(100.0);
+
+        let load = absolute_pct.max(relative_pct) as u8;
         self.load_level.store(load, Ordering::Relaxed);
         load
     }
@@ -822,6 +1041,13 @@ impl Worker {
     /// reload `tail` a second time on top of `head`. Only this worker thread
     /// ever touches `local_tail`, so the two reads are always identical; the
     /// second one was pure redundant atomic traffic on this hot enqueue path.
+    ///
+    /// Also refreshes `load_level` every [`LOAD_REFRESH_PERIOD`] pushes —
+    /// see that constant's doc comment for why a same-core enqueue burst
+    /// (whether from one fiber spawning many children in a tight loop, or
+    /// many small fibers cascading through their own dispatch cycles)
+    /// would otherwise leave `enqueue_deflect` reading a permanently stale
+    /// `load_level` no matter how large the backlog actually grows.
     #[inline(always)]
     pub fn push_local(&self, task: TaskIndex) -> bool {
         let tail = self.local_tail.load(Ordering::Relaxed);
@@ -837,6 +1063,12 @@ impl Worker {
         // Relaxed: only this worker thread reads local_tail.
         self.local_tail
             .store((tail + 1) & LOCAL_QUEUE_MASK, Ordering::Relaxed);
+
+        let pushes = self.push_count.get().wrapping_add(1);
+        self.push_count.set(pushes);
+        if pushes.trailing_zeros() >= LOAD_REFRESH_PERIOD.trailing_zeros() {
+            self.update_load(queue_len + 1);
+        }
         true
     }
 
@@ -878,6 +1110,34 @@ impl Worker {
         // Relaxed: push_batch is only called from the local worker thread.
         self.local_tail
             .store(end_idx & LOCAL_QUEUE_MASK, Ordering::Relaxed);
+    }
+
+    /// Pops a single task index from the local queue without executing it.
+    ///
+    /// Academic-only: lets the `benchmark`-feature comparison harness
+    /// (`src/benchmark/dta_harness.rs`) drive the real `DtaScheduler`
+    /// queueing/mailbox/deflection machinery over synthetic closure-based
+    /// tasks instead of real fibers, so the scheduling-algorithm comparison
+    /// against the pure-work-stealing baseline isn't confounded by fiber
+    /// context-switch cost (orthogonal to the scheduling question, and
+    /// already characterised separately in `benches/scheduler_efficiency.rs`).
+    /// Never compiled into a default build.
+    #[cfg(feature = "benchmark")]
+    #[inline(always)]
+    pub fn pop_local(&self) -> Option<TaskIndex> {
+        // Relaxed: local_head/local_tail are only accessed by this worker
+        // thread, mirroring `dispatch_loop`'s access pattern exactly.
+        let head = self.local_head.load(Ordering::Relaxed);
+        if head == self.local_tail.load(Ordering::Relaxed) {
+            return None;
+        }
+        let task = unsafe {
+            let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
+            *buffer_ptr.add(head)
+        };
+        self.local_head
+            .store((head + 1) & LOCAL_QUEUE_MASK, Ordering::Relaxed);
+        Some(task)
     }
 
     /// Primary execution loop for the worker thread.
@@ -1130,6 +1390,15 @@ impl DtaScheduler {
         chunk.count = 1;
 
         let ok = if current < n {
+            // SAFETY: `current < n` was just checked, and `self.mailboxes`
+            // is an `n`-by-`n` matrix built once in `DtaScheduler::new` —
+            // both indices are always in bounds, but the compiler can't
+            // see that `self.mailboxes.len() == n` across the constructor
+            // boundary.
+            unsafe {
+                core::hint::assert_unchecked(current < self.mailboxes.len());
+                core::hint::assert_unchecked(target < self.mailboxes[current].len());
+            }
             self.mailboxes[current][target].push(chunk).is_ok()
         } else {
             self.external_locks[target].lock();
@@ -1139,6 +1408,10 @@ impl DtaScheduler {
         };
 
         if ok {
+            #[cfg(feature = "benchmark")]
+            if current < n {
+                crate::benchmark::report_dta_hop(current, target);
+            }
             self.signal_worker(target);
         }
         ok
@@ -1171,7 +1444,16 @@ impl DtaScheduler {
         let threshold = worker_ref.deflection_threshold.load(Ordering::Relaxed);
         let load = worker_ref.load_level.load(Ordering::Relaxed);
 
-        let deflect_mask = if load > threshold { usize::MAX } else { 0 };
+        // `core::hint::select_unpredictable` (stable since Rust 1.98 — see
+        // this crate's MSRV): a direct, verified-branchless conditional
+        // select, replacing the `source ^ ((source ^ target) & mask)`
+        // XOR-trick this used to compute by hand for the same reason the
+        // comments here already explained — the load/threshold comparison
+        // is data-dependent and effectively unpredictable per task, so a
+        // real branch would mispredict at roughly the deflection rate.
+        // `select_unpredictable` states that intent directly instead of
+        // relying on the optimizer recognizing a hand-written bit pattern.
+        let deflect = load > threshold;
         #[allow(clippy::cast_possible_truncation)]
         let h1 = (flow_id & 7) as usize;
         #[allow(clippy::cast_possible_truncation)]
@@ -1181,23 +1463,19 @@ impl DtaScheduler {
             && matches!(affinity, crate::api::topology::Affinity::Any)
         {
             let deflect_target = (source + h1 + h2) % n;
-            // Branchless conditional selection: if deflect_mask is all 1s (load > threshold),
-            // this evaluates to deflect_target. If deflect_mask is 0 (load <= threshold),
-            // this evaluates to source. This avoids cross-core deflection under low load
-            // without incurring misprediction latency.
-            source ^ ((source ^ deflect_target) & deflect_mask)
+            core::hint::select_unpredictable(deflect, deflect_target, source)
         } else if matches!(affinity, crate::api::topology::Affinity::SameNUMA) {
             let numa_base = source & !63;
             let local_idx = source & 63;
             let deflect_target = (local_idx + h1 + h2) % 64;
-            let target_idx = local_idx ^ ((local_idx ^ deflect_target) & deflect_mask);
+            let target_idx = core::hint::select_unpredictable(deflect, deflect_target, local_idx);
             (numa_base | target_idx) % n
         } else {
             // SameCCX or default (which pins deflection to local CCX under P2PMesh)
             let ccx_base = source & !7;
             let local_idx = source & 7;
             let deflect_target = (local_idx + h1 + h2) & 7;
-            let target_idx = local_idx ^ ((local_idx ^ deflect_target) & deflect_mask);
+            let target_idx = core::hint::select_unpredictable(deflect, deflect_target, local_idx);
             (ccx_base | target_idx) % n
         };
 
@@ -1245,6 +1523,13 @@ impl DtaScheduler {
         loop {
             let result = if producer < n {
                 // Producer is a worker — use SPSC matrix.
+                // SAFETY: `producer < n` just checked; `target` is always
+                // `% n`-derived above. `self.mailboxes` is an `n`-by-`n`
+                // matrix (see `enqueue_pinned`'s identical hint).
+                unsafe {
+                    core::hint::assert_unchecked(producer < self.mailboxes.len());
+                    core::hint::assert_unchecked(target < self.mailboxes[producer].len());
+                }
                 self.mailboxes[producer][target].push(*chunk)
             } else {
                 // Producer is a host thread — use locked external_mailbox.
@@ -1256,6 +1541,10 @@ impl DtaScheduler {
 
             match result {
                 Ok(()) => {
+                    #[cfg(feature = "benchmark")]
+                    if producer < n {
+                        crate::benchmark::report_dta_hop(producer, target);
+                    }
                     self.signal_worker(target);
                     return true;
                 }
@@ -1375,12 +1664,25 @@ impl DtaScheduler {
         let num_polls = worker.polling_order.len();
         for idx in 0..num_polls {
             let i = worker.polling_order[idx];
+            // SAFETY: `polling_order` is built in `Worker::new` from
+            // `0..total_cores` only, and `self.mailboxes` always has
+            // exactly `total_cores` rows (`DtaScheduler::new` builds one
+            // row per worker) — this bound always holds. The compiler
+            // can't see that invariant across the constructor boundary,
+            // so without this hint it inserts a bounds check on every
+            // mailbox row lookup in this per-tick polling loop.
+            unsafe { core::hint::assert_unchecked(i < self.mailboxes.len()) };
             let row = &self.mailboxes[i];
 
             loop {
                 if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
                     break;
                 }
+                // SAFETY: `current_core` is always a valid worker index —
+                // every call site passes the caller's own worker index,
+                // which is always `< n` — and every row of `self.mailboxes`
+                // has exactly `n` columns (same construction as above).
+                unsafe { core::hint::assert_unchecked(current_core < row.len()) };
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
@@ -1476,8 +1778,19 @@ impl DtaScheduler {
         if n > 1 && target == current_core {
             target = (target + 1) % n;
         }
+        // SAFETY: `current_core` is always a valid worker index and
+        // `target` is always `% n`-derived above; `self.mailboxes` is an
+        // `n`-by-`n` matrix (see `enqueue_pinned`'s identical hint).
+        unsafe {
+            core::hint::assert_unchecked(current_core < self.mailboxes.len());
+            core::hint::assert_unchecked(target < self.mailboxes[current_core].len());
+        }
         match self.mailboxes[current_core][target].push(chunk) {
-            Ok(()) => self.signal_worker(target),
+            Ok(()) => {
+                #[cfg(feature = "benchmark")]
+                crate::benchmark::report_dta_hop(current_core, target);
+                self.signal_worker(target);
+            }
             Err(c) => {
                 let _ = self.park_in_warehouse(c);
             }
@@ -1644,5 +1957,65 @@ impl DtaScheduler {
 
             scheduler.poll_mailboxes(current_core);
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::Worker;
+    #[test]
+    fn worker_cache_line_layout_unchanged() {
+        assert_eq!(core::mem::align_of::<Worker>(), 64);
+        // Line 0 + Line 1 fixed-size prefix (before the HugeBuffer/Vec tail)
+        // must still be exactly 128 bytes.
+        let offset_of_local_queue = core::mem::offset_of!(Worker, local_queue);
+        assert_eq!(offset_of_local_queue, 128, "cache-line layout drifted");
+    }
+}
+
+#[cfg(test)]
+mod load_scale_tests {
+    use super::{
+        LOAD_SCALE_REFERENCE_N, LOAD_SCALE_REFERENCE_SHIFT, LOAD_SCALE_SHIFT_MIN,
+        load_scale_shift_for,
+    };
+
+    #[test]
+    fn reference_n_reproduces_original_fixed_shift() {
+        assert_eq!(
+            load_scale_shift_for(LOAD_SCALE_REFERENCE_N),
+            LOAD_SCALE_REFERENCE_SHIFT
+        );
+    }
+
+    #[test]
+    fn shift_shrinks_as_worker_count_grows() {
+        let n8 = load_scale_shift_for(8);
+        let n16 = load_scale_shift_for(16);
+        let n32 = load_scale_shift_for(32);
+        let n64 = load_scale_shift_for(64);
+        assert!(n8 >= n16 && n16 >= n32 && n32 >= n64);
+        // Doubling N should shave exactly one bit off the shift (both are
+        // powers of two here), until the floor clamp takes over.
+        assert_eq!(n8 - n16, 1);
+        assert_eq!(n16 - n32, 1);
+        assert_eq!(n32 - n64, 1);
+    }
+
+    #[test]
+    fn shift_grows_for_worker_counts_below_reference() {
+        assert!(load_scale_shift_for(4) > load_scale_shift_for(8));
+        assert!(load_scale_shift_for(1) > load_scale_shift_for(4));
+    }
+
+    #[test]
+    fn shift_stays_within_clamped_bounds_at_extreme_n() {
+        assert_eq!(load_scale_shift_for(1_000_000), LOAD_SCALE_SHIFT_MIN);
+        // The formula's own ceiling (`LOAD_SCALE_REFERENCE_SHIFT +
+        // ceil_log2(LOAD_SCALE_REFERENCE_N)` at the degenerate N=1 case)
+        // is 16, below `LOAD_SCALE_SHIFT_MAX` (17) — the max clamp is a
+        // defensive margin for future formula changes, not something this
+        // formula's current shape ever actually reaches.
+        assert_eq!(load_scale_shift_for(1), 16);
     }
 }
