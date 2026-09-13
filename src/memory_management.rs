@@ -1,7 +1,61 @@
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
 
+use core::cell::UnsafeCell;
+
 use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+/// Defensive upper cap on how many per-worker batch caches a single
+/// `ContextPool` will ever allocate, regardless of the `num_workers` its
+/// constructor is given. A worker id at or beyond `min(num_workers,
+/// MAX_CACHED_WORKERS)` falls back to the safe global CAS path — still
+/// fully correct, just without the fast path. Exists only to bound
+/// allocation size against a pathological caller-supplied `num_workers`;
+/// comfortably above any realistic core count.
+const MAX_CACHED_WORKERS: usize = 4096;
+
+/// Upper bound on how many free-list nodes one batch refill/donate moves
+/// per CAS. Matches `CHUNK_SIZE` (`src/dta_scheduler.rs`) — the same "how
+/// many indices per shared-pointer exchange" convention this codebase
+/// already uses for the scheduler's own mailbox chunks.
+const MAX_LOCAL_BATCH: u32 = 32;
+
+/// A per-worker cache of free [`ContextPool`] slot indices, sitting in
+/// front of the shared CAS-protected free list to amortize its cost:
+/// `alloc_context`/`free_context` pop/push this cache directly (no atomics)
+/// in the common case, only touching the shared list once every
+/// `batch_size` operations.
+///
+/// No slot "ownership" is tracked: unlike a page-based allocator (e.g.
+/// mimalloc, which must return memory to its originating page for OS-level
+/// reclamation), every `ContextPool` slot is interchangeable and lives in
+/// one pre-allocated arena for the pool's whole lifetime — a freed slot can
+/// go into whichever worker's cache frees it, regardless of who originally
+/// allocated it.
+///
+/// # Safety invariant
+/// Never touched by more than one thread at a time: it is only ever
+/// accessed via `ContextPool::local_caches[worker_id]`, where `worker_id`
+/// comes from [`crate::future_bridge::CURRENT_WORKER_ID`] — a value set
+/// exactly once, for the life of the OS thread, by the one worker thread
+/// `DtaScheduler::run_worker_static` spawns for that id
+/// (`src/dta_scheduler.rs`), and read (never set) everywhere else. No other
+/// thread ever reads or writes this specific cache slot. Mirrors the same
+/// "protocol-exclusive `UnsafeCell`" reasoning already used for `Worker` in
+/// `src/dta_scheduler.rs` and `TaskSlab` in `src/benchmark/dta_harness.rs`.
+struct LocalFreeCache {
+    slots: [u32; (MAX_LOCAL_BATCH * 2) as usize],
+    len: u32,
+}
+
+impl LocalFreeCache {
+    const fn new() -> Self {
+        Self {
+            slots: [0; (MAX_LOCAL_BATCH * 2) as usize],
+            len: 0,
+        }
+    }
+}
 
 /// Safety policies for context pool memory layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,13 +361,68 @@ pub struct ContextPool {
     /// and cached here so `get_context_ptr` — called on every fiber dispatch —
     /// never re-executes the alignment arithmetic at runtime.
     pub context_end_offset: usize,
+    /// Per-(pool, worker-id) batch caches amortizing `free_head`'s CAS cost.
+    /// See [`LocalFreeCache`] and `alloc_context`/`free_context`.
+    local_caches: Box<[UnsafeCell<LocalFreeCache>]>,
+    /// How many free-list nodes one refill/donate moves per CAS, scaled to
+    /// this pool's own capacity (see `new()`) so a batch can never claim a
+    /// disproportionate share of a small pool.
+    batch_size: u32,
 }
 
 unsafe impl Send for ContextPool {}
 unsafe impl Sync for ContextPool {}
 
 impl ContextPool {
+    /// Builds this pool's empty per-worker batch caches and computes the
+    /// batch size they refill/donate by.
+    ///
+    /// Sized against `num_workers`, not just `capacity`: every worker's
+    /// cache can independently grow up to `2 * batch_size` before it must
+    /// donate, so the *worst case* amount of the pool's capacity sitting
+    /// idle in caches (invisible to any other caller) is `num_workers * 2 *
+    /// batch_size`. Choosing `batch_size = capacity / (8 * num_workers)`
+    /// keeps that worst case at `capacity / 4` — at most a quarter of the
+    /// pool can ever be cache-resident at once, leaving the rest always
+    /// reachable through the shared global list. Getting this wrong is not
+    /// a performance footnote: sizing `batch_size` off `capacity` alone
+    /// (ignoring `num_workers`) previously let real worker caches
+    /// collectively hoard up to 100% of a pool's capacity, starving any
+    /// other caller (e.g. a host thread's `alloc_context_global`) — a real,
+    /// reproduced-under-stress-testing livelock, not a theoretical concern.
+    ///
+    /// Also scaled down for small pools so one worker's batch can't claim a
+    /// disproportionate share of total capacity (e.g. capacity=2 in several
+    /// tests clamps to `batch_size=1`, exactly degenerating to the uncached
+    /// per-node behavior — zero risk, zero benefit, the right tradeoff for
+    /// pools that tiny).
+    fn new_local_caches(
+        capacity: u32,
+        num_workers: usize,
+    ) -> (Box<[UnsafeCell<LocalFreeCache>]>, u32) {
+        let effective_workers = num_workers.clamp(1, MAX_CACHED_WORKERS);
+        #[allow(clippy::cast_possible_truncation)]
+        let divisor = (8 * effective_workers) as u32;
+        let batch_size = (capacity / divisor).clamp(1, MAX_LOCAL_BATCH);
+        let local_caches = (0..effective_workers)
+            .map(|_| UnsafeCell::new(LocalFreeCache::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        (local_caches, batch_size)
+    }
+
     /// Creates a new `ContextPool` with the specified capacity and safety.
+    ///
+    /// `num_workers` is the number of real scheduler workers that will ever
+    /// call [`Self::alloc_context`]/[`Self::free_context`] from their own
+    /// dispatch thread (i.e. whatever is passed to the paired
+    /// `DtaScheduler::new`) — it sizes and bounds the per-worker batch
+    /// caches (see [`Self::new_local_caches`]) so they can never
+    /// collectively hoard more than a bounded fraction of `capacity`. Pass
+    /// `1` for a pool with no real scheduler workers attached (e.g. a
+    /// standalone allocator-only test): every caller then takes the
+    /// uncached global path, identical to this pool's pre-batch-cache
+    /// behavior.
     ///
     /// This function performs the initial bulk allocation (via mmap or
     /// `VirtualAlloc`) and configures any requested hardware guard pages.
@@ -329,6 +438,7 @@ impl ContextPool {
         stack_size: usize,
         safety: SafetyLevel,
         numa: usize,
+        num_workers: usize,
     ) -> Result<Self, &'static str> {
         #[cfg(unix)]
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
@@ -377,6 +487,8 @@ impl ContextPool {
                 }
             }
 
+            let (local_caches, batch_size) = Self::new_local_caches(capacity, num_workers);
+
             let pool = Self {
                 base_ptr,
                 total_size: total_size_with_meta,
@@ -386,6 +498,8 @@ impl ContextPool {
                 safety,
                 free_head: AtomicU64::new(0),
                 context_end_offset,
+                local_caches,
+                batch_size,
             };
 
             for i in 0..capacity {
@@ -613,15 +727,97 @@ impl ContextPool {
         }
     }
 
-    /// O(1) Pop from the free list with ABA protection.
+    /// O(1) pop from this worker's local batch cache (no atomics),
+    /// refilling from the shared free list with one CAS per `batch_size`
+    /// slots when the cache is empty. Callers with no cache slot of their
+    /// own (see [`LocalFreeCache`]'s doc comment) fall back to
+    /// [`Self::alloc_context_global`] directly.
+    #[inline(always)]
+    pub fn alloc_context(&self) -> Option<u32> {
+        let worker_id = crate::future_bridge::CURRENT_WORKER_ID.with(core::cell::Cell::get);
+        if worker_id >= self.local_caches.len() {
+            // Cold: only host threads / callers outside a real scheduler
+            // worker ever take this branch (see `LocalFreeCache`'s doc
+            // comment) — every real worker's own dispatch thread always has
+            // `worker_id < self.local_caches.len()`.
+            core::hint::cold_path();
+            return self.alloc_context_global();
+        }
+        // SAFETY: see `LocalFreeCache`'s doc comment — `worker_id` uniquely
+        // identifies the one live OS thread that ever touches this slot.
+        let cache = unsafe { &mut *self.local_caches[worker_id].get() };
+        if cache.len == 0 {
+            self.refill_batch(cache);
+        }
+        if cache.len == 0 {
+            // Cold: the shared free list itself was exhausted on refill —
+            // true pool exhaustion, not the routine empty-cache case above.
+            core::hint::cold_path();
+            return None;
+        }
+        cache.len -= 1;
+        // SAFETY: `cache.len` never exceeds `2 * self.batch_size`, itself
+        // clamped to `MAX_LOCAL_BATCH` at construction — always in bounds
+        // of the fixed-size `slots` array. The compiler can't see that
+        // invariant across `refill_batch`/`donate_batch`'s mutations of
+        // `cache.len`, so without this hint it inserts a bounds check here.
+        unsafe { core::hint::assert_unchecked((cache.len as usize) < cache.slots.len()) };
+        Some(cache.slots[cache.len as usize])
+    }
+
+    /// Returns a context to this worker's local batch cache (no atomics),
+    /// donating a batch back to the shared free list with one CAS per
+    /// `batch_size` slots when the cache fills up. Callers with no cache
+    /// slot of their own fall back to [`Self::free_context_global`]
+    /// directly.
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn alloc_context(&self) -> Option<u32> {
+    pub fn free_context(&self, index: u32) {
+        let ctx = self.get_context_ptr(index);
+
+        // Reset state to Initial and notify any waiting host threads. This
+        // happens unconditionally and immediately regardless of whether
+        // `index` ends up in the local cache or is batch-donated below:
+        // `generation` guards ABA-safety for outstanding handles and must
+        // reflect "this fiber is done" right away, never deferred.
+        unsafe {
+            (*ctx)
+                .state
+                .store(FiberStatus::Initial as u32, Ordering::Release);
+            (*ctx).generation.fetch_add(1, Ordering::AcqRel);
+        };
+
+        let worker_id = crate::future_bridge::CURRENT_WORKER_ID.with(core::cell::Cell::get);
+        if worker_id >= self.local_caches.len() {
+            // Cold: see the matching branch in `alloc_context`.
+            core::hint::cold_path();
+            self.free_context_global(index);
+            return;
+        }
+        // SAFETY: see `LocalFreeCache`'s doc comment.
+        let cache = unsafe { &mut *self.local_caches[worker_id].get() };
+        if cache.len as usize == 2 * self.batch_size as usize {
+            self.donate_batch(cache);
+        }
+        // SAFETY: see the matching hint in `alloc_context` — `cache.len` is
+        // always in bounds of `slots` (donate above resets it to
+        // `self.batch_size` whenever it would otherwise reach capacity).
+        unsafe { core::hint::assert_unchecked((cache.len as usize) < cache.slots.len()) };
+        cache.slots[cache.len as usize] = index;
+        cache.len += 1;
+    }
+
+    /// Uncached O(1) pop directly from the shared free list, one CAS per
+    /// call — today's original `alloc_context` algorithm, unchanged.
+    #[inline(always)]
+    #[allow(clippy::cast_possible_truncation)]
+    fn alloc_context_global(&self) -> Option<u32> {
         let mut head = self.free_head.load(Ordering::Acquire);
         loop {
             let index = head as u32;
             let r#gen = (head >> 32) as u32;
             if index == u32::MAX {
+                core::hint::cold_path();
                 return None;
             }
 
@@ -647,25 +843,25 @@ impl ContextPool {
             );
             match cas {
                 Ok(_) => return Some(index),
-                Err(latest) => head = latest,
+                Err(latest) => {
+                    // Cold: contention on `free_head` is rare by design —
+                    // the whole point of `LocalFreeCache` is to keep most
+                    // callers off this shared, single-CAS path entirely.
+                    core::hint::cold_path();
+                    head = latest;
+                }
             }
         }
     }
 
-    /// Returns a context to the free list.
+    /// Uncached O(1) push directly onto the shared free list, one CAS per
+    /// call — today's original `free_context` free-list step, unchanged
+    /// (the state-reset/generation-bump prefix now lives in `free_context`
+    /// itself, since it must run regardless of which path handles linking).
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn free_context(&self, index: u32) {
+    fn free_context_global(&self, index: u32) {
         let ctx = self.get_context_ptr(index);
-
-        // Reset state to Initial and notify any waiting host threads.
-        unsafe {
-            (*ctx)
-                .state
-                .store(FiberStatus::Initial as u32, Ordering::Release);
-            (*ctx).generation.fetch_add(1, Ordering::AcqRel);
-        };
-
         let mut head = self.free_head.load(Ordering::Relaxed);
         loop {
             let current_idx = head as u32;
@@ -689,9 +885,140 @@ impl ContextPool {
             );
             match cas {
                 Ok(_) => break,
-                Err(h) => head = h,
+                Err(h) => {
+                    core::hint::cold_path();
+                    head = h;
+                }
             }
         }
+    }
+
+    /// Refills `cache` from the shared free list: walks up to
+    /// `self.batch_size` `next_free` links (relaxed reads — safe to read
+    /// speculatively before ownership is confirmed, exactly like
+    /// `alloc_context_global` already does for one node), then swings
+    /// `free_head` past the whole run with **one** CAS. Retries the whole
+    /// walk on CAS failure, same shape as the single-node path's retry
+    /// loop, just over a bigger unit of work per attempt. ABA safety is
+    /// unaffected: `free_head`'s generation still increments by exactly 1
+    /// per head mutation, whether that mutation moves 1 node or
+    /// `batch_size` nodes. Leaves `cache.len == 0` if the shared list is
+    /// already exhausted.
+    #[allow(clippy::cast_possible_truncation)]
+    fn refill_batch(&self, cache: &mut LocalFreeCache) {
+        let want = self.batch_size as usize;
+        // SAFETY: `batch_size` is clamped to `MAX_LOCAL_BATCH` at
+        // construction (`new_local_caches`), always strictly less than
+        // `slots.len() == 2 * MAX_LOCAL_BATCH` — the compiler can't relate
+        // a runtime field to the fixed-size array without this hint.
+        unsafe { core::hint::assert_unchecked(want < cache.slots.len()) };
+        loop {
+            let head = self.free_head.load(Ordering::Acquire);
+            let mut idx = head as u32;
+            if idx == u32::MAX {
+                core::hint::cold_path();
+                return; // shared list exhausted
+            }
+            let r#gen = (head >> 32) as u32;
+
+            let mut collected = 0usize;
+            while collected < want && idx != u32::MAX {
+                cache.slots[collected] = idx;
+                collected += 1;
+                let ctx = self.get_context_ptr(idx);
+                idx = unsafe { (*ctx).next_free.load(Ordering::Relaxed) };
+            }
+            // `idx` is now the first node NOT claimed (possibly u32::MAX).
+            let new_head = (u64::from(r#gen.wrapping_add(1)) << 32) | u64::from(idx);
+            #[cfg(not(loom))]
+            let cas = self.free_head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            #[cfg(loom)]
+            let cas = self.free_head.compare_exchange(
+                head,
+                new_head,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            if cas.is_ok() {
+                #[allow(clippy::cast_possible_truncation)]
+                let collected_u32 = collected as u32;
+                cache.len = collected_u32;
+                return;
+            }
+            // Cold: list changed under us — fall through to retry the walk
+            // from the fresh head. Rare by the same reasoning as above.
+            core::hint::cold_path();
+        }
+    }
+
+    /// Donates `self.batch_size` slots from `cache` back to the shared free
+    /// list: links them into a private chain (non-atomic — exclusively
+    /// owned until spliced in), then swings `free_head` to the chain's head
+    /// with **one** CAS, splicing the previous head onto the chain's tail.
+    /// Mirrors `free_context_global`'s single-node push, just for a
+    /// pre-built chain. Leaves `self.batch_size` slots resident in `cache`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn donate_batch(&self, cache: &mut LocalFreeCache) {
+        let n = self.batch_size as usize;
+        debug_assert!(cache.len as usize >= n);
+        let start = cache.len as usize - n;
+        // SAFETY: `donate_batch` is only ever called with `cache.len ==
+        // 2 * self.batch_size` (the "full" trigger in `free_context`), and
+        // `2 * self.batch_size <= slots.len()` by construction
+        // (`new_local_caches` clamps `batch_size` to `MAX_LOCAL_BATCH ==
+        // slots.len() / 2`) — so `start + n == cache.len <= slots.len()`,
+        // and every index touched below is in bounds.
+        unsafe { core::hint::assert_unchecked(start + n <= cache.slots.len()) };
+
+        // Link the donated slots into a private chain: nothing else can see
+        // these indices yet, so plain (non-atomic) stores are enough.
+        for i in start..start + n - 1 {
+            let ctx = self.get_context_ptr(cache.slots[i]);
+            unsafe {
+                (*ctx)
+                    .next_free
+                    .store(cache.slots[i + 1], Ordering::Relaxed);
+            }
+        }
+        let chain_head = cache.slots[start];
+        let tail_ctx = self.get_context_ptr(cache.slots[start + n - 1]);
+
+        let mut head = self.free_head.load(Ordering::Relaxed);
+        loop {
+            let old_idx = head as u32;
+            let r#gen = (head >> 32) as u32;
+            unsafe { (*tail_ctx).next_free.store(old_idx, Ordering::Relaxed) };
+            let new_head = (u64::from(r#gen.wrapping_add(1)) << 32) | u64::from(chain_head);
+            #[cfg(not(loom))]
+            let cas = self.free_head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+            #[cfg(loom)]
+            let cas = self.free_head.compare_exchange(
+                head,
+                new_head,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+            match cas {
+                Ok(_) => break,
+                Err(h) => {
+                    core::hint::cold_path();
+                    head = h;
+                }
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let n_u32 = n as u32;
+        cache.len -= n_u32;
     }
 
     /// Returns the base pointer and layout metadata for direct dispatcher access.
@@ -727,5 +1054,144 @@ impl Drop for ContextPool {
             use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
             VirtualFree(self.base_ptr.cast(), 0, MEM_RELEASE);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Sets `CURRENT_WORKER_ID` for the duration of the guard, restoring it
+    /// to the "not a worker" sentinel on drop (including on panic/early
+    /// return) — required because `cargo test`'s thread pool reuses OS
+    /// threads across tests, and a leaked worker-id assignment on a shared
+    /// thread-local could make an unrelated later test on that same OS
+    /// thread unexpectedly take the cached path against a *different*
+    /// `ContextPool` instance.
+    struct WorkerIdGuard;
+
+    impl Drop for WorkerIdGuard {
+        fn drop(&mut self) {
+            crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(usize::MAX));
+        }
+    }
+
+    fn as_worker(id: usize) -> WorkerIdGuard {
+        crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(id));
+        WorkerIdGuard
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cached_path_never_duplicates_or_loses_slots() {
+        let pool = ContextPool::new(64, 8192, SafetyLevel::Safety0, 0, 1).expect("pool init");
+        let _guard = as_worker(0);
+
+        let mut seen = HashSet::new();
+        for _ in 0..64 {
+            let idx = pool.alloc_context().expect("pool has 64 slots");
+            assert!(seen.insert(idx), "duplicate index {idx} handed out");
+        }
+        assert!(
+            pool.alloc_context().is_none(),
+            "65th alloc on a 64-slot pool must fail"
+        );
+
+        for idx in seen {
+            pool.free_context(idx);
+        }
+
+        // Every slot must be allocable again after freeing them all.
+        let mut recovered = HashSet::new();
+        for _ in 0..64 {
+            let idx = pool
+                .alloc_context()
+                .expect("all 64 slots should be free again");
+            assert!(recovered.insert(idx));
+        }
+        assert!(pool.alloc_context().is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn cached_path_forces_refill_and_donate_cycles() {
+        // capacity=64 -> batch_size = (64/8).clamp(1,32) = 8, so a cache
+        // holds up to 2*8=16 before donating and refills 8 at a time —
+        // allocating 30 in a row forces multiple refills, and freeing them
+        // all back forces at least one donate.
+        let pool = ContextPool::new(64, 8192, SafetyLevel::Safety0, 0, 1).expect("pool init");
+        let _guard = as_worker(0);
+
+        let mut allocated = Vec::new();
+        for _ in 0..30 {
+            allocated.push(pool.alloc_context().expect("pool has capacity"));
+        }
+        let unique: HashSet<_> = allocated.iter().copied().collect();
+        assert_eq!(unique.len(), 30, "refill must not hand out duplicates");
+
+        for idx in allocated {
+            pool.free_context(idx);
+        }
+
+        // No capacity may have been stranded in the cache: the pool must be
+        // fully drainable again from scratch.
+        let mut recovered = HashSet::new();
+        for _ in 0..64 {
+            let idx = pool
+                .alloc_context()
+                .expect("no capacity should be lost across a donate cycle");
+            assert!(recovered.insert(idx));
+        }
+        assert!(pool.alloc_context().is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn distinct_worker_ids_never_share_a_slot_concurrently() {
+        let pool = ContextPool::new(64, 8192, SafetyLevel::Safety0, 0, 2).expect("pool init");
+
+        let mut worker0_slots = HashSet::new();
+        {
+            let _guard = as_worker(0);
+            for _ in 0..8 {
+                worker0_slots.insert(pool.alloc_context().expect("pool has capacity"));
+            }
+        }
+
+        let mut worker1_slots = HashSet::new();
+        {
+            let _guard = as_worker(1);
+            for _ in 0..8 {
+                worker1_slots.insert(pool.alloc_context().expect("pool has capacity"));
+            }
+        }
+
+        assert!(
+            worker0_slots.is_disjoint(&worker1_slots),
+            "two distinct worker-id caches on the same pool handed out overlapping indices"
+        );
+
+        // Clean up so the pool's Drop doesn't matter for this test's intent.
+        for idx in worker0_slots.into_iter().chain(worker1_slots) {
+            pool.free_context(idx);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn uncached_sentinel_path_matches_existing_global_behavior() {
+        // No `as_worker` guard: CURRENT_WORKER_ID stays at its default
+        // sentinel (usize::MAX), exactly like every pre-existing
+        // ContextPool test (none of which go through a real worker
+        // dispatch loop) — this must behave exactly as it did before this
+        // change, since it takes the untouched `_global` fallback path.
+        let pool = ContextPool::new(2, 8192, SafetyLevel::Safety0, 0, 1).expect("pool init");
+        let a = pool.alloc_context().expect("first slot");
+        let b = pool.alloc_context().expect("second slot");
+        assert_ne!(a, b);
+        assert!(pool.alloc_context().is_none());
+        pool.free_context(a);
+        assert!(pool.alloc_context().is_some());
     }
 }

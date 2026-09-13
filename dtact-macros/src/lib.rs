@@ -311,7 +311,8 @@ pub fn dtact_init(args: TokenStream, item: TokenStream) -> TokenStream {
                     #capacity,
                     #stack,
                     dtact::memory_management::SafetyLevel::#safety_ident,
-                    #numa
+                    #numa,
+                    workers_count
                 ).expect("DTA-V3 Hardware Initialization Failed");
 
                 dtact::Runtime {

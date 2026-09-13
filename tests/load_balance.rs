@@ -326,6 +326,7 @@ fn test_global_topology_mode_completes_all_tasks() {
         131_072,
         dtact::memory_management::SafetyLevel::Safety0,
         0,
+        2,
     )
     .expect("pool creation failed");
 

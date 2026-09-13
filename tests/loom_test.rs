@@ -91,7 +91,8 @@ fn test_production_fiber_state_transitions() {
 #[test]
 fn test_production_context_pool_alloc_free() {
     bounded_model(|| {
-        let pool = Arc::new(ContextPool::new(2, 8192, SafetyLevel::Safety0, 0).expect("pool init"));
+        let pool =
+            Arc::new(ContextPool::new(2, 8192, SafetyLevel::Safety0, 0, 1).expect("pool init"));
 
         let p1 = pool.clone();
         let t1 = thread::spawn(move || {
@@ -102,6 +103,48 @@ fn test_production_context_pool_alloc_free() {
 
         let p2 = pool.clone();
         let t2 = thread::spawn(move || {
+            if let Some(idx) = p2.alloc_context() {
+                p2.free_context(idx);
+            }
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Test 2b: ContextPool per-worker batch cache (refill/donate multi-node CAS)
+//
+// `test_production_context_pool_alloc_free` above never sets a worker id, so
+// it only ever exercises the uncached `_global` fallback (unchanged from
+// before the batch-cache was added). This test gives each thread a distinct
+// small worker id via the test-only `__set_current_worker_id_for_test` hook
+// so both threads actually go through `ContextPool`'s per-worker
+// `LocalFreeCache`, with a pool capacity (32) and `num_workers` (2) chosen
+// so `batch_size = capacity / (8 * num_workers) = 2` — small enough to keep
+// loom's branch count bounded, but big enough that the new multi-node
+// `refill_batch`/`donate_batch` CAS paths (as opposed to the single-node
+// ones) are actually exercised at least once.
+// ---------------------------------------------------------------------------
+#[cfg_attr(miri, ignore)]
+#[test]
+fn test_production_context_pool_batch_cache_alloc_free() {
+    bounded_model(|| {
+        let pool =
+            Arc::new(ContextPool::new(32, 8192, SafetyLevel::Safety0, 0, 2).expect("pool init"));
+
+        let p1 = pool.clone();
+        let t1 = thread::spawn(move || {
+            dtact::future_bridge::__set_current_worker_id_for_test(0);
+            if let Some(idx) = p1.alloc_context() {
+                p1.free_context(idx);
+            }
+        });
+
+        let p2 = pool.clone();
+        let t2 = thread::spawn(move || {
+            dtact::future_bridge::__set_current_worker_id_for_test(1);
             if let Some(idx) = p2.alloc_context() {
                 p2.free_context(idx);
             }

@@ -30,6 +30,7 @@ fn ensure_runtimes() {
                 64 * 1024,
                 dtact::memory_management::SafetyLevel::Safety0,
                 0,
+                2,
             )
             .expect("dtact pool init failed");
             dtact::Runtime {

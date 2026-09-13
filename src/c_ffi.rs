@@ -109,6 +109,7 @@ pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
             stack_size,
             safety,
             cfg.numa as usize,
+            workers,
         )
         .expect("DTA-V3 FFI Initialization Failed");
         crate::Runtime {

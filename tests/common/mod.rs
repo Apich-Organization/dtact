@@ -19,6 +19,7 @@ pub fn init_runtime() {
                 524_288,
                 dtact::memory_management::SafetyLevel::Safety1,
                 0,
+                workers,
             )
             .expect("test runtime init failed");
             dtact::Runtime {

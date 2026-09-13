@@ -42,6 +42,7 @@ fn first_ever_fiber_dispatch_survives_inexact_float_division() {
             65_536,
             dtact::memory_management::SafetyLevel::Safety0,
             0,
+            workers,
         )
         .expect("test runtime init failed");
         dtact::Runtime {

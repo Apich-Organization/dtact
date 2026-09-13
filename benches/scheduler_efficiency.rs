@@ -16,6 +16,7 @@ fn init_dtact() {
             64 * 1024,
             dtact::memory_management::SafetyLevel::Safety0,
             0,
+            workers_count,
         )
         .expect("DTA-V3 Hardware Initialization Failed");
 

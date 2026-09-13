@@ -66,6 +66,21 @@ thread_local! {
     pub(crate) static CURRENT_WORKER_ID: core::cell::Cell<usize> = const { core::cell::Cell::new(usize::MAX) };
 }
 
+/// Test-only hook: sets `CURRENT_WORKER_ID` for the calling thread.
+///
+/// `CURRENT_WORKER_ID` is `pub(crate)` (only ever meant to be set by a real
+/// worker's dispatch loop, `DtaScheduler::run_worker_static`), which is
+/// exactly right for production but leaves external test binaries
+/// (`tests/loom_test.rs`, `tests/concurrency.rs`) with no way to exercise
+/// `ContextPool`'s per-worker batch-cache fast path
+/// (`src/memory_management.rs`), which keys its cache slot off this value.
+/// This tiny doc-hidden function is the deliberately narrow escape hatch
+/// for that — not part of the crate's public API surface.
+#[doc(hidden)]
+pub fn __set_current_worker_id_for_test(id: usize) {
+    CURRENT_WORKER_ID.with(|c| c.set(id));
+}
+
 /// The core execution bridge between Rust Futures and Dtact Fibers.
 ///
 /// This function executes a future on the fiber's stack. If the future yields
