@@ -570,6 +570,7 @@ version = "0.2.8"
 dependencies = [
  "cbindgen",
  "criterion",
+ "crossbeam-deque",
  "dtact-macros",
  "dtact-util",
  "libc",

@@ -21,6 +21,10 @@ rust-version = "1.98.1"
 [dependencies]
 dtact-macros = { path = "./dtact-macros", version = "0.1" }
 libc = "0.2"
+# Optional: pulled in only by the `benchmark` feature, which builds the
+# pure-work-stealing baseline scheduler used for academic comparison against
+# DtaScheduler. Never enabled by default; adds nothing to normal builds.
+crossbeam-deque = { version = "0.8", optional = true }
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
@@ -83,6 +87,14 @@ windows-root = []
 security-hardened = []
 kernel = []
 cooperative-yield = []
+# Academic-only: builds the pure-work-stealing comparison baseline and the
+# synthetic NUMA cost-model instrumentation used to empirically validate the
+# information-acquisition-rate formulas in the DTA preprint (see
+# `paper/main.tex`, secs. "Information Acquisition Rate" and "Concrete
+# Analysis on a Dual-Socket NUMA Topology"). Never enabled by default; no
+# non-academic user should need it, and it must never affect the default
+# build's behavior, binary size, or dependency graph.
+benchmark = ["dep:crossbeam-deque"]
 
 [lib]
 crate-type = ["cdylib", "rlib", "staticlib"]
@@ -95,3 +107,8 @@ dtact-macros = { path = "dtact-macros" }
 [[bench]]
 name = "scheduler_efficiency"
 harness = false
+
+[[bench]]
+name = "numa_information_cost"
+harness = false
+required-features = ["benchmark"]

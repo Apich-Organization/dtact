@@ -126,6 +126,13 @@ pub use dtact_macros::task;
 /// Public user-facing API for spawning and managing fibers.
 #[doc(hidden)]
 pub mod api;
+/// Academic-only comparison harness: pure work-stealing baseline and
+/// synthetic NUMA cost model used to empirically validate the
+/// information-acquisition-rate formulas in the DTA preprint. Gated behind
+/// the `benchmark` Cargo feature; never compiled into a default build.
+#[cfg(feature = "benchmark")]
+#[doc(hidden)]
+pub mod benchmark;
 /// C-compatible FFI boundary for cross-language integration.
 #[doc(hidden)]
 pub mod c_ffi;
