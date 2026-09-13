@@ -830,7 +830,7 @@ fn load_scale_shift_for(total_cores: usize) -> u8 {
 ///
 /// Cache-line layout (repr C, 64-byte aligned):
 ///   Line 0 (0–63):   cpu, `load_level`, `deflection_threshold`, `local_head`, `local_tail`, ticks,
-///                     `queue_ewma`, `push_count`, `load_scale_shift`
+///                     `last_polled_signal`, `queue_ewma`, `push_count`, `load_scale_shift`
 ///   Line 1 (64–127): `event_signal` — isolated to prevent false-sharing with line 0
 ///                     (`signal_worker` on remote cores writes here; local worker reads line 0)
 ///   Line 2+ (128+):  `local_queue` buffer, `polling_order`
@@ -848,6 +848,18 @@ pub struct Worker {
     pub local_tail: AtomicUsize,
     /// Total scheduler ticks executed.
     pub ticks: u64,
+    /// The `event_signal` value last observed by a `poll_mailboxes` call
+    /// that fully drained every mailbox row to empty. `poll_mailboxes`
+    /// compares this against the live `event_signal` to skip its O(N)
+    /// mailbox scan and the `update_load`/`tick` EWMA recompute entirely
+    /// when nothing has been pushed to any of this worker's mailboxes
+    /// since the last full drain — see `poll_mailboxes`'s doc comment for
+    /// why an early exit (local queue nearing capacity) must leave this
+    /// stale rather than advance it. Plain `Cell`, not atomic, for the
+    /// same single-owner reason as `queue_ewma`. Declared here (before
+    /// `queue_ewma`) so `repr(C)` doesn't need to insert alignment padding
+    /// between `ticks` and this `u32`-aligned field.
+    last_polled_signal: core::cell::Cell<u32>,
     /// Exponential moving average of this worker's own recent
     /// `local_queue_len()`, used as the "recent normal" baseline for the
     /// relative-anomaly half of `load_level` (see [`EWMA_ALPHA`]). Plain
@@ -878,8 +890,8 @@ pub struct Worker {
     load_scale_shift: u8,
     // Fill cache line 0 to 64 bytes.
     // cpu(6) + load_level(1) + deflection_threshold(1) + local_head(8) + local_tail(8) + ticks(8)
-    //   + queue_ewma(4) + push_count(2) + load_scale_shift(1) = 39
-    _pad0: [u8; 25],
+    //   + last_polled_signal(4) + queue_ewma(4) + push_count(2) + load_scale_shift(1) = 43
+    _pad0: [u8; 21],
 
     /// Counter for hardware-assisted wakeups (WFE/umonitor).
     /// Isolated on its own cache line: remote workers write here via `signal_worker`,
@@ -926,10 +938,11 @@ impl Worker {
             local_head: AtomicUsize::new(0),
             local_tail: AtomicUsize::new(0),
             ticks: 0,
+            last_polled_signal: core::cell::Cell::new(0),
             queue_ewma: core::cell::Cell::new(0.0),
             push_count: core::cell::Cell::new(0),
             load_scale_shift: load_scale_shift_for(total_cores),
-            _pad0: [0; 25],
+            _pad0: [0; 21],
             event_signal: AtomicU32::new(0),
             _pad1: [0; 60],
             local_queue: HugeBuffer::new()?,
@@ -1644,6 +1657,38 @@ impl DtaScheduler {
     /// Returns `true` if at least one chunk was received from any mailbox,
     /// allowing the caller to detect activity without extra queue-length reads.
     ///
+    /// # Fast path: skip everything when nothing is pending
+    ///
+    /// `signal_worker` bumps `Worker::event_signal` once per successful
+    /// mailbox push, at every push site (`enqueue_pinned`,
+    /// `push_chunk_with_hop`, the external-mailbox push) — it already
+    /// exists to wake a deeply-idle worker from WFE/umonitor. This function
+    /// also uses it to skip its own body entirely — the O(N) scan over
+    /// `polling_order` below, and the `update_load`/`tick` EWMA recompute
+    /// at the end — when nothing has been pushed to any of this worker's
+    /// mailboxes since the last call that fully drained them. Both
+    /// production `run_worker_static` and the benchmark harness call this
+    /// function unconditionally on every idle-loop iteration, so without
+    /// this gate an idle worker pays a full N-mailbox scan plus a
+    /// floating-point EWMA recompute on every spin — profiling
+    /// (`benches/numa_information_cost.rs`) showed this dominating DTA's
+    /// wall-clock cost far more than the scheduling algorithm itself.
+    ///
+    /// This mirrors `warehouse.is_busy()`'s existing role gating
+    /// `drain_warehouse` (`run_worker_static`) — the mailbox matrix simply
+    /// never had the equivalent cheap gate.
+    ///
+    /// **Why an early exit must leave the checkpoint stale**: the polling
+    /// loops below can stop before a row is fully drained if the local
+    /// queue nears capacity. If the checkpoint were unconditionally
+    /// advanced to the observed `event_signal` value regardless, leftover
+    /// chunks in that row could be stranded forever — nothing would force
+    /// a re-scan unless an unrelated future push happens to bump the
+    /// signal again. So the checkpoint only advances when every row was
+    /// actually drained to empty; otherwise the next call retries
+    /// unconditionally, self-resolving as soon as the local queue drains
+    /// (at most one harmless redundant scan).
+    ///
     /// `local_head` is cached once before the polling loops because it does
     /// not change here (we are only pushing work, not consuming). Only
     /// `local_tail` is re-loaded per iteration, halving the atomic reads in
@@ -1651,6 +1696,11 @@ impl DtaScheduler {
     #[inline(always)]
     pub fn poll_mailboxes(&self, current_core: usize) -> bool {
         let worker = unsafe { &mut *self.workers[current_core].get() };
+
+        let observed_signal = worker.event_signal.load(Ordering::Acquire);
+        if observed_signal == worker.last_polled_signal.get() {
+            return false;
+        }
 
         // local_head is immutable during this function — cache it once.
         let fixed_head = worker.local_head.load(Ordering::Relaxed);
@@ -1660,6 +1710,7 @@ impl DtaScheduler {
             .wrapping_sub(fixed_head)
             & LOCAL_QUEUE_MASK;
         let mut received_any = false;
+        let mut capacity_limited = false;
 
         let num_polls = worker.polling_order.len();
         for idx in 0..num_polls {
@@ -1676,6 +1727,11 @@ impl DtaScheduler {
 
             loop {
                 if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
+                    // Cold: the local queue nearing capacity is an edge
+                    // condition, not the steady-state case this loop runs
+                    // under.
+                    core::hint::cold_path();
+                    capacity_limited = true;
                     break;
                 }
                 // SAFETY: `current_core` is always a valid worker index —
@@ -1698,6 +1754,8 @@ impl DtaScheduler {
         // to internal CCX traffic when both are active.
         loop {
             if cur_len + CHUNK_SIZE >= LOCAL_QUEUE_CAPACITY {
+                core::hint::cold_path();
+                capacity_limited = true;
                 break;
             }
             match self.external_mailboxes[current_core].pop() {
@@ -1708,6 +1766,10 @@ impl DtaScheduler {
                 }
                 None => break,
             }
+        }
+
+        if !capacity_limited {
+            worker.last_polled_signal.set(observed_signal);
         }
 
         let load = worker.update_load(cur_len);
