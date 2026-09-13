@@ -43,6 +43,9 @@
     clippy::nursery,
     clippy::single_call_fn
 )]
+#![allow(clippy::unused_async)]
+#![allow(clippy::future_not_send)]
+#![allow(unknown_lints, clippy::unused_async_trait_impl)]
 // -------------------------------------------------------------------------
 // LEVEL 2: STYLE WARNINGS (Warn)
 // -------------------------------------------------------------------------
@@ -51,7 +54,6 @@
     warnings,
     clippy::dbg_macro,
     clippy::todo,
-    clippy::unused_async,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
@@ -63,7 +65,6 @@
 #![allow(
     unsafe_code,
     unused_unsafe,
-    clippy::unused_async,
     private_interfaces,
     clippy::restriction,
     clippy::inline_always,
