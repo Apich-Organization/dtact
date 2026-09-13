@@ -774,21 +774,32 @@ impl Worker {
         tail.wrapping_sub(head) & LOCAL_QUEUE_MASK
     }
 
-    /// Updates the `load_level` based on the current queue length.
+    /// Updates the `load_level` from a caller-supplied queue length.
+    ///
+    /// Takes `queue_len` instead of calling [`Worker::local_queue_len`] itself:
+    /// every current caller (`poll_mailboxes`) already tracks the length
+    /// incrementally as it drains mailboxes, so recomputing it here would mean
+    /// two more redundant atomic loads of `local_head`/`local_tail` on every
+    /// scheduler tick. Returns the freshly computed load so callers that need
+    /// it right after (e.g. [`Worker::tick`]) can reuse it instead of
+    /// re-issuing an atomic load against the value this call just stored.
     #[inline(always)]
-    pub fn update_load(&self) {
-        let queue_len = self.local_queue_len();
+    pub fn update_load(&self, queue_len: usize) -> u8 {
         #[allow(clippy::cast_possible_truncation)]
         let load = core::cmp::min((queue_len * 100) >> 13, 100) as u8;
         self.load_level.store(load, Ordering::Relaxed);
+        load
     }
 
     /// Performs internal maintenance tasks (e.g., adaptive threshold updates).
+    ///
+    /// `load` is the value [`Worker::update_load`] just stored into
+    /// `load_level` — passed in rather than re-read, since this worker is the
+    /// only writer and already holds it.
     #[inline(always)]
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self, load: u8) {
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks.trailing_zeros() >= 10 {
-            let load = self.load_level.load(Ordering::Relaxed);
             let current_thresh = self.deflection_threshold.load(Ordering::Relaxed);
 
             let new_thresh = if load > 90 {
@@ -805,10 +816,18 @@ impl Worker {
     }
 
     /// Pushes a single task into the local queue. Returns true if successful.
+    ///
+    /// Computes the queue length inline from a single `tail` load shared with
+    /// the write below, instead of calling `local_queue_len()` — which would
+    /// reload `tail` a second time on top of `head`. Only this worker thread
+    /// ever touches `local_tail`, so the two reads are always identical; the
+    /// second one was pure redundant atomic traffic on this hot enqueue path.
     #[inline(always)]
     pub fn push_local(&self, task: TaskIndex) -> bool {
         let tail = self.local_tail.load(Ordering::Relaxed);
-        if self.local_queue_len() >= LOCAL_QUEUE_CAPACITY - 1 {
+        let head = self.local_head.load(Ordering::Relaxed);
+        let queue_len = tail.wrapping_sub(head) & LOCAL_QUEUE_MASK;
+        if queue_len >= LOCAL_QUEUE_CAPACITY - 1 {
             return false;
         }
         unsafe {
@@ -1389,8 +1408,8 @@ impl DtaScheduler {
             }
         }
 
-        worker.update_load();
-        worker.tick();
+        let load = worker.update_load(cur_len);
+        worker.tick(load);
         received_any
     }
 
