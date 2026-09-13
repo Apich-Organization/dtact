@@ -1363,7 +1363,8 @@ impl DtaScheduler {
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        let added = self.route_chunk(worker, current_core, chunk, cur_len, &mut cur_tail);
+                        let added =
+                            self.route_chunk(worker, current_core, chunk, cur_len, &mut cur_tail);
                         cur_len += added;
                     }
                     None => break,
@@ -1380,7 +1381,8 @@ impl DtaScheduler {
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    let added = self.route_chunk(worker, current_core, chunk, cur_len, &mut cur_tail);
+                    let added =
+                        self.route_chunk(worker, current_core, chunk, cur_len, &mut cur_tail);
                     cur_len += added;
                 }
                 None => break,
@@ -1430,7 +1432,13 @@ impl DtaScheduler {
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk, cur_tail: &mut usize) {
+    fn route_local(
+        &self,
+        worker: &mut Worker,
+        _core: usize,
+        chunk: TaskChunk,
+        cur_tail: &mut usize,
+    ) {
         worker.push_batch(&chunk, cur_tail);
     }
 
