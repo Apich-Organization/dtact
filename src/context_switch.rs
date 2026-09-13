@@ -168,7 +168,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
     );
 }
 
-/// Switches execution context while preserving floating-point state (Unix AArch64).
+/// Switches execution context while preserving floating-point state (Unix `AArch64`).
 ///
 /// Implements BTI and PAC protection. Preserves x19-x30 and SIMD d8-d15 (q8-q15 saved).
 ///
@@ -645,7 +645,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_no_float(
     );
 }
 
-/// Switches execution context without preserving floating-point state (Unix AArch64).
+/// Switches execution context without preserving floating-point state (Unix `AArch64`).
 ///
 /// Includes BTI and PAC protection.
 ///
@@ -1060,7 +1060,7 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
     );
 }
 
-/// Lightweight context switch for fibers pinned to the current thread (Unix AArch64).
+/// Lightweight context switch for fibers pinned to the current thread (Unix `AArch64`).
 ///
 /// Skips TIB/TEB metadata preservation but maintains BTI and PAC security.
 ///
@@ -1535,7 +1535,7 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
     );
 }
 
-/// The fastest possible context switch: same-thread and no floating-point (Unix AArch64).
+/// The fastest possible context switch: same-thread and no floating-point (Unix `AArch64`).
 ///
 /// Includes BTI and PAC security.
 ///

@@ -808,7 +808,11 @@ impl Worker {
     #[inline(always)]
     pub fn push_local(&self, task: TaskIndex) -> bool {
         let tail = self.local_tail.load(Ordering::Relaxed);
-        if self.local_queue_len() >= LOCAL_QUEUE_CAPACITY - 1 {
+        let head = self.local_head.load(Ordering::Relaxed);
+        // Inline the queue length calculation here instead of calling `local_queue_len()`
+        // to avoid a redundant atomic load of `local_tail`, which we just loaded above.
+        let len = tail.wrapping_sub(head) & LOCAL_QUEUE_MASK;
+        if len >= LOCAL_QUEUE_CAPACITY - 1 {
             return false;
         }
         unsafe {
