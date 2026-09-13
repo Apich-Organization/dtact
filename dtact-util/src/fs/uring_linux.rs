@@ -452,10 +452,16 @@ impl DtactFile {
     /// Returns whatever `std::fs::OpenOptions::open` returns for `path`
     /// with `opts` applied (e.g. `NotFound`, `PermissionDenied`,
     /// `AlreadyExists` depending on which `OpenOptions` flags are set).
-    pub async fn open_with(
+    // `opts` is only ever borrowed internally (`OpenOptions::open` takes
+    // `&self`), but taking it by value here is the existing, stable public
+    // API (unrelated to the `async` removal above) — changing it to `&_`
+    // would be a breaking signature change for callers, not a clippy-only
+    // fix.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn open_with(
         path: impl Into<PathBuf>,
         opts: std::fs::OpenOptions,
-    ) -> io::Result<Self> {
+    ) -> impl std::future::Future<Output = io::Result<Self>> {
         // `std::fs::OpenOptions` has no public flag getters; delegate to
         // its own (synchronous) `open()` for flag resolution, then hand
         // the resulting fd off to the ring for all subsequent async ops.
@@ -464,13 +470,15 @@ impl DtactFile {
         // fully io_uring-async. A pure-uring open would need to duplicate
         // `OpenOptions`' private flag-computation logic here instead.
         use std::os::unix::io::IntoRawFd;
-        let path = path.into();
-        let file = opts.open(&path)?;
-        let fd = file.into_raw_fd();
-        Ok(Self {
-            fd,
-            cursor: AtomicI64::new(0),
-        })
+        std::future::ready((|| {
+            let path = path.into();
+            let file = opts.open(&path)?;
+            let fd = file.into_raw_fd();
+            Ok(Self {
+                fd,
+                cursor: AtomicI64::new(0),
+            })
+        })())
     }
 
     /// Read at the file's shared cursor, advancing it by the number of
@@ -579,7 +587,7 @@ impl DtactFile {
     ///
     /// Returns an `io::Error` if the underlying `fstat` fails (e.g. the
     /// fd was closed concurrently).
-    pub async fn metadata(&self) -> io::Result<std::fs::Metadata> {
+    pub fn metadata(&self) -> impl std::future::Future<Output = io::Result<std::fs::Metadata>> {
         // `Statx` needs a scratch `statx` buffer plus a conversion to
         // `std::fs::Metadata`, which has no public constructor from raw
         // `statx` fields. Fall back to a direct `fstat` via a borrowed
@@ -591,7 +599,7 @@ impl DtactFile {
         let file = std::mem::ManuallyDrop::new(file);
         let meta = file.metadata();
         let _ = file.as_raw_fd();
-        meta
+        std::future::ready(meta)
     }
 
     /// Explicitly close this file via a ring-submitted `Close`, rather

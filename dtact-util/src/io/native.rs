@@ -2685,9 +2685,13 @@ impl DtactUdpSocket {
     ///
     /// # Errors
     /// Returns any error from binding the OS socket or registering it.
-    pub async fn bind(addr: std::net::SocketAddr) -> std::io::Result<Self> {
-        let sock = std::net::UdpSocket::bind(addr)?;
-        Self::from_std(sock)
+    pub fn bind(
+        addr: std::net::SocketAddr,
+    ) -> impl std::future::Future<Output = std::io::Result<Self>> {
+        std::future::ready((|| {
+            let sock = std::net::UdpSocket::bind(addr)?;
+            Self::from_std(sock)
+        })())
     }
 
     /// Register an existing (already-bound) `std::net::UdpSocket`, taking
@@ -2864,8 +2868,11 @@ impl DtactUdpSocket {
     ///
     /// # Errors
     /// Returns any error from the underlying `connect`.
-    pub async fn connect(&self, addr: std::net::SocketAddr) -> std::io::Result<()> {
-        self.inner.connect(addr)
+    pub fn connect(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> {
+        std::future::ready(self.inner.connect(addr))
     }
 
     /// Send `buf` to the connected peer, returning the number of bytes sent.
@@ -3885,8 +3892,11 @@ impl DtactUnixDatagram {
     ///
     /// # Errors
     /// Returns any error from the underlying `connect`.
-    pub async fn connect(&self, target: impl AsRef<std::path::Path>) -> std::io::Result<()> {
-        self.inner.connect(target)
+    pub fn connect(
+        &self,
+        target: impl AsRef<std::path::Path>,
+    ) -> impl std::future::Future<Output = std::io::Result<()>> {
+        std::future::ready(self.inner.connect(target))
     }
 
     /// Send `buf` to the connected peer, returning the number of bytes
