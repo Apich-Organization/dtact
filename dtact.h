@@ -12,9 +12,151 @@
 #include <stdlib.h>
 
 /*
+ Uncontended CAS latency `c_CAS^(0)`, in nanoseconds (paper §`numa_concrete`).
+ */
+#define CAS_BASE_NS 100
+
+/*
  Number of tasks in a single `TaskChunk`.
  */
 #define CHUNK_SIZE 32
+
+/*
+ Additive cross-socket penalty: `δ_inter - δ_intra`.
+
+ Charged on top of a real, locally-measured operation when that
+ operation crosses a virtual socket boundary — in addition to (not
+ instead of) the real measured local cost, so the model never claims to
+ replace real timing; it only approximates the extra cost real
+ dual-socket hardware would have added.
+ */
+#define CROSS_SOCKET_PENALTY_NS (DELTA_INTER_NS - DELTA_INTRA_NS)
+
+/*
+ Cross-socket NUMA latency `δ_inter`, in nanoseconds (paper §`numa_concrete`).
+ */
+#define DELTA_INTER_NS 300
+
+/*
+ Intra-socket SPSC latency `δ_intra`, in nanoseconds (paper §`numa_concrete`).
+ */
+#define DELTA_INTRA_NS 80
+
+/*
+ EWMA decay rate `Worker::update_load` uses to track a worker's own
+ recent-normal queue depth.
+
+ The standard `ewma += α·(sample − ewma)` update — the same form as
+ TCP's RTT estimator. Smaller values adapt faster (more weight on the
+ newest sample) but track transient spikes more readily as "the new
+ normal"; larger values are slower to adapt but more resistant to being
+ dragged around by a single burst. A plain `f32` constant, computed via
+ [`f32::algebraic_mul`]/[`f32::algebraic_add`]/[`f32::algebraic_sub`] in
+ `update_load` rather than hand-rolled fixed-point integer arithmetic —
+ simpler, and those methods let the compiler reassociate/fuse the
+ expression the way it could for any other floating-point code, without
+ the strict IEEE-754 ordering `+`/`-`/`*` would otherwise force on an
+ already-approximate estimator.
+ */
+#define EWMA_ALPHA 0.125
+
+/*
+ How many multiples of a worker's own recent-average queue depth counts
+ as fully anomalous (maps to a 100% relative-load signal).
+
+ E.g. `3` means "queue depth at 3× my own recent normal is as urgent as
+ being at the absolute capacity ceiling."
+ */
+#define EWMA_ANOMALY_MULTIPLIER 3.0
+
+/*
+ Floor under the EWMA baseline used when computing the relative-anomaly
+ signal.
+
+ Without it, a worker with a near-zero recent history (freshly started,
+ or idle for a while — exactly the state a burst typically starts from)
+ would divide by (approximately) zero; instead it reacts to even a
+ modest queue depth as maximally anomalous, which is the correct
+ behaviour for that case: an idle worker suddenly holding *any*
+ meaningful backlog *is* anomalous relative to its own recent history.
+ */
+#define EWMA_MIN_BASELINE 4.0
+
+/*
+ How many same-core enqueues [`Worker::push_local`] accepts before
+ refreshing `load_level`.
+
+ Must be a power of two (checked via `trailing_zeros`, matching the
+ style of [`Worker::tick`]'s periodic threshold adjustment).
+
+ Without this, `load_level` — and therefore `enqueue_deflect`'s
+ stay-local-vs-deflect decision — is only ever refreshed *between* full
+ drains of a worker's local queue (inside `poll_mailboxes`, called after
+ `Worker::dispatch_loop` returns). Two related patterns both defeat that:
+ a fiber that spawns many children in one synchronous burst (a single
+ `push_local` storm from one `switch_fn` call, which `dispatch_loop`'s
+ outer loop never gets to observe mid-storm), and a recursive fan-out
+ where each child is its own separately-dispatched fiber that itself
+ spawns more children before ever yielding (many small `dispatch_loop`
+ iterations, none of which return to the outer scheduler loop until the
+ whole subtree drains). Either way — still a Bag-of-Tasks in the sense of
+ having no inter-task dependencies, just arriving as one internal burst
+ rather than a temporally-spread external one — the *entire* burst can
+ run to completion on a single worker: every `enqueue_deflect` call along
+ the way reads the same pre-burst `load_level`, which never reflects the
+ backlog the burst is itself creating, so it never crosses
+ `deflection_threshold` and nothing ever gets deflected, no matter how
+ large that backlog actually gets. Refreshing inside `push_local` itself
+ — the one choke point both patterns funnel through — catches both.
+ 32 enqueues is frequent enough to catch a growing backlog well before it
+ threatens `LOCAL_QUEUE_CAPACITY`, while being far too infrequent (one
+ extra `local_tail`/`local_head` load, one `store`, every 32 pushes) to
+ show up against the cost of the pushes themselves.
+ */
+#define LOAD_REFRESH_PERIOD 32
+
+/*
+ The worker count `Worker::new`'s N-aware load scale is calibrated against.
+
+ At exactly this many total workers, [`Worker::update_load`]'s
+ absolute-backlog signal behaves identically to the crate's original
+ fixed `queue_len >> 13` formula (i.e. "100% load" at `queue_len =
+ 8192`) — the configuration this project's own tests and benchmarks have
+ actually been tuned and validated against. See
+ [`LOAD_SCALE_REFERENCE_SHIFT`] for why: N above this reference gets a
+ *smaller* absolute trigger point (each worker's fair share of a burst
+ shrinks as there are more peers to share it with), N below gets a
+ *larger* one, and N at the reference is untouched.
+ */
+#define LOAD_SCALE_REFERENCE_N 8
+
+/*
+ The `>>` shift `Worker::update_load` used unconditionally before the
+ N-aware fix — see [`LOAD_SCALE_REFERENCE_N`].
+
+ `u8`: shift amounts for a `usize`/`u64` value never need more than a
+ handful of bits, and [`Worker`] packs this into the same cache line as
+ several other small fields — no reason to spend 4 bytes representing a
+ number that never exceeds [`LOAD_SCALE_SHIFT_MAX`].
+ */
+#define LOAD_SCALE_REFERENCE_SHIFT 13
+
+/*
+ See [`LOAD_SCALE_SHIFT_MIN`].
+ */
+#define LOAD_SCALE_SHIFT_MAX 17
+
+/*
+ Clamp on `Worker::update_load`'s per-worker absolute-backlog shift.
+
+ Keeps pathological worker counts (a single-worker degenerate run, or a
+ hypothetical many-thousand-way deployment) from pushing the "100% load"
+ queue depth to somewhere absurd (respectively: never, or after a
+ literal handful of tasks). `1 << 17` (`LOCAL_QUEUE_CAPACITY`) and `1 <<
+ 4` bound the trigger's absolute queue depth to `[16, 131072]`
+ regardless of `N`.
+ */
+#define LOAD_SCALE_SHIFT_MIN 4
 
 /*
  Capacity of a worker's local execution queue.
@@ -44,6 +186,11 @@
  Mask for mailbox index wrap-around.
  */
 #define MAILBOX_MASK (MAILBOX_CAPACITY - 1)
+
+/*
+ SPSC read cost `c_SPSC` (paper sets this equal to `δ_intra`).
+ */
+#define SPSC_COST_NS DELTA_INTRA_NS
 
 /*
  Warehouse capacity in chunks. 32 768 chunks × 32 tasks = 1 048 576 tasks of
@@ -126,14 +273,24 @@ extern "C" {
 /*
  Blocks the current thread until the specified fiber terminates.
 
- If called from a Dtact fiber, this will natively yield the physical core.
- If called from a non-managed thread (e.g., C main), this uses a tiered
- spin-loop and futex-wait strategy for zero-CPU idling.
+ C-ABI entry point; see [`dtact_await_observe`] for the full protocol
+ and why a Rust caller wanting to know *how* the fiber terminated
+ should use [`crate::api::outcome`] instead, which captures that
+ information in the same read that confirms termination.
 
  # Panics
  * Panics if the runtime is not initialized.
  */
  void dtact_await(dtact_handle_t aHandle) ;
+
+/*
+ Requests cooperative cancellation of the fiber referred to by `handle`.
+
+ C-ABI counterpart of [`crate::api::cancel`] — see its documentation for
+ the cancellation protocol (cooperative, not preemptive) and the
+ generation-checked stale-handle guard.
+ */
+ void dtact_cancel(dtact_handle_t aHandle) ;
 
 /*
  Returns the recommended default configuration for the Dtact runtime.
