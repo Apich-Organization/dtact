@@ -1,0 +1,3 @@
+## 2024-05-18 - Optimize redundant atomic loads in SPSC hot paths
+**Learning:** In high-frequency loops involving atomic variables (e.g., SPSC queues like `local_tail`), repeatedly loading thread-local atomic variables in helper functions like `push_batch` and `push_local` introduces unnecessary redundant atomic load instructions which LLVM cannot optimize away.
+**Action:** When a thread modifies state, hoist the atomic load out of loops or helper functions, pass the cached value down, have helpers return the updated state/delta, and accumulate the state to avoid redundant atomic reads without bypassing safety limits.
