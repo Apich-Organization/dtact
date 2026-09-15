@@ -817,8 +817,7 @@ impl Worker {
         }
         let new_tail = (tail + 1) & LOCAL_QUEUE_MASK;
         // Relaxed: only this worker thread reads local_tail.
-        self.local_tail
-            .store(new_tail, Ordering::Relaxed);
+        self.local_tail.store(new_tail, Ordering::Relaxed);
         Some(new_tail)
     }
 
@@ -860,8 +859,7 @@ impl Worker {
         }
         let new_tail = end_idx & LOCAL_QUEUE_MASK;
         // Relaxed: push_batch is only called from the local worker thread.
-        self.local_tail
-            .store(new_tail, Ordering::Relaxed);
+        self.local_tail.store(new_tail, Ordering::Relaxed);
         new_tail
     }
 
@@ -1366,7 +1364,8 @@ impl DtaScheduler {
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        let (added, new_tail) = self.route_chunk(worker, current_core, chunk, cur_len, current_tail);
+                        let (added, new_tail) =
+                            self.route_chunk(worker, current_core, chunk, cur_len, current_tail);
                         cur_len += added;
                         current_tail = new_tail;
                     }
@@ -1384,7 +1383,8 @@ impl DtaScheduler {
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    let (added, new_tail) = self.route_chunk(worker, current_core, chunk, cur_len, current_tail);
+                    let (added, new_tail) =
+                        self.route_chunk(worker, current_core, chunk, cur_len, current_tail);
                     cur_len += added;
                     current_tail = new_tail;
                 }
@@ -1435,7 +1435,13 @@ impl DtaScheduler {
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk, tail: usize) -> usize {
+    fn route_local(
+        &self,
+        worker: &mut Worker,
+        _core: usize,
+        chunk: TaskChunk,
+        tail: usize,
+    ) -> usize {
         worker.push_batch(&chunk, tail)
     }
 
