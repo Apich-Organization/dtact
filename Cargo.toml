@@ -132,3 +132,8 @@ required-features = ["benchmark"]
 name = "dta_forkjoin_bound"
 harness = false
 required-features = ["benchmark"]
+
+[[bench]]
+name = "dta_latency_bounds"
+harness = false
+required-features = ["benchmark"]

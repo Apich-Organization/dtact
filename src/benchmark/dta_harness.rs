@@ -384,6 +384,19 @@ impl DtaHarness {
         }
     }
 
+    /// Current local-queue depth for `core`, sampled live.
+    ///
+    /// Needed for benchmarks that test claims stated directly in terms of
+    /// worker queue depth rather than task latency — e.g.
+    /// `paper/main.tex`'s statistical makespan bound (`thm:stat-makespan`),
+    /// whose `C_max = max_i q_i^* · δ` is a queue-depth statistic, not
+    /// something derivable from per-task latency alone.
+    #[must_use]
+    pub fn local_queue_len(&self, core: usize) -> usize {
+        let worker = unsafe { &*self.scheduler.workers[core].get() };
+        worker.local_queue_len()
+    }
+
     /// Number of workers in this harness's declared topology.
     #[must_use]
     pub const fn worker_count(&self) -> usize {
