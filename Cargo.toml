@@ -122,3 +122,13 @@ required-features = ["benchmark"]
 name = "dta_deflect_overhead"
 harness = false
 required-features = ["benchmark"]
+
+[[bench]]
+name = "dta_load_ratio"
+harness = false
+required-features = ["benchmark"]
+
+[[bench]]
+name = "dta_forkjoin_bound"
+harness = false
+required-features = ["benchmark"]
