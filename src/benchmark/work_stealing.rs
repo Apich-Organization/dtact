@@ -109,7 +109,7 @@ impl WsScheduler {
             injector: Injector::new(),
             stealers,
             topology,
-            meter: AcquisitionMeter::new(),
+            meter: AcquisitionMeter::new(n),
             per_worker_completed: (0..n).map(|_| AtomicU64::new(0)).collect(),
             shutdown: AtomicBool::new(false),
             pending_deques: Mutex::new(Some(deques)),
@@ -177,13 +177,29 @@ fn worker_loop(sched: &WsScheduler, my_core: usize) {
             return;
         }
 
+        // Real measured local-pop charge, mirroring the DTA harness's own
+        // local `pop_local` timing (`dta_harness.rs::worker_loop`): a
+        // Chase-Lev deque's `pop()` is not free even for the owning
+        // thread — it still has to coordinate with concurrent stealers via
+        // real atomic operations near empty — and the paper's β formulas
+        // never actually claim a local pop costs nothing, they just don't
+        // spell out a value for it. Charging real measured cost here
+        // (rather than the previous zero) removes what was otherwise a
+        // one-sided asymmetry: the DTA harness charged every single
+        // dispatch, while this path charged none, silently diluting WS's
+        // empirical ns/task toward zero by however many tasks were served
+        // locally.
+        let pop_timer = Instant::now();
         let popped = LOCAL_DEQUE.with(|c| {
             let guard = c.borrow();
             guard.as_ref().and_then(Deque::pop)
         });
+        #[allow(clippy::cast_possible_truncation)]
+        let pop_ns = (pop_timer.elapsed().as_nanos() as u64).max(1);
         if let Some(task) = popped {
+            sched.meter.record_spsc(my_core, pop_ns);
             task(sched);
-            sched.meter.record_task_completed();
+            sched.meter.record_task_completed(my_core);
             sched.per_worker_completed[my_core].fetch_add(1, Ordering::Relaxed);
             idle_spins = 0;
             continue;
@@ -201,15 +217,15 @@ fn worker_loop(sched: &WsScheduler, my_core: usize) {
         let inj_ns = (inj_timer.elapsed().as_nanos() as u64).max(1);
         match inj_result {
             Steal::Success(task) => {
-                sched.meter.record_cas(inj_ns, true);
+                sched.meter.record_cas(my_core, inj_ns, true);
                 task(sched);
-                sched.meter.record_task_completed();
+                sched.meter.record_task_completed(my_core);
                 sched.per_worker_completed[my_core].fetch_add(1, Ordering::Relaxed);
                 idle_spins = 0;
                 continue;
             }
             Steal::Retry => {
-                sched.meter.record_cas(inj_ns, false);
+                sched.meter.record_cas(my_core, inj_ns, false);
             }
             Steal::Empty => {}
         }
@@ -237,13 +253,13 @@ fn worker_loop(sched: &WsScheduler, my_core: usize) {
             // single logical observation.
             let penalty_ns =
                 numa_model::charge_cross_socket_if_needed(&sched.topology, my_core, victim);
-            sched.meter.record_spsc(read_ns + penalty_ns);
+            sched.meter.record_spsc(my_core, read_ns + penalty_ns);
 
             match steal_result {
                 Steal::Success(task) => {
-                    sched.meter.record_cas(CAS_BASE_NS, true);
+                    sched.meter.record_cas(my_core, CAS_BASE_NS, true);
                     task(sched);
-                    sched.meter.record_task_completed();
+                    sched.meter.record_task_completed(my_core);
                     sched.per_worker_completed[my_core].fetch_add(1, Ordering::Relaxed);
                     idle_spins = 0;
                     continue;
@@ -252,7 +268,7 @@ fn worker_loop(sched: &WsScheduler, my_core: usize) {
                     // Lost a race for the same slot as another thief: the
                     // `Ω(log N)` CAS-contention term (paper's CAS-contention
                     // lemma) accumulates from events like this one.
-                    sched.meter.record_cas(CAS_BASE_NS, false);
+                    sched.meter.record_cas(my_core, CAS_BASE_NS, false);
                 }
                 Steal::Empty => {}
             }

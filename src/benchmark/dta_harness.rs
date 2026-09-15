@@ -364,7 +364,7 @@ impl DtaHarness {
             scheduler: DtaScheduler::new(n, TopologyMode::Global),
             slab: TaskSlab::new(task_capacity),
             topology,
-            meter: AcquisitionMeter::new(),
+            meter: AcquisitionMeter::new(n),
             per_worker_completed: (0..n).map(|_| AtomicU64::new(0)).collect(),
             shutdown: AtomicBool::new(false),
         }
@@ -435,18 +435,29 @@ impl DtaHarness {
             };
 
             let worker = unsafe { &*self.scheduler.workers[core].get() };
-            while let Some(task_idx) = worker.pop_local() {
-                activity = true;
-                // Flat per-task SPSC-read charge (`β_DTA(N) = Nλ·c_SPSC`):
-                // every dispatch, local or not, is one SPSC-style
-                // observation in DTA's design (even the local queue is an
-                // SPSC ring, not a free LIFO pop). `report_dta_hop` (called
-                // from `dta_scheduler.rs` on an actual cross-worker push)
+            loop {
+                // Real measured per-task SPSC-read charge (`β_DTA(N) =
+                // Nλ·c_SPSC`): every dispatch, local or not, is one
+                // SPSC-style observation in DTA's design (even the local
+                // queue is an SPSC ring, not a free LIFO pop) — timing the
+                // actual `pop_local` call, exactly like the WS baseline
+                // times its own local `Deque::pop()`
+                // (`work_stealing.rs::worker_loop`), rather than charging a
+                // flat theoretical constant: a hardcoded charge would make
+                // the "empirical vs. theoretical" ratio this benchmark
+                // reports tautological for DTA specifically, always
+                // reading exactly 1.0 regardless of what's actually
+                // measured. `report_dta_hop` (called from
+                // `dta_scheduler.rs` on an actual cross-worker push)
                 // charges only the *additional* cross-socket penalty on
-                // top of this base cost, so a purely local dispatch still
-                // registers DTA's constant baseline instead of reading as
-                // zero acquisition cost.
-                self.meter.record_spsc(super::numa_model::SPSC_COST_NS);
+                // top of this measured base cost.
+                let pop_timer = std::time::Instant::now();
+                let popped = worker.pop_local();
+                #[allow(clippy::cast_possible_truncation)]
+                let pop_ns = (pop_timer.elapsed().as_nanos() as u64).max(1);
+                let Some(task_idx) = popped else { break };
+                activity = true;
+                self.meter.record_spsc(core, pop_ns);
                 let task = self.slab.take(task_idx);
                 // `load_level` refresh during a same-core enqueue burst
                 // happens inside the real, unmodified `Worker::push_local`
@@ -455,7 +466,7 @@ impl DtaHarness {
                 // `enqueue_deflect`, which calls `push_local` on its
                 // same-core fast path, so no separate copy is needed here.
                 task(self);
-                self.meter.record_task_completed();
+                self.meter.record_task_completed(core);
                 self.per_worker_completed[core].fetch_add(1, Ordering::Relaxed);
             }
 

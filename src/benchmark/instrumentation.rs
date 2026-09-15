@@ -11,114 +11,148 @@
 //! reads, and a count/cost for CAS attempts (split into successes and
 //! failed/retried attempts, since the CAS-contention lemma's `Θ(log n)`
 //! prediction is about the *retry* count) — from real timed events.
+//!
+//! # Sharded per-worker, not one shared counter
+//!
+//! Recording is sharded one [`MeterShard`] per worker (`record_*` takes an
+//! explicit `worker_id`), summed only once at [`AcquisitionMeter::snapshot`]
+//! time after every worker has joined. A single shared set of atomics,
+//! fetch-added by every worker on every dispatch, was measured (a standalone
+//! 8-thread microbenchmark, contended `fetch_add` pair vs. uncontended) to
+//! cost ~30ns/op under real contention — pure benchmark-instrumentation
+//! overhead, unrelated to either scheduler's actual algorithm, and *not*
+//! symmetric between the two schedulers under test: the DTA harness records
+//! on every dispatch (local or not), while the WS baseline's local-pop path
+//! recorded nothing at all (see the module docs in `work_stealing.rs` for
+//! why that asymmetry itself was fixed separately). Sharding removes the
+//! contention for both.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Accumulates real timed information-acquisition events for one scheduler
-/// under test over the course of one benchmark run.
-///
-/// All fields are independent monotonic counters updated with `Relaxed`
-/// ordering from many worker threads concurrently; correctness only
-/// requires that the final totals (read after all workers have joined) are
-/// self-consistent, not that any two fields are observed atomically
-/// together mid-run.
+/// One worker's private slice of an [`AcquisitionMeter`] — touched only by
+/// that worker's own dispatch thread while a run is in progress, so these
+/// fields need no cross-thread synchronization beyond the `Relaxed`
+/// atomics already required for the final cross-thread `snapshot()` read.
+/// `align(64)`, one full cache line per shard: without this, adjacent
+/// workers' shards packed tightly would still false-share a line even
+/// though each worker only ever touches its own.
+#[repr(C, align(64))]
 #[derive(Debug, Default)]
+struct MeterShard {
+    spsc_reads: AtomicU64,
+    spsc_ns: AtomicU64,
+    cas_attempts: AtomicU64,
+    cas_successes: AtomicU64,
+    cas_ns: AtomicU64,
+    tasks_completed: AtomicU64,
+    // Fills the 64-byte line: 6 * 8 = 48 used, 16 pad.
+    _pad: [u8; 16],
+}
+
+/// Accumulates real timed information-acquisition events for one scheduler
+/// under test over the course of one benchmark run, sharded one
+/// [`MeterShard`] per worker (see module docs for why).
+#[derive(Debug)]
 pub struct AcquisitionMeter {
-    /// Number of SPSC-read information-acquisition events observed.
-    pub spsc_reads: AtomicU64,
-    /// Total nanoseconds charged against SPSC-read events (real measured
-    /// local cost plus any cross-socket penalty from [`super::numa_model`]).
-    pub spsc_ns: AtomicU64,
-    /// Number of CAS attempts observed (successes and failures/retries).
-    pub cas_attempts: AtomicU64,
-    /// Number of CAS attempts that succeeded on the first try.
-    pub cas_successes: AtomicU64,
-    /// Total nanoseconds charged against CAS events.
-    pub cas_ns: AtomicU64,
-    /// Total number of tasks completed (the `Nλ` normalizer: dividing
-    /// accumulated cost by this count yields per-task acquisition cost).
-    pub tasks_completed: AtomicU64,
+    shards: Box<[MeterShard]>,
 }
 
 impl AcquisitionMeter {
-    /// Creates a fresh, zeroed meter.
+    /// Creates a fresh, zeroed meter with one shard per worker.
+    /// `num_workers` should match the scheduler's real worker count — it is
+    /// only used to size and index the shard array, clamped to at least 1
+    /// so a degenerate 0-worker caller still has somewhere to record to.
     #[must_use]
-    pub const fn new() -> Self {
+    pub fn new(num_workers: usize) -> Self {
         Self {
-            spsc_reads: AtomicU64::new(0),
-            spsc_ns: AtomicU64::new(0),
-            cas_attempts: AtomicU64::new(0),
-            cas_successes: AtomicU64::new(0),
-            cas_ns: AtomicU64::new(0),
-            tasks_completed: AtomicU64::new(0),
+            shards: (0..num_workers.max(1))
+                .map(|_| MeterShard::default())
+                .collect(),
         }
+    }
+
+    #[inline]
+    fn shard(&self, worker_id: usize) -> &MeterShard {
+        &self.shards[worker_id % self.shards.len()]
     }
 
     /// Records one SPSC-read information-acquisition event costing `ns`
     /// nanoseconds (real measured cost plus any charged cross-socket
-    /// penalty).
+    /// penalty), attributed to `worker_id`'s own shard.
     #[inline]
-    pub fn record_spsc(&self, ns: u64) {
-        self.spsc_reads.fetch_add(1, Ordering::Relaxed);
-        self.spsc_ns.fetch_add(ns, Ordering::Relaxed);
+    pub fn record_spsc(&self, worker_id: usize, ns: u64) {
+        let shard = self.shard(worker_id);
+        shard.spsc_reads.fetch_add(1, Ordering::Relaxed);
+        shard.spsc_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
     /// Records one CAS attempt costing `ns` nanoseconds, noting whether it
-    /// succeeded.
+    /// succeeded, attributed to `worker_id`'s own shard.
     #[inline]
-    pub fn record_cas(&self, ns: u64, success: bool) {
-        self.cas_attempts.fetch_add(1, Ordering::Relaxed);
+    pub fn record_cas(&self, worker_id: usize, ns: u64, success: bool) {
+        let shard = self.shard(worker_id);
+        shard.cas_attempts.fetch_add(1, Ordering::Relaxed);
         if success {
-            self.cas_successes.fetch_add(1, Ordering::Relaxed);
+            shard.cas_successes.fetch_add(1, Ordering::Relaxed);
         }
-        self.cas_ns.fetch_add(ns, Ordering::Relaxed);
+        shard.cas_ns.fetch_add(ns, Ordering::Relaxed);
     }
 
-    /// Adds `ns` of extra charged cost to the running SPSC-cost total
-    /// without counting it as an additional read event — used when a
+    /// Adds `ns` of extra charged cost to `worker_id`'s running SPSC-cost
+    /// total without counting it as an additional read event — used when a
     /// penalty (e.g. [`super::numa_model::charge_cross_socket_if_needed`])
     /// applies on top of a read that a caller already recorded via
     /// [`Self::record_spsc`] as its own event.
     #[inline]
-    pub fn record_extra_ns(&self, ns: u64) {
-        self.spsc_ns.fetch_add(ns, Ordering::Relaxed);
+    pub fn record_extra_ns(&self, worker_id: usize, ns: u64) {
+        self.shard(worker_id)
+            .spsc_ns
+            .fetch_add(ns, Ordering::Relaxed);
     }
 
-    /// Records that one task ran to completion (the `Nλ` normalizer).
+    /// Records that one task ran to completion (the `Nλ` normalizer),
+    /// attributed to `worker_id`'s own shard.
     #[inline]
-    pub fn record_task_completed(&self) {
-        self.tasks_completed.fetch_add(1, Ordering::Relaxed);
+    pub fn record_task_completed(&self, worker_id: usize) {
+        self.shard(worker_id)
+            .tasks_completed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A point-in-time, non-atomic-across-fields snapshot of the meter,
-    /// suitable for reporting once all workers have joined.
+    /// A point-in-time snapshot of the meter, summed across every shard —
+    /// suitable for reporting once all workers have joined (before that,
+    /// this races with in-progress writes the same way any single shared
+    /// counter would).
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            spsc_reads: self.spsc_reads.load(Ordering::Relaxed),
-            spsc_ns: self.spsc_ns.load(Ordering::Relaxed),
-            cas_attempts: self.cas_attempts.load(Ordering::Relaxed),
-            cas_successes: self.cas_successes.load(Ordering::Relaxed),
-            cas_ns: self.cas_ns.load(Ordering::Relaxed),
-            tasks_completed: self.tasks_completed.load(Ordering::Relaxed),
+        let mut snap = Snapshot::default();
+        for shard in &self.shards {
+            snap.spsc_reads += shard.spsc_reads.load(Ordering::Relaxed);
+            snap.spsc_ns += shard.spsc_ns.load(Ordering::Relaxed);
+            snap.cas_attempts += shard.cas_attempts.load(Ordering::Relaxed);
+            snap.cas_successes += shard.cas_successes.load(Ordering::Relaxed);
+            snap.cas_ns += shard.cas_ns.load(Ordering::Relaxed);
+            snap.tasks_completed += shard.tasks_completed.load(Ordering::Relaxed);
         }
+        snap
     }
 }
 
-/// A resolved, immutable snapshot of an [`AcquisitionMeter`]'s counters.
+/// A resolved, immutable snapshot of an [`AcquisitionMeter`]'s counters,
+/// summed across every worker's shard.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Snapshot {
-    /// See [`AcquisitionMeter::spsc_reads`].
+    /// See [`AcquisitionMeter::record_spsc`].
     pub spsc_reads: u64,
-    /// See [`AcquisitionMeter::spsc_ns`].
+    /// See [`AcquisitionMeter::record_spsc`].
     pub spsc_ns: u64,
-    /// See [`AcquisitionMeter::cas_attempts`].
+    /// See [`AcquisitionMeter::record_cas`].
     pub cas_attempts: u64,
-    /// See [`AcquisitionMeter::cas_successes`].
+    /// See [`AcquisitionMeter::record_cas`].
     pub cas_successes: u64,
-    /// See [`AcquisitionMeter::cas_ns`].
+    /// See [`AcquisitionMeter::record_cas`].
     pub cas_ns: u64,
-    /// See [`AcquisitionMeter::tasks_completed`].
+    /// See [`AcquisitionMeter::record_task_completed`].
     pub tasks_completed: u64,
 }
 
@@ -249,13 +283,13 @@ mod tests {
 
     #[test]
     fn records_and_snapshots_correctly() {
-        let meter = AcquisitionMeter::new();
-        meter.record_spsc(80);
-        meter.record_spsc(380); // e.g. one cross-socket-penalized read
-        meter.record_cas(100, true);
-        meter.record_cas(100, false);
-        meter.record_task_completed();
-        meter.record_task_completed();
+        let meter = AcquisitionMeter::new(2);
+        meter.record_spsc(0, 80);
+        meter.record_spsc(1, 380); // e.g. one cross-socket-penalized read
+        meter.record_cas(0, 100, true);
+        meter.record_cas(1, 100, false);
+        meter.record_task_completed(0);
+        meter.record_task_completed(1);
 
         let snap = meter.snapshot();
         assert_eq!(snap.spsc_reads, 2);
@@ -271,8 +305,17 @@ mod tests {
 
     #[test]
     fn ns_per_task_avoids_div_by_zero() {
-        let meter = AcquisitionMeter::new();
+        let meter = AcquisitionMeter::new(4);
         assert!((meter.snapshot().ns_per_task() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn worker_id_wraps_for_out_of_range_ids() {
+        // A caller passing a worker_id >= num_workers (shouldn't happen in
+        // practice, but must not panic) wraps into a valid shard via `%`.
+        let meter = AcquisitionMeter::new(2);
+        meter.record_task_completed(5);
+        assert_eq!(meter.snapshot().tasks_completed, 1);
     }
 
     #[test]

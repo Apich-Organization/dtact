@@ -124,6 +124,10 @@ pub(crate) fn report_dta_hop(source: usize, target: usize) {
         // could reach this function has already joined (see doc comment
         // above).
         let meter = unsafe { &*meter_ptr };
-        meter.record_extra_ns(penalty_ns);
+        // Attributed to `source`'s shard: that's the worker whose dispatch
+        // (popping the task that's now being spawned/deflected) already
+        // recorded this task's base SPSC charge, so the extra cross-socket
+        // cost lands on the same shard it's extending.
+        meter.record_extra_ns(source, penalty_ns);
     }
 }
