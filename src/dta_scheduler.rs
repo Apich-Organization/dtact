@@ -156,9 +156,26 @@ pub struct TaskChunk {
     pub hop_count: u8,
     /// Reserved for future use; keeps the chunk 4-byte aligned for the trailing pad.
     _flags: u8,
-    /// Padding so the chunk's stride is 144 B and cleanly slices into cache lines.
+    /// Rounds the chunk's stride to 144 B (a multiple of 16, not of the
+    /// 64-byte cache line — see below).
     _pad: [u8; 12],
 }
+
+// Deliberately NOT cache-line-aligned, despite `Mailbox::buffer` storing a
+// raw `[TaskChunk; MAILBOX_CAPACITY]` with no per-slot padding: at 144 B
+// (2.25 cache lines), consecutive chunks in that array drift across line
+// boundaries rather than each starting fresh, so a producer writing chunk
+// `i` and a consumer reading chunk `i-1` can occasionally share a line —
+// checked and rejected padding to 192 B (the next 64-byte multiple that
+// fits 132 B of real data) because `Mailbox` is one of `N*(N-1)` in a
+// full P2P mesh, each `MAILBOX_CAPACITY = 65536` slots deep: the extra
+// 48 B/slot is ~3 MB *per mailbox*, which is tens of GB in aggregate at
+// the worker counts this crate targets (e.g. N=128 → ~48 GB). Accepted
+// instead because `Mailbox` is genuinely SPSC — the occasional line
+// shared between the one producer and the one consumer is, at worst, a
+// wider read/write than strictly necessary, not the classic multi-writer
+// false-sharing invalidation storm the padded structs elsewhere in this
+// file (`Worker`, `Warehouse`) exist to prevent.
 
 impl Default for TaskChunk {
     #[inline(always)]
@@ -582,7 +599,11 @@ impl Warehouse {
                         // Publish: subsequent Acquire on seq by the consumer
                         // synchronises with this Release and sees the payload.
                         slot.seq.store(pos + 1, Ordering::Release);
-                        self.backlog.fetch_add(1, Ordering::Release);
+                        // `backlog` is a liveness/scheduling hint only (read by
+                        // `is_busy`, itself Relaxed) — no proof relies on an
+                        // ordering guarantee for it beyond eventual consistency
+                        // with the CAS-protected head/tail indices.
+                        self.backlog.fetch_add(1, Ordering::Relaxed);
                         return Ok(());
                     }
                     // CAS lost to a concurrent producer on the same slot.
@@ -649,7 +670,9 @@ impl Warehouse {
                         let chunk = unsafe { (*slot.chunk.get()).assume_init_read() };
                         // Release the slot for the next round (pos + CAPACITY).
                         slot.seq.store(pos + WAREHOUSE_CAPACITY, Ordering::Release);
-                        self.backlog.fetch_sub(1, Ordering::Release);
+                        // See the matching comment in `push`: `backlog` needs no
+                        // ordering guarantee beyond eventual consistency.
+                        self.backlog.fetch_sub(1, Ordering::Relaxed);
                         return Some(chunk);
                     }
                     // Lost the CAS to a concurrent consumer — back off before
@@ -1232,9 +1255,10 @@ impl Worker {
                 }
             }
 
-            // Terminal states (Finished, Panicked)
+            // Terminal states (Finished, Panicked, Cancelled)
             if final_state == crate::memory_management::FiberStatus::Finished as u32
                 || final_state == crate::memory_management::FiberStatus::Panicked as u32
+                || final_state == crate::memory_management::FiberStatus::Cancelled as u32
             {
                 pool.free_context(task);
             } else if final_state == crate::memory_management::FiberStatus::Notified as u32 {

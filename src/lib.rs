@@ -98,6 +98,10 @@ macro_rules! spawn {
         $crate::api::spawner_traits::SpawnerTag.spawn($fut)
     }};
 }
+/// Request cooperative cancellation of a fiber.
+pub use crate::api::cancel;
+/// Query a terminated fiber's outcome (finished, panicked, or cancelled).
+pub use crate::api::outcome;
 /// Yield execution to the scheduler.
 pub use crate::api::yield_now;
 /// Yield execution to another fiber.
@@ -107,6 +111,8 @@ pub use crate::api::yield_to;
 pub use crate::api::yield_to as yield_to_async;
 /// Wait for a fiber to complete.
 pub use crate::c_ffi::dtact_await;
+/// Request cooperative cancellation of a fiber.
+pub use crate::c_ffi::dtact_cancel;
 /// Handle for C-compatible FFI.
 pub use crate::c_ffi::dtact_handle_t;
 /// Wait for a fiber to complete.
@@ -335,13 +341,12 @@ pub(crate) fn awaken_fiber_by_index(target_worker: usize, fiber_index: u32) {
         .get()
         .expect("dtact::awaken_fiber_by_index() invoked before Runtime Initialization");
     let ctx_ptr = runtime.pool.get_context_ptr(fiber_index);
-    let prev = unsafe {
-        (*ctx_ptr).state.swap(
-            crate::memory_management::FiberStatus::Notified as u32,
-            core::sync::atomic::Ordering::AcqRel,
-        )
-    };
-    if prev == crate::memory_management::FiberStatus::Yielded as u32 {
+    // `FiberContext::try_notify` leaves `state` alone if the target has
+    // already terminated — see its doc comment for why an unconditional
+    // swap here previously corrupted terminal state and hung joiners
+    // forever whenever a caller (e.g. `crate::api::cancel`, `yield_to`)
+    // held a handle to a fiber that finished before the wake arrived.
+    if unsafe { (*ctx_ptr).try_notify() } {
         wake_fiber(target_worker, fiber_index);
     }
 }

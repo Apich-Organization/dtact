@@ -2,11 +2,24 @@
 
 mod common;
 
-use dtact::{dtact_await, spawn};
+use dtact::{TaskOutcome, dtact_await, outcome, spawn};
+use serial_test::serial;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// All tests in this file are `#[serial]`: `outcome()` reads a slot's
+// terminal state, which `ContextPool::claim_context` only preserves until
+// that slot is next claimed by *any* fiber (see `outcome`'s doc comment
+// for why it must work this way). With near-instant panicking fibers and
+// a small shared pool (`common::init_runtime`), a sibling test spawning
+// its own fibers concurrently can — and, empirically, reliably did —
+// claim and recycle the exact slot an `outcome()` call in this file was
+// about to query, before that call ever ran, well before any race
+// internal to a single `outcome()` call could be the cause. `#[serial]`
+// (already used elsewhere in this crate's suite for tests that share
+// process-wide state) removes that specific source of contention.
 #[test]
+#[serial]
 #[cfg_attr(miri, ignore)]
 fn test_panic_in_fiber_does_not_crash_runtime() {
     common::init_runtime();
@@ -16,8 +29,16 @@ fn test_panic_in_fiber_does_not_crash_runtime() {
         panic!("intentional test panic");
     });
 
-    // dtact_await returns normally because fiber_entry_point sets Finished after catching the panic
-    dtact_await(bad);
+    // `outcome` already blocks until termination (it is a join, not a
+    // poll) and captures the status atomically with detecting it — calling
+    // `dtact_await` first and `outcome` after would reopen exactly the
+    // race this design avoids (see `outcome`'s doc comment), so call only
+    // `outcome` here.
+    assert_eq!(
+        outcome(bad).map(|(o, _)| o),
+        Some(TaskOutcome::Panicked),
+        "a panicking fiber must be observably distinct from a normal completion"
+    );
 
     // Runtime is still alive: a subsequent fiber runs correctly
     let result = Arc::new(AtomicU32::new(0));
@@ -34,6 +55,7 @@ fn test_panic_in_fiber_does_not_crash_runtime() {
 }
 
 #[test]
+#[serial]
 #[cfg_attr(miri, ignore)]
 fn test_panic_fiber_slot_is_recycled() {
     common::init_runtime();
@@ -62,6 +84,7 @@ fn test_panic_fiber_slot_is_recycled() {
 }
 
 #[test]
+#[serial]
 #[cfg_attr(miri, ignore)]
 fn test_multiple_concurrent_panics() {
     common::init_runtime();
@@ -97,6 +120,7 @@ fn test_multiple_concurrent_panics() {
 }
 
 #[test]
+#[serial]
 #[cfg_attr(miri, ignore)]
 fn test_panic_does_not_corrupt_sibling_fibers() {
     common::init_runtime();
@@ -117,18 +141,24 @@ fn test_panic_does_not_corrupt_sibling_fibers() {
         cc.fetch_add(1, Ordering::SeqCst);
     });
 
-    dtact_await(fiber_a);
-    dtact_await(fiber_b);
-    dtact_await(fiber_c);
+    // Query outcome directly rather than `dtact_await` first — see the
+    // comment in `test_panic_in_fiber_does_not_crash_runtime`.
+    let outcome_a = outcome(fiber_a).map(|(o, _)| o);
+    let outcome_b = outcome(fiber_b).map(|(o, _)| o);
+    let outcome_c = outcome(fiber_c).map(|(o, _)| o);
 
     assert_eq!(
         counter.load(Ordering::SeqCst),
         2,
         "fibers A and C must complete despite fiber B panicking"
     );
+    assert_eq!(outcome_a, Some(TaskOutcome::Finished));
+    assert_eq!(outcome_b, Some(TaskOutcome::Panicked));
+    assert_eq!(outcome_c, Some(TaskOutcome::Finished));
 }
 
 #[test]
+#[serial]
 #[cfg_attr(miri, ignore)]
 fn test_panic_with_string_payload() {
     common::init_runtime();
@@ -141,7 +171,9 @@ fn test_panic_with_string_payload() {
         let msg = String::from("heap-allocated panic payload");
         panic!("{}", msg);
     });
-    dtact_await(bad);
+    let (result, message) = outcome(bad).expect("panicked fiber must report an outcome");
+    assert_eq!(result, TaskOutcome::Panicked);
+    assert_eq!(message.as_deref(), Some("heap-allocated panic payload"));
 
     let good = spawn(async move {
         a.store(99, Ordering::SeqCst);

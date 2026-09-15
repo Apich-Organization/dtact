@@ -3,7 +3,7 @@
 
 use core::cell::UnsafeCell;
 
-use crate::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Defensive upper cap on how many per-worker batch caches a single
 /// `ContextPool` will ever allocate, regardless of the `num_workers` its
@@ -169,13 +169,50 @@ pub enum FiberStatus {
     Notified = 5,
     /// The fiber is currently transitioning to a suspended state.
     Suspending = 6,
+    /// Terminated cooperatively in response to `cancel()`, distinct from
+    /// an unhandled panic even though both unwind the fiber's stack.
+    Cancelled = 7,
+}
+
+/// Terminal outcomes of a fiber, as observed by a caller after joining it.
+///
+/// Distinct from [`FiberStatus`]: this is the small, public subset of
+/// terminal states relevant to a caller of [`crate::api::outcome`], not
+/// the full internal lifecycle enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskOutcome {
+    /// The fiber ran to completion without panicking or being cancelled.
+    Finished,
+    /// The fiber unwound due to an unhandled panic in its body.
+    Panicked,
+    /// The fiber unwound because [`crate::api::cancel`] was called on it.
+    Cancelled,
 }
 
 /// The hardware-level execution context for a stackful fiber.
 ///
-/// This structure is strictly aligned to 64 bytes to ensure that all
-/// register state and future data reside within a single cache line (or contiguous lines)
-/// to minimize L1/L2 misses during context switches.
+/// Cache-line layout (repr C, 64-byte aligned):
+///   Lines 0–19: `regs`, `executor_regs` (640 B / 10 lines each) — untouched
+///               by this layout's reasoning, see [`Registers`].
+///   Line 20:    `state`, `cancel_requested` — both read *and* written by a
+///               remote thread (`try_notify`'s wake, `cancel`'s flag) *and*
+///               checked every iteration of this fiber's own
+///               `wait_pinned` loop. Isolated together so a wake touches
+///               exactly one line, and so neither shares a line with...
+///   Line 21:    `adaptive_spin_count`, `spin_failure_count` — also
+///               touched every `wait_pinned` iteration, but *only* by this
+///               fiber's own thread (self-tuning, never written remotely).
+///               An earlier layout packed these onto the same line as
+///               `state` and, later, `cancel_requested`: every remote wake
+///               or `cancel()` call would then invalidate this purely
+///               thread-local spin-budget data for no reason, and every
+///               local spin-budget update would invalidate the line a
+///               remote wake was about to read. Splitting them is the
+///               actual fix; the rest of this struct (setup-once fields,
+///               read after spawn but essentially never rewritten) is far
+///               less contended and does not need the same treatment.
+///   Line 22+:   everything else — `fiber_index`, the closure/trampoline
+///               pointers, `waiter_thread_id`/`waiter_handle`, etc.
 #[repr(C, align(64))]
 #[doc(hidden)]
 pub struct FiberContext {
@@ -183,14 +220,32 @@ pub struct FiberContext {
     pub regs: Registers,
     /// Return address for the scheduler dispatch loop.
     pub executor_regs: Registers,
+
+    /// Current execution state.
+    pub state: AtomicU32,
+    /// Set by [`crate::api::cancel`]; observed by this fiber itself the
+    /// next time it resumes through [`crate::future_bridge::wait_pinned`].
+    /// Cooperative only: a fiber that never suspends through a DTA
+    /// primitive never observes this flag.
+    pub(crate) cancel_requested: AtomicBool,
+    // Fill cache line 20 to 64 bytes: state(4) + cancel_requested(1) = 5.
+    _pad_sync: [u8; 59],
+
+    /// Statistics: Adaptive Spin Budget. Thread-local — see the struct-level
+    /// doc comment for why this is deliberately not on the same line as
+    /// `state`/`cancel_requested` above.
+    pub adaptive_spin_count: u32,
+    /// Statistics: Recent Spin Failures.
+    pub spin_failure_count: u32,
+    // Fill cache line 21 to 64 bytes: 8 bytes used, 56 bytes pad.
+    _pad_spin: [u8; 56],
+
     /// Fiber identification index.
     pub fiber_index: u32,
     /// The OS thread ID where this fiber was last executed.
     pub last_os_thread_id: u64,
     /// The hardware core ID where this fiber was originally spawned.
     pub origin_core: u16,
-    /// Current execution state.
-    pub state: AtomicU32,
     /// Pointer to the assembly context-switch function.
     pub switch_fn: unsafe extern "C" fn(*mut Registers, *const Registers),
     /// Pointer to the fiber's entry-point closure or future.
@@ -209,10 +264,6 @@ pub struct FiberContext {
     pub mode: TopologyMode,
     /// Metadata: Core Affinity Hint for wake routing.
     pub affinity: crate::api::topology::Affinity,
-    /// Statistics: Adaptive Spin Budget.
-    pub adaptive_spin_count: u32,
-    /// Statistics: Recent Spin Failures.
-    pub spin_failure_count: u32,
 
     /// Current stack pointer for this fiber.
     pub(crate) stack_ptr: usize,
@@ -277,6 +328,9 @@ impl FiberContext {
             adaptive_spin_count: 50,
             spin_failure_count: 0,
             last_os_thread_id: 0,
+            cancel_requested: AtomicBool::new(false),
+            _pad_sync: [0; 59],
+            _pad_spin: [0; 56],
         }
     }
     /// Creates a new, blank `FiberContext`.
@@ -316,7 +370,50 @@ impl FiberContext {
             adaptive_spin_count: 50,
             spin_failure_count: 0,
             last_os_thread_id: 0,
+            cancel_requested: AtomicBool::new(false),
+            _pad_sync: [0; 59],
+            _pad_spin: [0; 56],
         }
+    }
+
+    /// Attempts to transition `state` to `Notified` in response to a wake,
+    /// succeeding only if the fiber is currently in one of the "live,
+    /// possibly-waiting" states (`Running`, `Suspending`, `Yielded`).
+    ///
+    /// A wake — whether from `crate::api::cancel`/`yield_to`
+    /// (`crate::awaken_fiber_by_index`) or a stored [`core::task::Waker`]
+    /// firing after the fiber it was created for has already moved on
+    /// (`future_bridge::wake_by_ref_impl`) — can legitimately arrive
+    /// after the target has already terminated (`Finished`/`Panicked`/
+    /// `Cancelled`) or had its slot reclaimed (`Initial`). Both call
+    /// sites used to swap `state` to `Notified` unconditionally,
+    /// silently overwriting a terminal value — and since nothing ever
+    /// transitions a slot back out of `Notified` once its owning fiber
+    /// is gone, any `dtact_await`/`crate::api::outcome` still waiting on
+    /// that handle would then hang forever. Not a theoretical concern:
+    /// reproduced with a minimal standalone program (two fibers, one
+    /// `yield_to`-ing the other after it had already finished).
+    ///
+    /// Returns `true` iff the previous state was `Yielded` — the fiber
+    /// was fully parked off any run queue and the caller must enqueue it
+    /// itself; for `Running`/`Suspending` the fiber's own worker will
+    /// notice `Notified` when it resumes from its context switch, and
+    /// for anything else (already terminal, `Initial`, or already
+    /// `Notified`) this is correctly a no-op.
+    #[inline(always)]
+    pub(crate) fn try_notify(&self) -> bool {
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                if s == FiberStatus::Running as u32
+                    || s == FiberStatus::Suspending as u32
+                    || s == FiberStatus::Yielded as u32
+                {
+                    Some(FiberStatus::Notified as u32)
+                } else {
+                    None
+                }
+            })
+            == Ok(FiberStatus::Yielded as u32)
     }
 }
 
@@ -762,7 +859,57 @@ impl ContextPool {
         // invariant across `refill_batch`/`donate_batch`'s mutations of
         // `cache.len`, so without this hint it inserts a bounds check here.
         unsafe { core::hint::assert_unchecked((cache.len as usize) < cache.slots.len()) };
-        Some(cache.slots[cache.len as usize])
+        let index = cache.slots[cache.len as usize];
+        self.claim_context(index);
+        Some(index)
+    }
+
+    /// Finalizes a slot at the point a fresh fiber claims it: bumps
+    /// `generation`, clears `cancel_requested`, and drops any leftover
+    /// panic payload from whichever fiber previously occupied this slot.
+    ///
+    /// All three are deliberately done *here* (on claim) rather than in
+    /// [`Self::free_context`] (on release), which is the opposite of
+    /// what "ABA-safety must happen right away" might suggest. The
+    /// reason: `crate::api::outcome` reads a just-terminated fiber's
+    /// `state`/`panic_payload_ptr` (and `generation`, to know it's
+    /// still reading the fiber its caller thinks it is) *after* that
+    /// caller's `dtact_await` has already returned — necessarily some
+    /// time after `free_context` ran on a different thread. Finalizing
+    /// at free time raced that read and lost it almost every time under
+    /// any real concurrent load (reproduced empirically, not merely
+    /// theorized); claiming instead of releasing is the only point that
+    /// is actually exclusive to one fiber's setup, so it is the only
+    /// point these can safely happen without racing a joiner.
+    /// `SpawnBuilder::spawn` and every C-FFI spawn path already
+    /// unconditionally overwrite `state` to `Running` on claim
+    /// (untouched by this change) — this extends the same "claim
+    /// resets, free leaves alone" rule to the other three fields.
+    ///
+    /// A payload nobody ever reads via `outcome` before this slot is
+    /// reused is bounded to leak for at most one recycle cycle, not the
+    /// process lifetime — the same bound `free_context`'s doc comment
+    /// already accepts for the stale `state` value.
+    #[inline(always)]
+    fn claim_context(&self, index: u32) {
+        let ctx = self.get_context_ptr(index);
+        unsafe {
+            (*ctx).generation.fetch_add(1, Ordering::AcqRel);
+            (*ctx).cancel_requested.store(false, Ordering::Relaxed);
+            let payload_ptr =
+                core::mem::replace(&mut (*ctx).panic_payload_ptr, core::ptr::null_mut());
+            if !payload_ptr.is_null() {
+                // Cold: almost every claimed slot's previous occupant
+                // finished normally or was never queried via
+                // `crate::api::outcome` in the first place — this branch
+                // is the rare "an un-retrieved panic payload is still
+                // sitting here" case.
+                core::hint::cold_path();
+                drop(Box::from_raw(
+                    payload_ptr.cast::<Box<dyn core::any::Any + Send>>(),
+                ));
+            }
+        }
     }
 
     /// Returns a context to this worker's local batch cache (no atomics),
@@ -773,19 +920,19 @@ impl ContextPool {
     #[inline(always)]
     #[allow(clippy::cast_possible_truncation)]
     pub fn free_context(&self, index: u32) {
-        let ctx = self.get_context_ptr(index);
-
-        // Reset state to Initial and notify any waiting host threads. This
-        // happens unconditionally and immediately regardless of whether
-        // `index` ends up in the local cache or is batch-donated below:
-        // `generation` guards ABA-safety for outstanding handles and must
-        // reflect "this fiber is done" right away, never deferred.
-        unsafe {
-            (*ctx)
-                .state
-                .store(FiberStatus::Initial as u32, Ordering::Release);
-            (*ctx).generation.fetch_add(1, Ordering::AcqRel);
-        };
+        // Deliberately do NOT reset `state`, `generation`, `cancel_requested`,
+        // or drop `panic_payload_ptr` here. All four are finalized instead
+        // by `claim_context`, at the point this slot is next claimed by
+        // `alloc_context` — see that function's doc comment for why: a
+        // joiner's `crate::api::outcome` reads a just-terminated fiber's
+        // `state`/`panic_payload_ptr`, gated on `generation` matching its
+        // handle, strictly after its `dtact_await` on the same handle has
+        // already returned — necessarily after whatever this function does,
+        // on a different thread. Finalizing eagerly here raced that read
+        // and lost it almost every time under real concurrent load
+        // (reproduced empirically). Leaving all four alone until the slot
+        // is actually claimed by a new fiber is what makes that read safe:
+        // nothing overwrites them in between.
 
         let worker_id = crate::future_bridge::CURRENT_WORKER_ID.with(core::cell::Cell::get);
         if worker_id >= self.local_caches.len() {
@@ -842,7 +989,10 @@ impl ContextPool {
                 Ordering::Acquire,
             );
             match cas {
-                Ok(_) => return Some(index),
+                Ok(_) => {
+                    self.claim_context(index);
+                    return Some(index);
+                }
                 Err(latest) => {
                     // Cold: contention on `free_head` is rare by design —
                     // the whole point of `LocalFreeCache` is to keep most
@@ -1054,6 +1204,41 @@ impl Drop for ContextPool {
             use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
             VirtualFree(self.base_ptr.cast(), 0, MEM_RELEASE);
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::FiberContext;
+
+    /// Locks in `FiberContext`'s cache-line isolation (see the struct's
+    /// doc comment): `state`/`cancel_requested` must stay on their own
+    /// line, separate from the thread-local `adaptive_spin_count`/
+    /// `spin_failure_count` pair, so a regression here is caught at test
+    /// time rather than rediscovered by profiling a false-sharing
+    /// regression later. Mirrors `dta_scheduler::layout_tests`'s
+    /// `Worker` check.
+    #[test]
+    fn fiber_context_hot_fields_stay_cache_line_isolated() {
+        assert_eq!(core::mem::align_of::<FiberContext>(), 64);
+
+        let state_line = core::mem::offset_of!(FiberContext, state) / 64;
+        let cancel_line = core::mem::offset_of!(FiberContext, cancel_requested) / 64;
+        assert_eq!(
+            state_line, cancel_line,
+            "state and cancel_requested must share one cache line"
+        );
+
+        let spin_count_line = core::mem::offset_of!(FiberContext, adaptive_spin_count) / 64;
+        let spin_failure_line = core::mem::offset_of!(FiberContext, spin_failure_count) / 64;
+        assert_eq!(
+            spin_count_line, spin_failure_line,
+            "adaptive_spin_count and spin_failure_count must share one cache line"
+        );
+        assert_ne!(
+            state_line, spin_count_line,
+            "the state/cancel_requested line must not overlap the thread-local spin-budget line"
+        );
     }
 }
 

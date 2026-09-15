@@ -677,24 +677,95 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
     )
 }
 
-/// Blocks the current thread until the specified fiber terminates.
+/// True for any of the three terminal fiber states a joiner should stop
+/// waiting on: ran to completion, panicked, or was cancelled. `Initial`
+/// (never started, or the slot was already recycled) is deliberately
+/// excluded — callers check that separately, since it means something
+/// different (nothing to join, not "joined and terminated").
+#[inline(always)]
+const fn is_terminal(status: u32) -> bool {
+    status == crate::memory_management::FiberStatus::Finished as u32
+        || status == crate::memory_management::FiberStatus::Panicked as u32
+        || status == crate::memory_management::FiberStatus::Cancelled as u32
+}
+
+/// Reads `state` bracketed by two `generation` loads: `(torn, status, gen)`.
+///
+/// `torn` is `true` when the two generation reads disagree — a
+/// `ContextPool::claim_context` on another thread landed inside the
+/// bracket. Shared by every checkpoint in [`dtact_await_observe`] because
+/// a torn bracket must be treated as "resample", never as a verdict: an
+/// earlier version of each checkpoint read this pattern inline and, in
+/// two different ways (checked and reverted in turn), got that
+/// distinction wrong — see that function's doc comment.
+#[inline(always)]
+#[allow(clippy::cast_possible_truncation)]
+unsafe fn bracketed_state_read(
+    target_ctx: *const crate::memory_management::FiberContext,
+) -> (bool, u32, u16) {
+    unsafe {
+        let g_before = ((*target_ctx)
+            .generation
+            .load(core::sync::atomic::Ordering::Acquire) as u16)
+            & 0x7FFF;
+        let status = (*target_ctx)
+            .state
+            .load(core::sync::atomic::Ordering::Acquire);
+        let g_after = ((*target_ctx)
+            .generation
+            .load(core::sync::atomic::Ordering::Acquire) as u16)
+            & 0x7FFF;
+        (g_before != g_after, status, g_before)
+    }
+}
+
+/// Blocks the current thread until the specified fiber terminates, and
+/// returns the terminal `FiberStatus` value observed at the exact moment
+/// termination was detected, together with the fiber's context pointer
+/// (so callers needing more than the bare status — `crate::api::outcome`
+/// reading `panic_payload_ptr` — don't have to re-derive and re-look-up
+/// what this function already resolved) — or `None` if `handle` was
+/// already stale (generation mismatch) before this call ever found it in
+/// a terminal state.
 ///
 /// If called from a Dtact fiber, this will natively yield the physical core.
 /// If called from a non-managed thread (e.g., C main), this uses a tiered
 /// spin-loop and futex-wait strategy for zero-CPU idling.
 ///
+/// # Why this returns the observed status instead of leaving it to a
+/// separate later query
+/// An earlier version of this crate had `dtact_await` return `()` and
+/// exposed a separate `outcome(handle)` query for callers who wanted to
+/// know *how* the fiber terminated. That was racy in a way this project
+/// initially underestimated: `ContextPool::claim_context` finalizes a
+/// slot's `state`/`generation` the moment `alloc_context` next hands that
+/// slot to a **different** fiber, and under real concurrent load (many
+/// threads sharing one pool, as in this crate's own test suite) that next
+/// claim can — and empirically does, reproducibly — happen before a
+/// caller gets back around to a second, separate query call, even one
+/// issued immediately after this function returns. Capturing the status
+/// here, in the same read that confirms termination, closes that window
+/// entirely: there is no second read to race.
+///
+/// Every checkpoint below reads through [`bracketed_state_read`] and
+/// treats a torn bracket (`claim_context` landing mid-read) as
+/// "resample", never as a verdict — see its doc comment for why that
+/// distinction is load-bearing, not defensive-for-its-own-sake: both ways
+/// of getting it wrong (treating a tear as "stale", or trusting an
+/// unbracketed terminal-looking read) were tried, and both reproducibly
+/// misreported a live or already-different fiber under real load.
+///
 /// # Panics
 /// * Panics if the runtime is not initialized.
-#[unsafe(no_mangle)]
 #[allow(clippy::cast_possible_truncation)]
 #[allow(clippy::too_many_lines)]
-pub extern "C" fn dtact_await(handle: dtact_handle_t) {
+pub(crate) fn dtact_await_observe(
+    handle: dtact_handle_t,
+) -> Option<(u32, *mut crate::memory_management::FiberContext)> {
     let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
     let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
     let handle_gen = ((handle_val >> 48) & 0x7FFF) as u16; // Mask out sentinel bit
-    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
-        return;
-    };
+    let runtime = crate::GLOBAL_RUNTIME.get()?;
     let pool = &runtime.pool;
     let target_ctx = pool.get_context_ptr(target_ctx_id);
 
@@ -702,31 +773,23 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
 
     if ctx_ptr.is_null() {
         // ===== NON-FIBER PATH (C main thread, host thread) =====
-        // Three consecutive Acquire loads bracket the state read — no SeqCst fence needed.
-        // On AArch64, consecutive `ldar` instructions cannot be reordered by the hardware.
         let mut spins = 0u32;
-        loop {
-            let (_current_gen, status) = unsafe {
-                let g1 = ((*target_ctx)
-                    .generation
-                    .load(core::sync::atomic::Ordering::Acquire) as u16)
-                    & 0x7FFF;
-                let status = (*target_ctx)
-                    .state
-                    .load(core::sync::atomic::Ordering::Acquire);
-                let g2 = ((*target_ctx)
-                    .generation
-                    .load(core::sync::atomic::Ordering::Acquire) as u16)
-                    & 0x7FFF;
+        return loop {
+            let (torn, status, generation) = unsafe { bracketed_state_read(target_ctx) };
 
-                if g1 != handle_gen || g2 != handle_gen {
-                    break;
+            if torn {
+                // Cold: a claim landing inside this exact 3-load bracket is
+                // a tight race — inconclusive, resample. Rare relative to
+                // "still waiting" (most iterations while polling a
+                // long-running task) or "found the terminal state".
+                core::hint::cold_path();
+            } else {
+                if generation != handle_gen {
+                    break None;
                 }
-                (g1, status)
-            };
-
-            if status == crate::memory_management::FiberStatus::Finished as u32 {
-                break;
+                if is_terminal(status) {
+                    break Some((status, target_ctx));
+                }
             }
 
             if spins < 4000 {
@@ -734,12 +797,11 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
                 spins += 1;
             } else {
                 // Host thread has nothing else to do — OS yield is acceptable here.
-                // Generation double-check above prevents ABA-induced permanent stalls.
+                // The stable-generation check above prevents ABA-induced permanent stalls.
                 std::thread::yield_now();
                 spins = 2000;
             }
-        }
-        return;
+        };
     }
 
     // ===== FIBER PATH (called from within a running fiber) =====
@@ -753,25 +815,21 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
             );
         }
 
-        // 0. Check target state and generation
-        let (current_gen, status) = unsafe {
-            (
-                ((*target_ctx)
-                    .generation
-                    .load(core::sync::atomic::Ordering::Acquire) as u16)
-                    & 0x7FFF,
-                (*target_ctx)
-                    .state
-                    .load(core::sync::atomic::Ordering::Acquire),
-            )
-        };
-
-        if current_gen != handle_gen
-            || status == crate::memory_management::FiberStatus::Finished as u32
+        // 0. Check target state.
+        let (torn, status, generation) = unsafe { bracketed_state_read(target_ctx) };
+        if torn {
+            // Cold: see the non-fiber path's matching comment above.
+            core::hint::cold_path();
+            continue;
+        }
+        if is_terminal(status) {
+            break Some((status, target_ctx));
+        }
+        if generation != handle_gen
             || status == crate::memory_management::FiberStatus::Initial as u32
         {
-            // Target already finished (or context recycled/freed), break
-            break;
+            // Handle already stale before we ever observed a terminal state.
+            break None;
         }
 
         // 1. Register the current fiber as a waiter for the target fiber
@@ -789,24 +847,17 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
                 .swap(my_handle, core::sync::atomic::Ordering::AcqRel);
         }
 
-        // 2. Double-check target state after registering waiter
-        let (current_gen_post, status_post) = unsafe {
-            (
-                ((*target_ctx)
-                    .generation
-                    .load(core::sync::atomic::Ordering::Acquire) as u16)
-                    & 0x7FFF,
-                (*target_ctx)
-                    .state
-                    .load(core::sync::atomic::Ordering::Acquire),
-            )
-        };
+        // 2. Double-check target state after registering waiter.
+        let (torn_post, status_post, gen_post) = unsafe { bracketed_state_read(target_ctx) };
+        let post_terminal = !torn_post && is_terminal(status_post);
+        let post_stale = !torn_post
+            && (gen_post != handle_gen
+                || status_post == crate::memory_management::FiberStatus::Initial as u32);
 
-        if current_gen_post != handle_gen
-            || status_post == crate::memory_management::FiberStatus::Finished as u32
-            || status_post == crate::memory_management::FiberStatus::Initial as u32
-        {
-            // Completed between check and waiter registration
+        if torn_post || post_terminal || post_stale {
+            // Completed (or the read was inconclusive) between check and
+            // waiter registration — either way, unregister and either
+            // resample (torn) or report a verdict (terminal/stale).
             unsafe {
                 let _ = (*target_ctx).waiter_handle.compare_exchange(
                     my_handle,
@@ -815,7 +866,16 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
                     core::sync::atomic::Ordering::Relaxed,
                 );
             }
-            break;
+            if torn_post {
+                // Cold: see checkpoint 0's matching comment above.
+                core::hint::cold_path();
+                continue;
+            }
+            break if post_terminal {
+                Some((status_post, target_ctx))
+            } else {
+                None
+            };
         }
 
         // 3. Try to transition to Suspending and suspend
@@ -835,6 +895,30 @@ pub extern "C" fn dtact_await(handle: dtact_handle_t) {
             }
         }
     }
+}
+
+/// Blocks the current thread until the specified fiber terminates.
+///
+/// C-ABI entry point; see [`dtact_await_observe`] for the full protocol
+/// and why a Rust caller wanting to know *how* the fiber terminated
+/// should use [`crate::api::outcome`] instead, which captures that
+/// information in the same read that confirms termination.
+///
+/// # Panics
+/// * Panics if the runtime is not initialized.
+#[unsafe(no_mangle)]
+pub extern "C" fn dtact_await(handle: dtact_handle_t) {
+    let _ = dtact_await_observe(handle);
+}
+
+/// Requests cooperative cancellation of the fiber referred to by `handle`.
+///
+/// C-ABI counterpart of [`crate::api::cancel`] — see its documentation for
+/// the cancellation protocol (cooperative, not preemptive) and the
+/// generation-checked stale-handle guard.
+#[unsafe(no_mangle)]
+pub extern "C" fn dtact_cancel(handle: dtact_handle_t) {
+    crate::api::cancel(handle);
 }
 
 /// Signals all worker threads to shutdown and waits for them to terminate.

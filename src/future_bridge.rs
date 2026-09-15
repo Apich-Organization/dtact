@@ -7,6 +7,14 @@ use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use crate::memory_management::{FiberContext, FiberStatus};
 
+/// Panic payload used to unwind a fiber in response to [`crate::api::cancel`].
+///
+/// A unique, zero-sized marker type rather than a `String`/`&str` payload
+/// (what an ordinary `panic!()` produces) so [`crate::api::fiber_entry_point`]
+/// can distinguish "cancelled" from "genuinely panicked" by downcasting,
+/// with no risk of a real panic message accidentally matching.
+pub(crate) struct DtaCancellation;
+
 /// `VTable` for the Zero-Cost Dtact Waker.
 ///
 /// This waker bypasses the standard `Arc` reference counting overhead by
@@ -30,17 +38,18 @@ unsafe fn wake_impl(data: *const ()) {
 unsafe fn wake_by_ref_impl(data: *const ()) {
     let ctx = unsafe { &*data.cast::<FiberContext>() };
 
-    let prev = ctx
-        .state
-        .swap(FiberStatus::Notified as u32, Ordering::AcqRel);
-
-    if prev == FiberStatus::Yielded as u32 {
+    // `try_notify` leaves `state` alone if this fiber has already
+    // terminated (this exact `Waker` firing late, after its fiber moved
+    // on, is a normal, expected occurrence, not a bug in the caller) —
+    // see its doc comment for why an unconditional swap here previously
+    // corrupted terminal state and hung joiners forever.
+    if ctx.try_notify() {
         // The fiber was fully suspended and yielded. We can safely enqueue it
         // for migration to any worker.
         crate::wake_fiber(ctx.origin_core as usize, ctx.fiber_index);
     }
-    // If prev was Suspending or Running, the local worker will handle the
-    // re-enqueue when it resumes from the context switch.
+    // If the previous state was Suspending or Running, the local worker
+    // will handle the re-enqueue when it resumes from the context switch.
 }
 
 #[inline(always)]
@@ -157,6 +166,31 @@ pub fn wait_pinned<F: Future>(mut fut_pinned: Pin<&mut F>) -> F::Output {
         if cur_state != FiberStatus::Running as u32 {
             ctx.state
                 .store(FiberStatus::Running as u32, Ordering::Release);
+        }
+
+        // Cooperative cancellation check: every suspension/resumption of
+        // this fiber passes through this loop, making it the single choke
+        // point where `cancel()`'s flag can be observed, regardless of how
+        // deep in user code the fiber's native call stack currently is. A
+        // fiber that never suspends through a DTA primitive never reaches
+        // here and is therefore never cancellable — cooperative, not
+        // preemptive.
+        //
+        // Relaxed, not Acquire: this flag carries no payload for the
+        // reader to synchronise with (unlike `state`, nothing else must be
+        // visible "because" cancellation was observed) — worst case a
+        // Relaxed read delays noticing by one extra suspend/resume cycle,
+        // which this loop's own retry-every-time structure already
+        // tolerates. `cancel()`'s store is Relaxed for the matching
+        // reason on the writer side.
+        if ctx.cancel_requested.load(Ordering::Relaxed) {
+            // Cold: this flag is checked on every single iteration of this
+            // hot loop, but is set for the overwhelming majority of
+            // fibers' entire lifetimes — never. Hinting keeps the
+            // not-cancelled fast path free of this branch's code in the
+            // common case.
+            core::hint::cold_path();
+            std::panic::panic_any(DtaCancellation);
         }
 
         match fut_pinned.as_mut().poll(&mut cx) {

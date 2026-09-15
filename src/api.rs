@@ -1,6 +1,8 @@
 pub use crate::c_ffi::dtact_handle_t;
 pub use crate::common_types::{TopologyMode, WorkloadKind};
-pub use crate::memory_management::{ContextPool, FiberContext, FiberStatus, SafetyLevel};
+pub use crate::memory_management::{
+    ContextPool, FiberContext, FiberStatus, SafetyLevel, TaskOutcome,
+};
 use core::future::Future;
 use core::pin::Pin;
 pub use topology::Affinity;
@@ -458,8 +460,15 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
     let invoke = ctx.invoke_closure;
     let arg = ctx.closure_ptr;
 
-    // Execute the task payload with SEH/Panic protection
-    let _ = std::panic::catch_unwind(core::panic::AssertUnwindSafe(move || {
+    // Execute the task payload with SEH/Panic protection. This catch_unwind
+    // spans the fiber's *entire* multi-suspension lifetime, not just one
+    // resumption: `invoke` drives the user future/closure across however
+    // many switch-out/switch-in cycles it takes via `wait_pinned`, and each
+    // resumption re-enters this same still-live stack frame, so a panic (or
+    // a `cancel()`-triggered unwind, see `future_bridge::DtaCancellation`)
+    // raised from arbitrarily deep inside any of those resumptions is still
+    // caught here.
+    let result = std::panic::catch_unwind(core::panic::AssertUnwindSafe(move || {
         unsafe { invoke(arg) };
     }));
 
@@ -468,12 +477,33 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         unsafe { cleanup(ctx.closure_ptr) };
     }
 
-    // Mark as Finished. The scheduler will return this context to the pool
+    let final_state = match result {
+        Ok(()) => crate::memory_management::FiberStatus::Finished,
+        Err(payload) => {
+            // Cold: this runs once per fiber, at termination — but for the
+            // overwhelming majority of fibers in any real workload, that
+            // termination is `Ok`, not `Err`.
+            core::hint::cold_path();
+            if payload
+                .downcast_ref::<crate::future_bridge::DtaCancellation>()
+                .is_some()
+            {
+                crate::memory_management::FiberStatus::Cancelled
+            } else {
+                // Double-boxed so the fat `Box<dyn Any + Send>` pointer fits
+                // in `panic_payload_ptr`'s thin `*mut ()`; retrieved by
+                // `crate::api::outcome`, and otherwise dropped by
+                // `ContextPool::free_context` when this slot is recycled.
+                ctx.panic_payload_ptr = Box::into_raw(Box::new(payload)).cast::<()>();
+                crate::memory_management::FiberStatus::Panicked
+            }
+        }
+    };
+
+    // Mark as terminal. The scheduler will return this context to the pool
     // AFTER we switch back, preventing use-after-free races.
-    ctx.state.store(
-        crate::memory_management::FiberStatus::Finished as u32,
-        core::sync::atomic::Ordering::Release,
-    );
+    ctx.state
+        .store(final_state as u32, core::sync::atomic::Ordering::Release);
     // No futex_wake needed: dtact_await host-thread path uses spin+yield_now, not futex.
 
     // Wake up any fiber waiting for this one (FFI join).
@@ -901,6 +931,165 @@ pub async fn yield_to(handle: dtact_handle_t) {
     // and the double-dispatch race it prevents on deflectable fibers.
     crate::awaken_fiber_by_index(target_core_id, target_ctx_id);
     yield_now().await;
+}
+
+/// Requests cooperative cancellation of the fiber referred to by `handle`.
+///
+/// This only sets a flag and, if the target is currently parked
+/// (`Yielded`), wakes it so it gets a chance to observe that flag — it
+/// does not itself block or confirm cancellation. The target unwinds the
+/// next time it resumes through any DTA suspension point (`wait_now`,
+/// `yield_now`, a mailbox/mutex wait, ...), landing in
+/// [`FiberStatus::Cancelled`], observable via [`outcome`].
+///
+/// # Cooperative, not preemptive
+/// A fiber that never suspends through a DTA primitive — a pure
+/// CPU-bound loop with no `.await` inside it — never observes this flag
+/// and cannot be cancelled until it does, exactly as with any
+/// cooperative scheduler (DTA does not preempt `Running` fibers).
+///
+/// A stale handle (the fiber already finished and its slot was reused
+/// for an unrelated task) is silently ignored: the generation check
+/// below guards against cancelling the wrong task — including the case
+/// where the slot is reclaimed *during* this call (see the comment on
+/// the post-store re-check).
+#[allow(clippy::cast_possible_truncation)]
+#[inline]
+pub fn cancel(handle: dtact_handle_t) {
+    let Some(runtime) = crate::GLOBAL_RUNTIME.get() else {
+        return;
+    };
+    let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
+    let target_ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
+    let target_core_id = ((handle_val >> 32) & 0xFFFF) as usize;
+    let handle_gen = ((handle_val >> 48) & 0x7FFF) as u16;
+
+    let ctx_ptr = runtime.pool.get_context_ptr(target_ctx_id);
+    // Acquire, not Relaxed: unlike `cancel_requested` below, these two
+    // generation reads gate a real correctness decision (whether to undo
+    // the store past the race window), and `cancel` is called rarely
+    // enough — once per cancellation, not once per task — that there is
+    // no meaningful cost to paying for a timely, correctly-ordered read
+    // here rather than trusting Relaxed's weaker eventual-visibility.
+    let gen_before = unsafe {
+        ((*ctx_ptr)
+            .generation
+            .load(core::sync::atomic::Ordering::Acquire) as u16)
+            & 0x7FFF
+    };
+    if gen_before != handle_gen {
+        // Handle refers to a since-recycled slot; nothing to cancel.
+        return;
+    }
+
+    // `cancel_requested` itself is a pure signal with no payload riding
+    // along with it (unlike `state`/`generation`, nothing downstream
+    // depends on *what else* was visible at the moment it flips) —
+    // Relaxed is sufficient, same reasoning as the warehouse `backlog`
+    // counter's ordering (see `paper/main.tex`'s memory-order audit).
+    unsafe {
+        (*ctx_ptr)
+            .cancel_requested
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Re-check generation after the store: if it moved, `claim_context`
+    // reclaimed this slot for a *different* fiber somewhere between our
+    // read above and the store just now, meaning the store above may have
+    // just set `cancel_requested` on that unrelated new occupant instead
+    // of our actual target (which, for generation to have moved at all,
+    // must itself already be done). Undo it rather than leave a stray
+    // cancellation armed against a fiber that never asked for one — found
+    // by the same kind of concurrent-load stress testing that caught the
+    // read-side race in `dtact_await_observe`, not merely theorized.
+    let gen_after = unsafe {
+        ((*ctx_ptr)
+            .generation
+            .load(core::sync::atomic::Ordering::Acquire) as u16)
+            & 0x7FFF
+    };
+    if gen_after != gen_before {
+        unsafe {
+            (*ctx_ptr)
+                .cancel_requested
+                .store(false, core::sync::atomic::Ordering::Relaxed);
+        }
+        return;
+    }
+
+    // State-guarded wake, same protocol as `yield_to` — only actually
+    // enqueues if the target was parked (`Yielded`); a `Running`/
+    // `Suspending` fiber will observe the flag on its own next resumption.
+    crate::awaken_fiber_by_index(target_core_id, target_ctx_id);
+}
+
+/// Blocks until the fiber referred to by `handle` terminates, then returns
+/// its outcome.
+///
+/// A join, not a poll: this has the same blocking behaviour as
+/// `dtact_await` (natively yields if called from within a fiber, spins
+/// then parks if called from a host thread), plus the classification.
+///
+/// `None` only if `handle` was already stale (its slot had been reused for
+/// a different fiber) at the moment this call started waiting — not "not
+/// yet terminated," since this blocks until it is.
+///
+/// # Why this blocks instead of polling
+/// An earlier version of this function read `state` directly, non-blocking,
+/// meant to be called any time after a separate `dtact_await` had already
+/// confirmed termination. That was racy in a way this project initially
+/// underestimated: `ContextPool::claim_context` finalizes a slot's
+/// `state`/`generation` the moment `alloc_context` next hands that slot to
+/// a **different** fiber, and under real concurrent load (many threads
+/// sharing one pool, as in this crate's own test suite) that next claim
+/// can — and empirically did, reproducibly — happen before a second,
+/// separate call got back around to reading it, even one issued
+/// immediately after the first confirmed termination. Blocking here and
+/// capturing the status in the exact same read that detects termination
+/// (see [`crate::c_ffi::dtact_await_observe`]) closes that window
+/// entirely: there is no second read to race.
+///
+/// For [`memory_management::TaskOutcome::Panicked`], also returns the
+/// panic payload's message when it was an ordinary `&str`/`String`
+/// payload (the common case for `panic!("...")`). The classification
+/// (`Panicked` itself) is captured atomically with termination and is
+/// therefore race-free; the message is a second, separate read taken
+/// immediately after and carries the same — far narrower — residual risk
+/// as the rest of this function's outcome used to: an extremely tight
+/// race against a concurrent reclaim could occasionally lose the message
+/// (never the classification) back to `None`.
+#[must_use]
+#[inline]
+pub fn outcome(
+    handle: dtact_handle_t,
+) -> Option<(crate::memory_management::TaskOutcome, Option<String>)> {
+    let (status, ctx_ptr) = crate::c_ffi::dtact_await_observe(handle)?;
+
+    if status == FiberStatus::Finished as u32 {
+        Some((crate::memory_management::TaskOutcome::Finished, None))
+    } else if status == FiberStatus::Cancelled as u32 {
+        Some((crate::memory_management::TaskOutcome::Cancelled, None))
+    } else if status == FiberStatus::Panicked as u32 {
+        // `ctx_ptr` is exactly what `dtact_await_observe` already resolved
+        // to detect termination — no need to re-derive `target_ctx_id` and
+        // re-look-up `GLOBAL_RUNTIME`/`get_context_ptr` for it here.
+        core::hint::cold_path();
+        let ctx = unsafe { &mut *ctx_ptr };
+        let payload_ptr = core::mem::replace(&mut ctx.panic_payload_ptr, core::ptr::null_mut());
+        let message = if payload_ptr.is_null() {
+            None
+        } else {
+            let payload =
+                *unsafe { Box::from_raw(payload_ptr.cast::<Box<dyn core::any::Any + Send>>()) };
+            payload
+                .downcast_ref::<&str>()
+                .map(|s| String::from(*s))
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+        };
+        Some((crate::memory_management::TaskOutcome::Panicked, message))
+    } else {
+        None
+    }
 }
 
 /// Global Runtime Configuration and Telemetry.
