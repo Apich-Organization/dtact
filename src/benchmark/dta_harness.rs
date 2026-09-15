@@ -551,11 +551,27 @@ impl TaskSpawner for DtaHarness {
                 crate::api::topology::Affinity::Any,
             );
         } else {
-            // Called from the harness/main thread (seeding the root task):
-            // route to worker 0, mirroring how a host thread's first spawn
-            // has no "current core" of its own to prefer.
+            // Called from the harness/main thread (not a worker OS thread).
+            // Real production code (`src/api.rs`'s host-thread `spawn` path)
+            // routes this exact case via the *calling thread's own* real
+            // CPU core id (`topology::current().core_id % n`), not a fixed
+            // worker — so different host threads (or repeated calls from
+            // one host thread migrating across CPUs) naturally spread
+            // across workers instead of funneling through a single one.
+            // This harness must match that, not hardcode worker 0: this
+            // path is exercised not just once (a single root-task spawn,
+            // where the choice of target wouldn't matter) but potentially
+            // many times per run — e.g. every arrival in an open-loop
+            // Poisson-BoT workload (`workloads::run_poisson_bot`) is a
+            // fresh off-worker `spawn` call. Hardcoding worker 0 there
+            // would turn every arrival into a serialized bottleneck on one
+            // worker's mailbox/queue before DTA's real deflection policy
+            // ever gets a chance to run — a harness artifact, not real DTA
+            // behavior, and not something WS's shared, N-way-stealable
+            // `Injector` has an equivalent problem with.
+            let core = crate::api::topology::current().core_id as usize % n;
             let _ = self.scheduler.enqueue_deflect(
-                0,
+                core,
                 u64::from(idx),
                 idx,
                 crate::api::topology::Affinity::Any,
