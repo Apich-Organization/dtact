@@ -98,6 +98,14 @@ benchmark = ["dep:crossbeam-deque"]
 
 [lib]
 crate-type = ["cdylib", "rlib", "staticlib"]
+# `cargo bench` implicitly builds and runs the lib's own unit tests as a
+# bench target too (default libtest harness) unless told not to. Left
+# enabled, any global `cargo bench -- <flag>` (e.g. `--save-baseline`,
+# understood only by the Criterion-driven [[bench]] targets below, all of
+# which set `harness = false`) gets forwarded to that libtest binary as
+# well and is rejected as an unrecognized option, failing the whole
+# `cargo bench` invocation.
+bench = false
 
 [package.metadata.docs.rs]
 all-features = true
