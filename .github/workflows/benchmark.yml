@@ -1,6 +1,23 @@
 name: Benchmark (PR check)
 
-# Runs benchmarks on PRs for regression detection.
+# Runs benchmarks on PRs for regression detection against main's most
+# recent results.
+#
+# "Regression detection" previously meant literally: this workflow ran
+# `cargo bench` in a checkout with no prior `target/criterion` data, so
+# every PR compared against nothing and Criterion's own change-detection
+# (the "Performance has improved/regressed" lines) never had anything to
+# report against. Fixed by restoring the baseline `deploy.yml` saves on
+# every push to main (see that workflow) and running with
+# `--baseline-lenient main`: like `--baseline`, but per-benchmark rather
+# than all-or-nothing, so a PR that adds/renames a benchmark (with no
+# "main" baseline yet for that specific one) still runs and compares
+# everything else, instead of the whole job failing outright — and the
+# same flag degrades gracefully to "run with no comparison" on the very
+# first run ever, before any baseline has been saved at all. Comparison
+# results are written to the job summary so a reviewer sees them without
+# digging through raw logs.
+#
 # Deployment of benchmark reports is handled by deploy.yml (push to main only).
 
 on:
@@ -31,5 +48,34 @@ jobs:
       - name: Cache dependencies
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
+      - name: Restore main's Criterion baseline
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/criterion
+          # This exact key is never written by anyone (a PR's own commit
+          # SHA never matches a prior save from `deploy.yml`, which keys
+          # by the *main*-branch commit that produced the baseline) — the
+          # point is to always fall through to `restore-keys` below,
+          # which picks the most recent baseline `deploy.yml` saved.
+          key: criterion-baseline-main-${{ github.sha }}
+          restore-keys: |
+            criterion-baseline-main-
+
       - name: Run Criterion benchmarks
-        run: cargo bench
+        run: cargo bench -- --baseline-lenient main 2>&1 | tee /tmp/bench-output.txt
+
+      - name: Write regression summary
+        if: always()
+        run: |
+          {
+            echo "## Benchmark comparison vs. \`main\`"
+            echo
+            echo '```'
+            if [ -f /tmp/bench-output.txt ]; then
+              grep -E "^[A-Za-z].*/(Dtact|Tokio)|Performance has (improved|regressed)|Change within noise threshold|No change in performance detected|^ {24}time:|^ {24}thrpt:" \
+                /tmp/bench-output.txt || echo "(no matching output captured)"
+            else
+              echo "(benchmark step did not produce output)"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

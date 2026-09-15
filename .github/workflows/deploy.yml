@@ -49,7 +49,19 @@ jobs:
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
       - name: Run Criterion benchmarks
-        run: cargo bench
+        # Saves under the named baseline "main" (rather than Criterion's
+        # default unnamed base/new cycle, which only ever compares a run
+        # against whatever ran immediately before it *in the same
+        # checkout* — meaningless in CI, where every job starts fresh).
+        # `benchmark.yml`'s PR jobs restore the cache saved below and
+        # compare their own run against this named baseline.
+        run: cargo bench -- --save-baseline main
+
+      - name: Save Criterion baseline for PR comparisons
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/criterion
+          key: criterion-baseline-main-${{ github.sha }}
 
       - name: Upload criterion report artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
