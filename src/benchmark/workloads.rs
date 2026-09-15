@@ -306,6 +306,127 @@ fn uts_task<S: TaskSpawner>(
     countdown.done_one();
 }
 
+/// Parameters for an open-loop, Poisson-arrival Bag-of-Tasks workload.
+///
+/// This is the load-ratio (`ρ_0`) regime the preprint's "Scope of
+/// Applicability" section (`sec:dta_scope`) ties DTA's advantage to
+/// specifically ("high but subcritical load", `ρ_0 ∈ [0.6, 0.95]`), as
+/// distinct from [`spawn_fib`]/[`spawn_uts`] above, which are *closed-loop*
+/// bursts: every task is fired as fast as possible with no arrival-rate
+/// control at all (effectively `ρ_0` uncontrolled/undefined). Both
+/// `fib`/`uts` are about task-graph *shape*; this one is about system
+/// *load*.
+#[derive(Clone, Copy, Debug)]
+pub struct PoissonBotParams {
+    /// Target system-wide arrival rate, in tasks/sec.
+    pub lambda_per_sec: f64,
+    /// Fixed per-task service time (busy-wait), in nanoseconds — pins the
+    /// per-worker service rate `μ = 1e9 / service_ns` tasks/sec.
+    pub service_ns: u64,
+    /// Total number of tasks the generator produces before stopping.
+    pub count: u64,
+}
+
+impl PoissonBotParams {
+    /// The load ratio `ρ_0 = λ / (N·μ)` this configuration implies for a
+    /// scheduler with `workers` worker cores. `< 1` is queueing-stable;
+    /// `∈ [0.6, 0.95]` is the preprint's claimed DTA sweet spot.
+    #[must_use]
+    pub fn rho_0(&self, workers: usize) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
+        let workers_f = workers as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let mu_per_sec = 1.0e9 / self.service_ns as f64;
+        self.lambda_per_sec / (workers_f * mu_per_sec)
+    }
+
+    /// Builds parameters that target a given `rho_0` at `workers` worker
+    /// cores, holding `service_ns` (task granularity) fixed — the natural
+    /// way to sweep load ratio independent of task shape.
+    #[must_use]
+    pub fn for_rho_0(rho_0: f64, workers: usize, service_ns: u64, count: u64) -> Self {
+        #[allow(clippy::cast_precision_loss)]
+        let workers_f = workers as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let mu_per_sec = 1.0e9 / service_ns as f64;
+        Self {
+            lambda_per_sec: rho_0 * workers_f * mu_per_sec,
+            service_ns,
+            count,
+        }
+    }
+}
+
+/// Bookkeeping and results shared across one Poisson-BoT run.
+pub struct PoissonBotRun {
+    /// Outstanding-task tracker. [`run_poisson_bot`] itself only blocks for
+    /// the *generation* (arrival-pacing) duration — call
+    /// [`Countdown::wait_zero`] on this afterward to block until every
+    /// generated task has actually *completed* (which can lag behind
+    /// generation under high load).
+    pub countdown: Arc<Countdown>,
+    /// Per-task end-to-end latency (arrival to completion), in nanoseconds.
+    /// Index `i` holds task `i`'s latency once it has completed — `0`
+    /// until then, so callers must wait on `countdown` first.
+    pub latencies_ns: Arc<Vec<AtomicU64>>,
+}
+
+/// Runs an open-loop Poisson-arrival Bag-of-Tasks workload against
+/// `spawner`, pacing task generation to `params.lambda_per_sec`.
+///
+/// Spin-wait paced (not `sleep`-based): at realistic `lambda` values the
+/// inter-arrival gaps this workload needs are well under a millisecond,
+/// far finer than `sleep`'s scheduling-granularity precision, so a spin
+/// loop against a real `Instant` is used instead — the standard tradeoff
+/// (CPU for precision) any open-loop load generator makes.
+///
+/// Blocks the calling thread only for the pacing duration (`params.count /
+/// params.lambda_per_sec` seconds in expectation) — returns once every
+/// task has been *spawned*, not necessarily completed.
+#[must_use]
+pub fn run_poisson_bot<S: TaskSpawner>(spawner: &S, params: PoissonBotParams) -> PoissonBotRun {
+    let run = PoissonBotRun {
+        countdown: Arc::new(Countdown::new()),
+        latencies_ns: Arc::new((0..params.count).map(|_| AtomicU64::new(0)).collect()),
+    };
+
+    let mut rng_state = splitmix64(0x504F_4953_534F_4E42 ^ params.count);
+    let start = std::time::Instant::now();
+    let mut next_arrival = std::time::Duration::ZERO;
+
+    for i in 0..params.count {
+        // Exponential inter-arrival draw via inverse-CDF: -ln(U)/lambda,
+        // the standard way to turn a uniform PRNG stream into a Poisson
+        // arrival process. `.max(f64::MIN_POSITIVE)` guards `ln(0)`.
+        rng_state = splitmix64(rng_state);
+        #[allow(clippy::cast_precision_loss)]
+        let unit = ((rng_state >> 11) as f64 * (1.0 / (1u64 << 53) as f64)).max(f64::MIN_POSITIVE);
+        let inter_arrival_secs = -unit.ln() / params.lambda_per_sec;
+        next_arrival += std::time::Duration::from_secs_f64(inter_arrival_secs);
+
+        while start.elapsed() < next_arrival {
+            core::hint::spin_loop();
+        }
+
+        run.countdown.add(1);
+        let arrival = std::time::Instant::now();
+        let countdown = Arc::clone(&run.countdown);
+        let latencies = Arc::clone(&run.latencies_ns);
+        let service_ns = params.service_ns;
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = i as usize;
+        spawner.spawn(Box::new(move |_s: &S| {
+            super::numa_model::burn_ns(service_ns);
+            #[allow(clippy::cast_possible_truncation)]
+            let latency_ns = arrival.elapsed().as_nanos() as u64;
+            latencies[idx].store(latency_ns, Ordering::Relaxed);
+            countdown.done_one();
+        }));
+    }
+
+    run
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +475,30 @@ mod tests {
         inline.drain();
         run.countdown.wait_zero();
         assert_eq!(run.sum.load(Ordering::Relaxed), fib_seq(15));
+    }
+
+    #[test]
+    fn poisson_bot_for_rho_0_round_trips() {
+        let params = PoissonBotParams::for_rho_0(0.75, 4, 1000, 100);
+        assert!((params.rho_0(4) - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn poisson_bot_generates_every_task_with_positive_latency() {
+        let inline = Inline {
+            queue: Mutex::new(Vec::new()),
+        };
+        // High rho_0 and tiny service_ns keep this test's real-time pacing
+        // (run_poisson_bot spin-waits on the wall clock between arrivals)
+        // well under a millisecond.
+        let params = PoissonBotParams::for_rho_0(0.9, 2, 100, 5);
+        let run = run_poisson_bot(&inline, params);
+        inline.drain();
+        run.countdown.wait_zero();
+        assert_eq!(run.latencies_ns.len(), 5);
+        for latency in &*run.latencies_ns {
+            assert!(latency.load(Ordering::Relaxed) > 0);
+        }
     }
 
     #[test]
