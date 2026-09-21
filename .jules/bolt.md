@@ -1,0 +1,3 @@
+## 2026-09-21 - [Eliminated Redundant Atomic Loads in Task Routing]
+**Learning:** In the Dtact scheduler's hot path (`route_chunk`, `poll_mailboxes`), redundant `Relaxed` atomic loads to `local_tail` were occurring repeatedly during batch task pushes. Due to pointer aliasing concerns, the compiler could not automatically optimize these away across helper functions.
+**Action:** Always verify if atomic state can be pre-calculated from loop invariants (e.g., computing `tail` from an immutable `local_head` and a running `cur_len` offset). Pass this pre-calculated state down the call stack to strictly minimize atomic interactions inside high-frequency loops.

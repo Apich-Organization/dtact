@@ -30,8 +30,7 @@ proptest! {
                 let worker = &*scheduler.workers[i].get();
                 total_tasks += worker.local_queue_len();
 
-                for j in 0..64 {
-                    let mailbox = &scheduler.mailboxes[i][j];
+                for mailbox in scheduler.mailboxes[i].iter().take(64) {
                     let head = mailbox.head.load(Ordering::SeqCst);
                     let tail = mailbox.tail.load(Ordering::SeqCst);
                     if tail != head {
@@ -70,8 +69,7 @@ proptest! {
                 let worker = &*scheduler.workers[i].get();
                 total_tasks += worker.local_queue_len();
 
-                for j in 0..64 {
-                    let mailbox = &scheduler.mailboxes[i][j];
+                for mailbox in scheduler.mailboxes[i].iter().take(64) {
                     if mailbox.tail.load(Ordering::SeqCst) != mailbox.head.load(Ordering::SeqCst) {
                         total_tasks += 1;
                     }
