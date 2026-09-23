@@ -827,11 +827,7 @@ pub use crate::common_types::TopologyMode;
 #[allow(clippy::cast_possible_truncation)]
 fn load_scale_shift_for(total_cores: usize) -> u8 {
     const fn ceil_log2(n: usize) -> u8 {
-        if n <= 1 {
-            0
-        } else {
-            (n - 1).ilog2() as u8 + 1
-        }
+        if n <= 1 { 0 } else { (n - 1).ilog2() as u8 + 1 }
     }
     let reference_log2 = ceil_log2(LOAD_SCALE_REFERENCE_N);
     let n_log2 = ceil_log2(total_cores.max(1));
