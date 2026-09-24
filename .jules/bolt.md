@@ -1,0 +1,3 @@
+## 2025-05-18 - [Optimizing SPSC/MPMC Queue Pushes by Pre-Calculating Tail Offsets]
+**Learning:** In hot Rust code paths, especially SPSC/MPMC queues in this project, passing a previously mathematically computed `tail` offset (from cached variables `fixed_head` and `cur_len`) to helper functions prevents redundant atomic loads of thread-local pointers (even with `Ordering::Relaxed`).
+**Action:** Always compute tail mathematically (`(head + len) & MASK`) and pass it as an argument down the call stack instead of allowing inner functions to execute a redundant `local_tail.load(Ordering::Relaxed)` whenever possible.
