@@ -830,7 +830,7 @@ fn load_scale_shift_for(total_cores: usize) -> u8 {
         if n <= 1 {
             0
         } else {
-            (usize::BITS - (n - 1).leading_zeros()) as u8
+            (n - 1).ilog2() as u8 + 1
         }
     }
     let reference_log2 = ceil_log2(LOAD_SCALE_REFERENCE_N);
@@ -1114,26 +1114,25 @@ impl Worker {
     /// stays under `LOCAL_QUEUE_CAPACITY`. The `route_chunk` / `drain_warehouse`
     /// paths enforce this via `LOCAL_QUEUE_HIGH_WATERMARK`.
     #[inline]
-    pub fn push_batch(&mut self, chunk: &TaskChunk) {
+    pub fn push_batch(&mut self, chunk: &TaskChunk, current_tail: usize) {
         let count = chunk.count as usize;
-        let tail = self.local_tail.load(Ordering::Relaxed);
-        let end_idx = tail.wrapping_add(count);
+        let end_idx = current_tail.wrapping_add(count);
 
         if end_idx <= LOCAL_QUEUE_CAPACITY {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     chunk.tasks.as_ptr(),
-                    (*self.local_queue.ptr).as_mut_ptr().add(tail),
+                    (*self.local_queue.ptr).as_mut_ptr().add(current_tail),
                     count,
                 );
             }
         } else {
-            let first_part = LOCAL_QUEUE_CAPACITY - tail;
+            let first_part = LOCAL_QUEUE_CAPACITY - current_tail;
             let second_part = count - first_part;
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     chunk.tasks.as_ptr(),
-                    (*self.local_queue.ptr).as_mut_ptr().add(tail),
+                    (*self.local_queue.ptr).as_mut_ptr().add(current_tail),
                     first_part,
                 );
                 core::ptr::copy_nonoverlapping(
@@ -1665,7 +1664,10 @@ impl DtaScheduler {
             }
             match self.warehouse.pop() {
                 Some(chunk) => {
-                    worker.push_batch(&chunk);
+                    // Optimization (Bolt): Pre-calculate the tail mathematically using the already-cached head
+                    // and current length. This avoids a redundant atomic load in the hot `push_batch` function.
+                    let current_tail = (fixed_head.wrapping_add(cur_len)) & LOCAL_QUEUE_MASK;
+                    worker.push_batch(&chunk, current_tail);
                     cur_len += chunk.count as usize;
                     drained += 1;
                 }
@@ -1766,7 +1768,7 @@ impl DtaScheduler {
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        let added = self.route_chunk(worker, current_core, chunk, cur_len);
+                        let added = self.route_chunk(worker, current_core, chunk, cur_len, fixed_head);
                         cur_len += added;
                     }
                     None => break,
@@ -1785,7 +1787,7 @@ impl DtaScheduler {
             match self.external_mailboxes[current_core].pop() {
                 Some(chunk) => {
                     received_any = true;
-                    let added = self.route_chunk(worker, current_core, chunk, cur_len);
+                    let added = self.route_chunk(worker, current_core, chunk, cur_len, fixed_head);
                     cur_len += added;
                 }
                 None => break,
@@ -1812,6 +1814,7 @@ impl DtaScheduler {
         current_core: usize,
         chunk: TaskChunk,
         cur_len: usize,
+        fixed_head: usize,
     ) -> usize {
         let space_ok = (cur_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
         let hops_ok = chunk.hop_count < self.max_hops;
@@ -1825,7 +1828,9 @@ impl DtaScheduler {
         // through a function pointer array which introduces misprediction latency.
         if space_ok {
             let added = chunk.count as usize;
-            self.route_local(worker, current_core, chunk);
+            // Optimization (Bolt): Compute tail mathematically rather than reloading atomically in push_batch.
+            let current_tail = (fixed_head.wrapping_add(cur_len)) & LOCAL_QUEUE_MASK;
+            self.route_local(worker, current_core, chunk, current_tail);
             added
         } else if hops_ok {
             self.route_deflect(worker, current_core, chunk);
@@ -1838,8 +1843,8 @@ impl DtaScheduler {
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk) {
-        worker.push_batch(&chunk);
+    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk, current_tail: usize) {
+        worker.push_batch(&chunk, current_tail);
     }
 
     /// This code path utilizes branchless programming to eliminate mispredictions.
