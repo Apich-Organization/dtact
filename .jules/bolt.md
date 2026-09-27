@@ -1,0 +1,3 @@
+## 2024-09-13 - [Optimize redundant atomic reads of local_tail]
+**Learning:** In hot Rust code paths, especially SPSC/MPMC queues, redundant atomic loads of thread-local pointers can be optimized by caching the atomic value and passing it as a mutable reference to helper functions.
+**Action:** When working with high-frequency loops, analyze if the thread mutates the state locally. If so, hoist the load and accumulate the state to avoid redundant atomic reads, while preserving the queue's original functional semantics and safety limits. Ensure comments explain these optimizations to maintain readability.
