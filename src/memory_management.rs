@@ -401,6 +401,7 @@ impl FiberContext {
     /// for anything else (already terminal, `Initial`, or already
     /// `Notified`) this is correctly a no-op.
     #[inline(always)]
+    #[allow(deprecated)]
     pub(crate) fn try_notify(&self) -> bool {
         self.state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {

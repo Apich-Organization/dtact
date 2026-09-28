@@ -827,11 +827,7 @@ pub use crate::common_types::TopologyMode;
 #[allow(clippy::cast_possible_truncation)]
 fn load_scale_shift_for(total_cores: usize) -> u8 {
     const fn ceil_log2(n: usize) -> u8 {
-        if n <= 1 {
-            0
-        } else {
-            (usize::BITS - (n - 1).leading_zeros()) as u8
-        }
+        if n <= 1 { 0 } else { (n - 1).ilog2() as u8 + 1 }
     }
     let reference_log2 = ceil_log2(LOAD_SCALE_REFERENCE_N);
     let n_log2 = ceil_log2(total_cores.max(1));
@@ -1086,8 +1082,8 @@ impl Worker {
     /// `load_level` no matter how large the backlog actually grows.
     #[inline(always)]
     pub fn push_local(&self, task: TaskIndex) -> bool {
-        let tail = self.local_tail.load(Ordering::Relaxed);
         let head = self.local_head.load(Ordering::Relaxed);
+        let tail = self.local_tail.load(Ordering::Relaxed);
         let queue_len = tail.wrapping_sub(head) & LOCAL_QUEUE_MASK;
         if queue_len >= LOCAL_QUEUE_CAPACITY - 1 {
             return false;
@@ -1114,9 +1110,8 @@ impl Worker {
     /// stays under `LOCAL_QUEUE_CAPACITY`. The `route_chunk` / `drain_warehouse`
     /// paths enforce this via `LOCAL_QUEUE_HIGH_WATERMARK`.
     #[inline]
-    pub fn push_batch(&mut self, chunk: &TaskChunk) {
+    pub fn push_batch(&mut self, chunk: &TaskChunk, tail: usize) {
         let count = chunk.count as usize;
-        let tail = self.local_tail.load(Ordering::Relaxed);
         let end_idx = tail.wrapping_add(count);
 
         if end_idx <= LOCAL_QUEUE_CAPACITY {
@@ -1665,7 +1660,7 @@ impl DtaScheduler {
             }
             match self.warehouse.pop() {
                 Some(chunk) => {
-                    worker.push_batch(&chunk);
+                    worker.push_batch(&chunk, fixed_head.wrapping_add(cur_len) & LOCAL_QUEUE_MASK);
                     cur_len += chunk.count as usize;
                     drained += 1;
                 }
@@ -1825,7 +1820,7 @@ impl DtaScheduler {
         // through a function pointer array which introduces misprediction latency.
         if space_ok {
             let added = chunk.count as usize;
-            self.route_local(worker, current_core, chunk);
+            self.route_local(worker, current_core, chunk, cur_len);
             added
         } else if hops_ok {
             self.route_deflect(worker, current_core, chunk);
@@ -1838,8 +1833,9 @@ impl DtaScheduler {
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk) {
-        worker.push_batch(&chunk);
+    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk, cur_len: usize) {
+        let fixed_head = worker.local_head.load(Ordering::Relaxed);
+        worker.push_batch(&chunk, fixed_head.wrapping_add(cur_len) & LOCAL_QUEUE_MASK);
     }
 
     /// This code path utilizes branchless programming to eliminate mispredictions.
