@@ -40,7 +40,7 @@
     clippy::all,
     clippy::pedantic,
     missing_docs,
-    clippy::nursery,
+
     clippy::single_call_fn
 )]
 // -------------------------------------------------------------------------
