@@ -376,6 +376,7 @@ impl DtaHarness {
     /// benchmark harness whose task volumes may not otherwise build up
     /// enough per-worker backlog to cross the production default.
     pub fn set_deflection_threshold(&self, threshold: u8) {
+        #[allow(clippy::needless_range_loop)]
         for core in 0..self.worker_count() {
             let worker = unsafe { &*self.scheduler.workers[core].get() };
             worker

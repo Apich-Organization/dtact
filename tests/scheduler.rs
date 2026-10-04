@@ -30,6 +30,7 @@ proptest! {
                 let worker = &*scheduler.workers[i].get();
                 total_tasks += worker.local_queue_len();
 
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..64 {
                     let mailbox = &scheduler.mailboxes[i][j];
                     let head = mailbox.head.load(Ordering::SeqCst);
@@ -70,6 +71,7 @@ proptest! {
                 let worker = &*scheduler.workers[i].get();
                 total_tasks += worker.local_queue_len();
 
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..64 {
                     let mailbox = &scheduler.mailboxes[i][j];
                     if mailbox.tail.load(Ordering::SeqCst) != mailbox.head.load(Ordering::SeqCst) {
