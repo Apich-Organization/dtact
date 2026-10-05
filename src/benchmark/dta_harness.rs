@@ -376,7 +376,13 @@ impl DtaHarness {
     /// benchmark harness whose task volumes may not otherwise build up
     /// enough per-worker backlog to cross the production default.
     pub fn set_deflection_threshold(&self, threshold: u8) {
-        for (_core, worker_cell) in self.scheduler.workers.iter().enumerate().take(self.worker_count()) {
+        for (_core, worker_cell) in self
+            .scheduler
+            .workers
+            .iter()
+            .enumerate()
+            .take(self.worker_count())
+        {
             let worker = unsafe { &*worker_cell.get() };
             worker
                 .deflection_threshold

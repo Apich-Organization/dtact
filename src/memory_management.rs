@@ -753,6 +753,7 @@ impl ContextPool {
             }
             #[cfg(windows)]
             {
+                let _ = numa;
                 use windows_sys::Win32::System::Memory::{
                     MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
                 };
