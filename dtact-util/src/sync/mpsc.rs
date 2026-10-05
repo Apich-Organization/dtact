@@ -145,6 +145,9 @@ pub struct Sender<T> {
     shared: Arc<Shared<T>>,
 }
 
+unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Send> Sync for Sender<T> {}
+
 impl<T> Clone for Sender<T> {
     #[inline(always)]
     fn clone(&self) -> Self {
@@ -259,6 +262,8 @@ pub struct Receiver<T> {
 // panics (rather than silently racing) if this invariant is ever somehow
 // violated, rather than relying solely on this unsafe impl.
 unsafe impl<T: Send> Sync for Receiver<T> {}
+
+unsafe impl<T: Send> Send for Receiver<T> {}
 
 impl<T> Drop for Receiver<T> {
     #[inline(always)]

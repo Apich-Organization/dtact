@@ -1,0 +1,3 @@
+## 2024-05-18 - [Optimize P2P Scheduler Dispatch and Push Fast Path]
+**Learning:** In hot Rust code paths, especially SPSC/MPMC queues in this project, the compiler cannot always optimize away redundant atomic loads of thread-local pointers (even with `Ordering::Relaxed`) across helper functions. Manually computing state (e.g. queue tail indexes) once and passing it down as arguments to helper functions eliminates redundant load instructions. Also, returning loop exit conditions from helpers avoids duplicated state checks.
+**Action:** Always compute loop invariants or mutable local thread state mathematically where possible and pass the values as arguments instead of letting helper functions re-read atomic variables.

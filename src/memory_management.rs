@@ -530,6 +530,7 @@ impl ContextPool {
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
     #[inline(never)]
+    #[allow(unused_variables)]
     pub fn new(
         capacity: u32,
         stack_size: usize,
@@ -686,6 +687,7 @@ impl ContextPool {
     #[inline(always)]
     #[allow(clippy::useless_let_if_seq)]
     #[allow(clippy::cast_possible_truncation)]
+    #[allow(unused_variables)]
     unsafe fn allocate_arena(
         size: usize,
         safety: SafetyLevel,
