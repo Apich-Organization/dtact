@@ -403,7 +403,7 @@ impl FiberContext {
     #[inline(always)]
     pub(crate) fn try_notify(&self) -> bool {
         self.state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |s| {
                 if s == FiberStatus::Running as u32
                     || s == FiberStatus::Suspending as u32
                     || s == FiberStatus::Yielded as u32
