@@ -1767,7 +1767,8 @@ impl DtaScheduler {
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        let added = self.route_chunk(worker, current_core, chunk, cur_len, fixed_head);
+                        let added =
+                            self.route_chunk(worker, current_core, chunk, cur_len, fixed_head);
                         cur_len += added;
                     }
                     None => break,
@@ -1840,7 +1841,14 @@ impl DtaScheduler {
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk, fixed_head: usize, cur_len: usize) {
+    fn route_local(
+        &self,
+        worker: &mut Worker,
+        _core: usize,
+        chunk: TaskChunk,
+        fixed_head: usize,
+        cur_len: usize,
+    ) {
         worker.push_batch(&chunk, fixed_head, cur_len);
     }
 
