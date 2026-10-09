@@ -830,7 +830,9 @@ fn load_scale_shift_for(total_cores: usize) -> u8 {
         if n <= 1 {
             0
         } else {
-            (usize::BITS - (n - 1).leading_zeros()) as u8
+            #[allow(clippy::manual_bit_width)]
+            let bits = usize::BITS - (n - 1).leading_zeros();
+            bits as u8
         }
     }
     let reference_log2 = ceil_log2(LOAD_SCALE_REFERENCE_N);
