@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum Theme {
     #[default]
