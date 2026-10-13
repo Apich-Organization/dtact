@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 use crate::{
     components::{footer::Footer, nav::Nav},
     pages::{

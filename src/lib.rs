@@ -1,3 +1,4 @@
+#![allow(clippy::incompatible_msrv)]
 //! # Dtact-V3: Distributed Task-Aware Coroutine Toolkit
 //!
 //! Dtact is a high-performance, low-latency asynchronous runtime designed for systems-level
