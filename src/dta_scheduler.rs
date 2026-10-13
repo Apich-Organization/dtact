@@ -826,12 +826,11 @@ pub use crate::common_types::TopologyMode;
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 fn load_scale_shift_for(total_cores: usize) -> u8 {
-    #[allow(clippy::manual_bit_width)]
     const fn ceil_log2(n: usize) -> u8 {
         if n <= 1 {
             0
         } else {
-            (usize::BITS - (n - 1).leading_zeros()) as u8
+            (n - 1).bit_width() as u8
         }
     }
     let reference_log2 = ceil_log2(LOAD_SCALE_REFERENCE_N);
@@ -1769,7 +1768,8 @@ impl DtaScheduler {
                 match row[current_core].pop() {
                     Some(chunk) => {
                         received_any = true;
-                        let added = self.route_chunk(worker, current_core, chunk, cur_len, fixed_head);
+                        let added =
+                            self.route_chunk(worker, current_core, chunk, cur_len, fixed_head);
                         cur_len += added;
                     }
                     None => break,
@@ -1842,7 +1842,14 @@ impl DtaScheduler {
 
     #[inline(always)]
     #[allow(clippy::unused_self)]
-    fn route_local(&self, worker: &mut Worker, _core: usize, chunk: TaskChunk, cur_len: usize, fixed_head: usize) {
+    fn route_local(
+        &self,
+        worker: &mut Worker,
+        _core: usize,
+        chunk: TaskChunk,
+        cur_len: usize,
+        fixed_head: usize,
+    ) {
         worker.push_batch(&chunk, cur_len, fixed_head);
     }
 
