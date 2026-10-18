@@ -25,6 +25,7 @@
 \usepackage{caption}
 \usepackage{subcaption}
 \usepackage{tabularx}
+\usepackage{longtable}
 
 %% -- Code listings ---------------------------------------------------------
 \usepackage{listings}
@@ -1056,7 +1057,7 @@ has an edge $i \to j$ iff $i \rightsquigarrow j$.
 % =============================================================
 \label{sec:corr}
 
-\begin{table}[H]
+\begin{longtable}[H]
 \centering
 \small
 \caption{Mapping between mathematical objects and Rust source identifiers
@@ -1120,7 +1121,7 @@ $\hat{O}_{\text{birth}}^{\text{park}}$ & Spawn onto a warehouse-busy target (bir
   & \code{alloc\_context} $\to$ \code{wake\_fiber} $\to$ \code{enqueue\_deflect}'s \code{divert\_to\_warehouse} fast exit \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{longtable}
 
 % =============================================================
 \section{Summary of Parameters}
