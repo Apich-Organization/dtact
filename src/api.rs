@@ -394,22 +394,18 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             {
                 let lr = fiber_entry_point as *const () as u64;
                 let sp = stack_top as u64;
-                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened"))]
-                let signed_lr = {
-                    let mut signed = lr;
-                    core::arch::asm!(
-                        "mov x16, {lr}",
-                        "mov x17, {sp}",
-                        ".inst 0xDAC10230", // pacia x16, x17
-                        "mov {lr}, x16",
-                        lr = inout(reg) signed,
-                        sp = in(reg) sp,
-                        out("x16") _, out("x17") _,
-                    );
-                    signed
-                };
-                #[cfg(not(all(target_arch = "aarch64", unix, feature = "security-hardened")))]
-                let signed_lr = lr;
+                #[allow(unused)]
+                let mut signed_lr = lr;
+                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened",))]
+                core::arch::asm!(
+                    "mov x16, {lr}",
+                    "mov x17, {sp}",
+                    ".inst 0xDAC10230", // pacia x16, x17
+                    "mov {lr}, x16",
+                    lr = inout(reg) signed_lr,
+                    sp = in(reg) sp,
+                    out("x16") _, out("x17") _,
+                );
                 (*ctx_ptr).regs.gprs[12] = sp; // SP
                 (*ctx_ptr).regs.gprs[11] = signed_lr; // Signed x30 (LR)
                 #[cfg(windows)]
@@ -791,22 +787,17 @@ pub mod fiber {
             {
                 let lr = super::fiber_entry_point as *const () as u64;
                 let sp = stack_top as u64;
-                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened"))]
-                let signed_lr = {
-                    let mut signed = lr;
-                    core::arch::asm!(
-                        "mov x16, {lr}",
-                        "mov x17, {sp}",
-                        ".inst 0xDAC10230", // pacia x16, x17
-                        "mov {lr}, x16",
-                        lr = inout(reg) signed,
-                        sp = in(reg) sp,
-                        out("x16") _, out("x17") _,
-                    );
-                    signed
-                };
-                #[cfg(not(all(target_arch = "aarch64", unix, feature = "security-hardened")))]
-                let signed_lr = lr;
+                let mut signed_lr = lr;
+                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened",))]
+                core::arch::asm!(
+                    "mov x16, {lr}",
+                    "mov x17, {sp}",
+                    ".inst 0xDAC10230", // pacia x16, x17
+                    "mov {lr}, x16",
+                    lr = inout(reg) signed_lr,
+                    sp = in(reg) sp,
+                    out("x16") _, out("x17") _,
+                );
                 (*ctx_ptr).regs.gprs[12] = sp; // SP
                 (*ctx_ptr).regs.gprs[11] = signed_lr; // Signed x30 (LR)
                 #[cfg(windows)]
