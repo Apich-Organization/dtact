@@ -60,13 +60,13 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         let _ = page.get();
         if let Some(window) = web_sys::window() {
-            if let Ok(func) =
-                js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("triggerKatex"))
+            let key = wasm_bindgen::JsValue::from_str("triggerKatex");
+            if let Some(func) = js_sys::Reflect::get(&window, &key)
+                .ok()
+                .filter(|f| f.is_function())
             {
-                if func.is_function() {
-                    let func: js_sys::Function = func.into();
-                    let _ = func.call0(&window);
-                }
+                let func: js_sys::Function = func.into();
+                let _ = func.call0(&window);
             }
         }
     });
