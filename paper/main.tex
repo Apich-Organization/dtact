@@ -1052,21 +1052,36 @@ perform some action before worker $i$ can proceed.  The
 has an edge $i \to j$ iff $i \rightsquigarrow j$.
 \end{definition}
 
+\newpage
+
 % =============================================================
 \section{Correspondence Table: Math~$\leftrightarrow$~Code}
 % =============================================================
 \label{sec:corr}
 
-\begin{longtable}[H]
-\centering
-\small
+\begin{longtable}{>{\ttfamily}p{3.4cm} p{4.5cm} p{5.5cm}}
 \caption{Mapping between mathematical objects and Rust source identifiers
-in \texttt{src/dta\_scheduler.rs}.}
-\label{tab:corr}
-\begin{tabular}{>{\ttfamily}p{3.4cm} p{4.5cm} p{5.5cm}}
+in \texttt{src/dta\_scheduler.rs}.} \label{tab:corr} \\
 \toprule
 \normalfont Math symbol & Meaning & Code identifier \\
 \midrule
+\endfirsthead
+
+\multicolumn{3}{c}%
+{{\bfseries Table \thetable\ continued from previous page}} \\
+\toprule
+\normalfont Math symbol & Meaning & Code identifier \\
+\midrule
+\endhead
+
+\midrule
+\multicolumn{3}{r}{{Continued on next page\dots}} \\
+\bottomrule
+\endfoot
+
+\bottomrule
+\endlastfoot
+
 $\mathcal{T}$, $P$   & Task index set, pool capacity
   & \code{TaskIndex = u32}; pool capacity arg to \code{ContextPool::new} \\
 $\mathcal{C}$, $K$   & Chunk set, chunk size
@@ -1119,9 +1134,9 @@ $\hat{O}_{\text{birth}}^{\text{route}}$ & Fiber-internal spawn, cross-worker (bi
   & \code{alloc\_context} $\to$ \code{wake\_fiber} $\to$ \code{enqueue\_pinned}/\code{enqueue\_deflect} SPSC push \\
 $\hat{O}_{\text{birth}}^{\text{park}}$ & Spawn onto a warehouse-busy target (birth)
   & \code{alloc\_context} $\to$ \code{wake\_fiber} $\to$ \code{enqueue\_deflect}'s \code{divert\_to\_warehouse} fast exit \\
-\bottomrule
-\end{tabular}
 \end{longtable}
+
+\newpage
 
 % =============================================================
 \section{Summary of Parameters}
