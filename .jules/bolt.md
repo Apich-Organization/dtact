@@ -1,0 +1,3 @@
+## 2024-10-18 - Hoist local_tail load in push_batch
+**Learning:** In hot loops over SPSC/MPMC queues, even Ordering::Relaxed atomic loads of thread-local state like `local_tail` can be redundant if the tail offset can be computed from existing cached invariants (like `fixed_head` and `cur_len`).
+**Action:** Calculate tail manually `(fixed_head + cur_len) & MASK` and pass it down to helper functions to avoid redundant atomic loads.
