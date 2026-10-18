@@ -78,14 +78,6 @@ jobs:
             if [[ "\$arg" == --target=* ]]; then
               continue
             fi
-            if [[ "\$arg" == *"--fix-cortex-a53-843419"* ]]; then
-              arg="\${arg//,--fix-cortex-a53-843419/}"
-              arg="\${arg//--fix-cortex-a53-843419,/}"
-              arg="\${arg//--fix-cortex-a53-843419/}"
-              if [[ "\$arg" == "-Wl" || "\$arg" == "-Wl," || -z "\$arg" ]]; then
-                continue
-              fi
-            fi
             args+=("\$arg")
           done
           exec zig cc -target $ZIG_TARGET "\${args[@]}"
@@ -98,14 +90,6 @@ jobs:
           for arg in "\$@"; do
             if [[ "\$arg" == --target=* ]]; then
               continue
-            fi
-            if [[ "\$arg" == *"--fix-cortex-a53-843419"* ]]; then
-              arg="\${arg//,--fix-cortex-a53-843419/}"
-              arg="\${arg//--fix-cortex-a53-843419,/}"
-              arg="\${arg//--fix-cortex-a53-843419/}"
-              if [[ "\$arg" == "-Wl" || "\$arg" == "-Wl," || -z "\$arg" ]]; then
-                continue
-              fi
             fi
             args+=("\$arg")
           done
