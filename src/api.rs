@@ -396,12 +396,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 let sp = stack_top as u64;
                 #[allow(unused)]
                 let mut signed_lr = lr;
-                #[cfg(not(all(
-                    target_arch = "aarch64",
-                    unix,
-                    not(target_os = "macos"),
-                    not(feature = "security-hardened"),
-                )))]
+                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened",))]
                 core::arch::asm!(
                     "mov x16, {lr}",
                     "mov x17, {sp}",
@@ -793,6 +788,7 @@ pub mod fiber {
                 let lr = super::fiber_entry_point as *const () as u64;
                 let sp = stack_top as u64;
                 let mut signed_lr = lr;
+                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened",))]
                 core::arch::asm!(
                     "mov x16, {lr}",
                     "mov x17, {sp}",

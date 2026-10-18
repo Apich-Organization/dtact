@@ -2051,14 +2051,14 @@ impl Future for DtactIoFuture {
                             slot.completed.store(false, Ordering::Relaxed);
                             slot.dropped.store(false, Ordering::Relaxed);
                             slot.origin_fd.store(self.fd, Ordering::Relaxed);
-                            let raw = unsafe {
-                                std::mem::transmute::<_, &(*mut (), *const RawWakerVTable)>(
-                                    cx.waker(),
-                                )
-                            };
                             slot.lock_waker();
-                            slot.waker_data.store(raw.0, Ordering::Relaxed);
-                            slot.waker_vtable.store(raw.1 as *mut _, Ordering::Relaxed);
+                            slot.waker_data
+                                .store(cx.waker().data().cast_mut(), Ordering::Relaxed);
+                            slot.waker_vtable.store(
+                                std::ptr::from_ref::<RawWakerVTable>(cx.waker().vtable())
+                                    .cast_mut(),
+                                Ordering::Relaxed,
+                            );
                             slot.unlock_waker();
 
                             let req = self.create_io_request(idx);
@@ -2089,11 +2089,9 @@ impl Future for DtactIoFuture {
 
                     let state = &WORKERS.get().unwrap()[self.worker_idx];
                     let slot = &state.slots[slot_idx];
-                    let raw = unsafe {
-                        std::mem::transmute::<_, &(*mut (), *const RawWakerVTable)>(cx.waker())
-                    };
-                    let new_data = raw.0;
-                    let new_vtable = raw.1 as *mut _;
+                    let new_data = cx.waker().data().cast_mut();
+                    let new_vtable =
+                        std::ptr::from_ref::<RawWakerVTable>(cx.waker().vtable()).cast_mut();
 
                     slot.lock_waker();
                     let old_data = slot.waker_data.load(Ordering::Relaxed);
