@@ -60,7 +60,8 @@ jobs:
           if [ "$RUNNER_OS" == "Linux" ]; then
             sudo apt-get update || true
             sudo apt-get install -y qemu-user-static || true
-            sudo apt-get install -y libc6-arm64-cross libc6-riscv64-cross gcc-riscv64-linux-gnu || true
+            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-arm64-cross libc6-dev-arm64-cross || true
+            sudo apt-get install -y gcc-riscv64-linux-gnu libc6-riscv64-cross libc6-dev-riscv64-cross || true
           fi
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
