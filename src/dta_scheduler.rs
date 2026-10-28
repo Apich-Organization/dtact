@@ -1192,15 +1192,23 @@ impl Worker {
     #[inline(always)]
     pub unsafe fn dispatch_loop(&self, pool: &crate::memory_management::ContextPool) -> bool {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
+        // ⚡ Bolt Optimization:
+        // Caching `tail` and only reloading it when `head == tail` prevents an unnecessary
+        // atomic load on every loop iteration, improving the efficiency of the hot dispatch loop.
         let mut head = self.local_head.load(Ordering::Relaxed);
+        let mut tail = self.local_tail.load(Ordering::Relaxed);
 
-        if head == self.local_tail.load(Ordering::Relaxed) {
+        if head == tail {
             return false;
         }
 
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
+            // Hot inner loop doesn't check tail unless head has advanced to cached tail.
+            if head == tail {
+                tail = self.local_tail.load(Ordering::Relaxed);
+                if head == tail {
+                    break;
+                }
             }
 
             let task = unsafe {
