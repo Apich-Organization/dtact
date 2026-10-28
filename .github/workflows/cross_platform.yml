@@ -54,6 +54,7 @@ jobs:
           version: "0.13.0"
 
       - name: Install Dependencies
+        shell: bash
         run: |
           cargo install cargo-zigbuild --locked
           if [ "$RUNNER_OS" == "Linux" ]; then
