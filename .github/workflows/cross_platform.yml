@@ -121,7 +121,7 @@ jobs:
 
           if [ -n "${{ matrix.qemu_arch }}" ]; then
             # QEMU needs the path to the cross-compiled dynamic libraries
-            RUNNER_CMD="qemu-${{ matrix.qemu_arch }}-static"
+            RUNNER_CMD="qemu-${{ matrix.qemu_arch }}"
 
             case "${{ matrix.qemu_arch }}" in
               riscv64)
