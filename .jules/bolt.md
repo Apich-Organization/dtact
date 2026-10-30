@@ -1,0 +1,3 @@
+## 2026-10-30 - [Optimize dispatch loop by caching local_tail]
+**Learning:** In the Dtact scheduler (`src/dta_scheduler.rs`), tasks executed by `dispatch_loop` can indirectly write to `local_tail`. To optimize the hot loop and avoid redundant atomic loads across loop iterations, cache `local_tail` locally and only reload it from atomic memory when `head == tail_cache` to check for newly enqueued tasks. This eliminates redundant atomic load instructions and cache line traffic for tasks that don't push new work.
+**Action:** Always consider caching locally mutated variables in hot loops and reloading them only when the cached values indicate an empty or action-requiring state.
