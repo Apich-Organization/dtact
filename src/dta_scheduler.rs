@@ -1293,14 +1293,18 @@ impl Worker {
     pub unsafe fn dispatch_loop(&self, pool: &crate::memory_management::ContextPool) -> bool {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
         let mut head = self.local_head.load(Ordering::Relaxed);
+        let mut cached_tail = self.local_tail.load(Ordering::Relaxed);
 
-        if head == self.local_tail.load(Ordering::Relaxed) {
+        if head == cached_tail {
             return false;
         }
 
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
+            if head == cached_tail {
+                cached_tail = self.local_tail.load(Ordering::Relaxed);
+                if head == cached_tail {
+                    break;
+                }
             }
 
             let task = unsafe {
