@@ -173,7 +173,14 @@ struct dtact_config_t {
     uint32_t mWorkers;
     /// Memory safety level (0-2).
     uint8_t mSafetyLevel;
-    /// Topology mode (0: `P2PMesh`, 1: Global).
+    /// Topology mode (0: `P2PMesh`, 1: `Global`, 2: `Pinned`).
+    ///
+    /// `Pinned` pins every fiber to the worker it was spawned from: it is
+    /// the runtime-wide default that a fiber can still override with
+    /// `dtact_spawn_options_t`'s switcher (a `CrossThread` switcher needs
+    /// migration to be legal, so it cannot opt *into* pinning this way —
+    /// but the reverse, a `P2PMesh`/`Global` runtime pinning one fiber, is
+    /// what the per-fiber switcher controls).
     uint8_t mTopologyMode;
     /// NUMA node for memory allocation. Set to 0 for default (local node).
     uint8_t mNuma;
@@ -224,28 +231,44 @@ struct dtact_spawn_options_t {
     uint8_t mKind;
     /// 0: `CrossThreadFloat`, 1: `CrossThreadNoFloat`, 2: `SameThreadFloat`, 3: `SameThreadNoFloat`
     uint8_t mSwitcher;
+    /// Stack bytes for this fiber. 0 uses the runtime's configured
+    /// `dtact_config_t::stack_size`; a larger request is clamped to what one
+    /// arena slot can hold (see `dtact::STACK_CLAMPED_SPAWNS`).
+    uint32_t mStackSize;
+    /// Per-fiber stack-overflow policy: 0 = none, 1 = canary checked at
+    /// termination, 2 = canary checked at every suspension.
+    /// Any other value inherits `dtact_config_t::safety_level`.
+    uint8_t mSafety;
 
     dtact_spawn_options_t(uint8_t const& aMPriority,
                           uint8_t const& aMAffinity,
                           uint8_t const& aMKind,
-                          uint8_t const& aMSwitcher)
+                          uint8_t const& aMSwitcher,
+                          uint32_t const& aMStackSize,
+                          uint8_t const& aMSafety)
       : mPriority(aMPriority),
         mAffinity(aMAffinity),
         mKind(aMKind),
-        mSwitcher(aMSwitcher)
+        mSwitcher(aMSwitcher),
+        mStackSize(aMStackSize),
+        mSafety(aMSafety)
     {}
 
     bool operator==(const dtact_spawn_options_t& aOther) const {
         return mPriority == aOther.mPriority &&
                mAffinity == aOther.mAffinity &&
                mKind == aOther.mKind &&
-               mSwitcher == aOther.mSwitcher;
+               mSwitcher == aOther.mSwitcher &&
+               mStackSize == aOther.mStackSize &&
+               mSafety == aOther.mSafety;
     }
     bool operator!=(const dtact_spawn_options_t& aOther) const {
         return mPriority != aOther.mPriority ||
                mAffinity != aOther.mAffinity ||
                mKind != aOther.mKind ||
-               mSwitcher != aOther.mSwitcher;
+               mSwitcher != aOther.mSwitcher ||
+               mStackSize != aOther.mStackSize ||
+               mSafety != aOther.mSafety;
     }
 };
 

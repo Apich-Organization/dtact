@@ -154,8 +154,16 @@ pub struct TaskChunk {
     pub count: u16,
     /// Number of times this chunk has been re-routed. Bounded by `max_hops`.
     pub hop_count: u8,
-    /// Reserved for future use; keeps the chunk 4-byte aligned for the trailing pad.
-    _flags: u8,
+    /// Priority class of the task(s) in this chunk, packed as
+    /// [`crate::api::Priority::level`] in the low two bits.
+    ///
+    /// This is what keeps the priority contract alive across a mailbox hop:
+    /// `route_chunk` runs on the *receiving* worker, which has no other way
+    /// to know that the chunk it just popped contains a fiber that must not
+    /// be deflected again. Every chunk this scheduler builds holds a single
+    /// task (`enqueue_pinned`/`enqueue_deflect` both wrap one index), so one
+    /// class covers the whole chunk.
+    flags: u8,
     /// Rounds the chunk's stride to 144 B (a multiple of 16, not of the
     /// 64-byte cache line — see below).
     _pad: [u8; 12],
@@ -177,6 +185,45 @@ pub struct TaskChunk {
 // false-sharing invalidation storm the padded structs elsewhere in this
 // file (`Worker`, `Warehouse`) exist to prevent.
 
+/// Bits of [`TaskChunk::flags`] holding the packed priority class.
+const PRIORITY_FLAGS_MASK: u8 = 0b11;
+
+/// Marks [`TaskChunk::flags`] as carrying a priority at all.
+///
+/// Needed because `Priority::level()` starts at `0` (`Low`), so an
+/// all-zero `flags` byte would otherwise be indistinguishable from "this
+/// chunk was built by `Low`-priority code" and a zeroed chunk would read
+/// back as `Low` instead of the neutral `Normal`.
+const PRIORITY_FLAGS_SET: u8 = 0x80;
+
+impl TaskChunk {
+    /// Builds a one-task chunk carrying `task` at `priority`.
+    #[inline(always)]
+    #[must_use]
+    pub fn single(task: TaskIndex, priority: crate::api::Priority) -> Self {
+        let mut chunk = Self::default();
+        chunk.tasks[0] = task;
+        chunk.count = 1;
+        chunk.flags = PRIORITY_FLAGS_SET | (priority.level() & PRIORITY_FLAGS_MASK);
+        chunk
+    }
+
+    /// The priority class this chunk was built with.
+    ///
+    /// A chunk that never went through [`TaskChunk::single`] — only
+    /// `Default::default()`, i.e. not built by this scheduler — reports
+    /// `Normal`, so an unmarked chunk is scheduled exactly as it was before
+    /// priorities existed.
+    #[inline(always)]
+    #[must_use]
+    pub const fn priority(&self) -> crate::api::Priority {
+        if self.flags & PRIORITY_FLAGS_SET == 0 {
+            return crate::api::Priority::Normal;
+        }
+        crate::api::Priority::from_level(self.flags & PRIORITY_FLAGS_MASK)
+    }
+}
+
 impl Default for TaskChunk {
     #[inline(always)]
     fn default() -> Self {
@@ -184,7 +231,7 @@ impl Default for TaskChunk {
             tasks: [0; CHUNK_SIZE],
             count: 0,
             hop_count: 0,
-            _flags: 0,
+            flags: 0,
             _pad: [0; 12],
         }
     }
@@ -1108,6 +1155,59 @@ impl Worker {
         true
     }
 
+    /// Inserts a single task at the **front** of the local queue.
+    ///
+    /// Used for [`crate::api::Priority::Critical`] fibers, whose contract is
+    /// "always local queue front": the task is written at `head - 1` and
+    /// `head` is stepped back over it, so the very next `dispatch_loop`
+    /// iteration pops it before anything that was already queued.
+    ///
+    /// Safe without any additional synchronisation because `local_head` is
+    /// owned by this worker thread alone (exactly like `local_tail` in
+    /// [`Worker::push_local`]); `head - 1` is guaranteed to be a free slot
+    /// by the same capacity check `push_local` uses, since the queue holds
+    /// at most `LOCAL_QUEUE_CAPACITY - 1` entries.
+    #[inline(always)]
+    pub fn push_front(&self, task: TaskIndex) -> bool {
+        let head = self.local_head.load(Ordering::Relaxed);
+        let tail = self.local_tail.load(Ordering::Relaxed);
+        let queue_len = tail.wrapping_sub(head) & LOCAL_QUEUE_MASK;
+        if queue_len >= LOCAL_QUEUE_CAPACITY - 1 {
+            return false;
+        }
+        let new_head = head.wrapping_sub(1) & LOCAL_QUEUE_MASK;
+        unsafe {
+            let buffer_ptr = self.local_queue.ptr.cast::<TaskIndex>();
+            *buffer_ptr.add(new_head) = task;
+        }
+        // Relaxed: only this worker thread reads local_head.
+        self.local_head.store(new_head, Ordering::Relaxed);
+
+        // Keep `load_level` honest about the backlog this push adds — same
+        // periodic refresh `push_local` performs, for the same reason.
+        let pushes = self.push_count.get().wrapping_add(1);
+        self.push_count.set(pushes);
+        if pushes.trailing_zeros() >= LOAD_REFRESH_PERIOD.trailing_zeros() {
+            self.update_load(queue_len + 1);
+        }
+        true
+    }
+
+    /// Enqueues `task` locally, honouring its priority's insertion rule.
+    ///
+    /// Collapses to exactly [`Worker::push_local`] — the previous, only
+    /// behaviour — for every priority except `Critical`, so the common path
+    /// pays one predictable, always-false branch on a value the caller
+    /// already has in a register.
+    #[inline(always)]
+    pub fn push_local_priority(&self, task: TaskIndex, priority: crate::api::Priority) -> bool {
+        if priority.jumps_queue() {
+            self.push_front(task) || self.push_local(task)
+        } else {
+            self.push_local(task)
+        }
+    }
+
     /// Pushes a batch of tasks into the local queue.
     ///
     /// CALLER CONTRACT: caller must guarantee `local_queue_len() + chunk.count`
@@ -1238,6 +1338,21 @@ impl Worker {
 
             crate::future_bridge::CURRENT_FIBER.with(|c| c.set(core::ptr::null_mut()));
 
+            // Re-sync the cached head with `local_head` before continuing.
+            //
+            // The fiber we just ran may have spawned `Critical` children of
+            // its own, which are `push_front`-ed into the very slot this
+            // loop popped it from — moving `local_head` *backwards*. The
+            // `head` local below is the value we stored on the way in, so
+            // continuing with it would silently overwrite the front
+            // insertion and strand those children forever (the tail-side
+            // `push_local` never had this problem: the loop re-reads
+            // `local_tail` every iteration).
+            //
+            // Relaxed: same-thread field, and this loop is the only place
+            // that stores it while a fiber is on this thread's stack.
+            head = self.local_head.load(Ordering::Relaxed);
+
             // Optimized lifecycle state machine: handle Finished, Notified, or Suspending transitions.
             let post_state = unsafe { (*target_ptr).state.load(Ordering::Acquire) };
 
@@ -1268,7 +1383,14 @@ impl Worker {
                 // Re-push to the same local queue. We JUST popped this task, so the
                 // queue has at least one slot free — push_local cannot fail here in
                 // a well-formed state machine. debug_assert catches future bugs.
-                let pushed = self.push_local(task);
+                //
+                // The priority decides *where*: a `Critical` fiber goes back to
+                // the front (its documented contract), everything else to the
+                // back exactly as before. Reading it off the context we just
+                // switched out of costs one load from a line the switch itself
+                // already brought into L1.
+                let priority = unsafe { (*target_ptr).priority };
+                let pushed = self.push_local_priority(task, priority);
                 debug_assert!(
                     pushed,
                     "DTA-V3 invariant: Notified re-enqueue must succeed (we just freed a slot by popping)"
@@ -1401,16 +1523,22 @@ impl DtaScheduler {
         }
     }
 
-    /// Enqueue a task whose fiber may NOT be deflected (`SameThread` switchers).
+    /// Enqueue a task whose fiber may NOT be deflected (`SameThread` switchers,
+    /// and every `Critical`-priority fiber).
     ///
     /// Routes strictly to `target_core` (the fiber's origin). On same-core push
-    /// it is a single `push_local`. On cross-core it uses the SPSC mailbox
-    /// matrix (the current worker is the unique producer for `mailboxes[me][*]`)
-    /// or the external mailbox if the caller is a non-worker thread. Pinned
-    /// chunks NEVER enter the warehouse because warehouse drainers cannot
-    /// honour fiber-to-thread pinning.
+    /// it is a single `push_local` (or `push_front` for `Critical`). On
+    /// cross-core it uses the SPSC mailbox matrix (the current worker is the
+    /// unique producer for `mailboxes[me][*]`) or the external mailbox if the
+    /// caller is a non-worker thread. Pinned chunks NEVER enter the warehouse
+    /// because warehouse drainers cannot honour fiber-to-thread pinning.
     #[inline(always)]
-    pub fn enqueue_pinned(&self, target_core: usize, task: TaskIndex) -> bool {
+    pub fn enqueue_pinned(
+        &self,
+        target_core: usize,
+        task: TaskIndex,
+        priority: crate::api::Priority,
+    ) -> bool {
         let n = self.workers.len();
         let target = target_core % n;
         let current = crate::future_bridge::CURRENT_WORKER_ID.with(std::cell::Cell::get);
@@ -1418,14 +1546,14 @@ impl DtaScheduler {
         if current == target {
             // Hot path: same-worker direct push. Single Relaxed access.
             let worker = unsafe { &*self.workers[target].get() };
-            return worker.push_local(task);
+            return worker.push_local_priority(task, priority);
         }
 
         // Cross-worker push: assemble a 1-task chunk and route via SPSC matrix
         // (current is fiber) or external mailbox (current is host thread).
-        let mut chunk = TaskChunk::default();
-        chunk.tasks[0] = task;
-        chunk.count = 1;
+        // The priority travels in the chunk so the receiving worker's
+        // `route_chunk` honours it instead of re-deflecting blindly.
+        let chunk = TaskChunk::single(task, priority);
 
         let ok = if current < n {
             // SAFETY: `current < n` was just checked, and `self.mailboxes`
@@ -1460,6 +1588,19 @@ impl DtaScheduler {
     /// Honours topology mode and current load. When the warehouse is busy
     /// (`is_busy() == true`), diverts the task there immediately to relieve
     /// back-pressure on the per-core mailboxes (the soft-back-pressure feedback).
+    ///
+    /// `mode` is the *fiber's* deflection scope (see
+    /// [`crate::api::SpawnBuilder::topology_mode`]), which normally inherits
+    /// the runtime's topology: `Global` lets the target be any worker,
+    /// `P2PMesh` confines it to the source's CCX neighbourhood, and
+    /// `Pinned` suppresses deflection entirely.
+    ///
+    /// `priority` biases the stay-local-vs-deflect decision through
+    /// [`crate::api::Priority::deflection_bias`]: `Low` fibers leave for a
+    /// peer at a lower load, `High` ones only at a higher load, and
+    /// `Normal` — the default — reproduces the original comparison exactly
+    /// (`bias == 0`). `Critical` fibers never reach this function at all;
+    /// `crate::wake_fiber` routes them through [`Self::enqueue_pinned`].
     #[inline(always)]
     pub fn enqueue_deflect(
         &self,
@@ -1467,19 +1608,24 @@ impl DtaScheduler {
         flow_id: u64,
         task: TaskIndex,
         affinity: crate::api::topology::Affinity,
+        mode: TopologyMode,
+        priority: crate::api::Priority,
     ) -> bool {
         // Soft back-pressure: if the warehouse already holds chunks, every new
         // task goes straight in. Single Relaxed load on an isolated cache line —
         // the cold path is the `#[cold]` divert_to_warehouse, branch-predicted
         // false on every well-behaved iteration.
         if self.warehouse.is_busy() {
-            return self.divert_to_warehouse(task);
+            return self.divert_to_warehouse(task, priority);
         }
 
         let n = self.workers.len();
         let source = source_core % n;
         let worker_ref = unsafe { &*self.workers[source].get() };
-        let threshold = worker_ref.deflection_threshold.load(Ordering::Relaxed);
+        let threshold = worker_ref
+            .deflection_threshold
+            .load(Ordering::Relaxed)
+            .saturating_add_signed(priority.deflection_bias());
         let load = worker_ref.load_level.load(Ordering::Relaxed);
 
         // `core::hint::select_unpredictable` (stable since Rust 1.98 — see
@@ -1491,13 +1637,20 @@ impl DtaScheduler {
         // real branch would mispredict at roughly the deflection rate.
         // `select_unpredictable` states that intent directly instead of
         // relying on the optimizer recognizing a hand-written bit pattern.
-        let deflect = load > threshold;
+        //
+        // `may_deflect()` is false only for `Critical`, which
+        // `crate::wake_fiber` already routes through `enqueue_pinned` —
+        // re-checking it here keeps the "never deflected" contract true for
+        // every other caller of this function too (benchmarks, the
+        // comparison harness, embedders driving the scheduler directly).
+        let deflect =
+            priority.may_deflect() && !matches!(mode, TopologyMode::Pinned) && load > threshold;
         #[allow(clippy::cast_possible_truncation)]
         let h1 = (flow_id & 7) as usize;
         #[allow(clippy::cast_possible_truncation)]
         let h2 = ((flow_id >> 3) & 7 | 1) as usize;
 
-        let target = if self.topology == TopologyMode::Global
+        let target = if matches!(mode, TopologyMode::Global)
             && matches!(affinity, crate::api::topology::Affinity::Any)
         {
             let deflect_target = (source + h1 + h2) % n;
@@ -1521,16 +1674,14 @@ impl DtaScheduler {
 
         if current == target {
             let worker = unsafe { &*self.workers[target].get() };
-            if worker.push_local(task) {
+            if worker.push_local_priority(task, priority) {
                 return true;
             }
             // Local queue full — fall through to chunk routing
         }
 
         // Cross-worker (or local full): wrap in chunk and push, with hop fallback.
-        let mut chunk = TaskChunk::default();
-        chunk.tasks[0] = task;
-        chunk.count = 1;
+        let mut chunk = TaskChunk::single(task, priority);
         self.push_chunk_with_hop(current, target, &mut chunk)
     }
 
@@ -1610,10 +1761,8 @@ impl DtaScheduler {
     /// Cold path: divert one task directly to the warehouse.
     #[cold]
     #[inline(never)]
-    fn divert_to_warehouse(&self, task: TaskIndex) -> bool {
-        let mut chunk = TaskChunk::default();
-        chunk.tasks[0] = task;
-        chunk.count = 1;
+    fn divert_to_warehouse(&self, task: TaskIndex, priority: crate::api::Priority) -> bool {
+        let mut chunk = TaskChunk::single(task, priority);
         // Mark as already-exhausted-hops so any worker that drains it pushes
         // directly into its own queue without trying to re-deflect.
         chunk.hop_count = u8::MAX;
@@ -1804,9 +1953,18 @@ impl DtaScheduler {
         received_any
     }
 
-    /// 4-way branchless chunk router. The function-pointer table makes the
+    /// 4-way chunk router. The function-pointer table makes the
     /// hot routes (cases 01 and 11 → `push_local`) collapse to a single indirect
     /// call after the index is computed.
+    ///
+    /// The chunk's own priority class participates: a `Critical` chunk that
+    /// arrives on a worker with no room left is parked in the warehouse
+    /// rather than hopped onward. That is the last piece of "never
+    /// deflected" — `wake_fiber` already routes such a fiber to its origin
+    /// worker, but if that worker's queue is full the chunk still has to go
+    /// *somewhere*, and between "may bounce across `max_hops` mailboxes" and
+    /// "waits in the emergency backlog for the first worker with room", the
+    /// latter is the one that guarantees the fiber runs soonest.
     #[inline(always)]
     #[allow(clippy::items_after_statements)]
     fn route_chunk(
@@ -1818,7 +1976,9 @@ impl DtaScheduler {
         fixed_head: usize,
     ) -> usize {
         let space_ok = (cur_len + chunk.count as usize) <= LOCAL_QUEUE_HIGH_WATERMARK;
-        let hops_ok = chunk.hop_count < self.max_hops;
+        // `&&` short-circuits so the (already hot) flags byte is only
+        // consulted on the rare no-space path.
+        let hops_ok = chunk.hop_count < self.max_hops && chunk.priority().may_deflect();
 
         //   no space, no hops left  → warehouse
         //   space,    no hops left  → local (we already have room)

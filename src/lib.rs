@@ -230,13 +230,37 @@ pub static GLOBAL_RUNTIME: std::sync::OnceLock<Runtime> = std::sync::OnceLock::n
 pub static HEAP_ESCAPED_SPAWNS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
+/// Telemetry: counts spawns whose requested stack exceeded what one arena
+/// slot can provide and were therefore clamped to the slot's capacity.
+///
+/// A non-zero value means some fiber asked for more stack than the runtime
+/// was configured with (`dtact_config_t::stack_size` /
+/// `#[dtact_init(stack = ...)]`); raise that to make the request exact.
+/// Clamping is never silent-but-fatal: the fiber still gets the largest
+/// stack its slot can legally hold.
+#[doc(hidden)]
+pub static STACK_CLAMPED_SPAWNS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Telemetry: counts fibers that wrote below the stack they were granted.
+///
+/// Only ever incremented for fibers spawned with
+/// [`memory_management::SafetyLevel::Safety1`] or `Safety2`, which plant a
+/// canary word at the stack's low bound.
+#[doc(hidden)]
+pub static STACK_CANARY_TRIPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Awakens a fiber by pushing it onto the scheduler mesh.
 ///
 /// Dispatches between `enqueue_pinned` and `enqueue_deflect` based on the
-/// fiber's stored `mode`. Pinned fibers (`SameThread` switchers) skip the
-/// deflection hash and route strictly to their `origin_core`; deflectable
-/// fibers (`CrossThread` switchers) consult load and may hop / spill to the
-/// warehouse. The mode is set at spawn time and never changes.
+/// fiber's stored `mode` and `priority`. Pinned fibers (`SameThread`
+/// switchers, `TopologyMode::Pinned`, and every `Critical`-priority fiber)
+/// skip the deflection hash and route strictly to their `origin_core`;
+/// deflectable fibers (`CrossThread` switchers) consult load — biased by
+/// their priority — and may hop / spill to the warehouse, within the
+/// neighbourhood their own `mode` allows. All three are set at spawn time
+/// and never change.
 ///
 /// # Arguments
 /// * `origin_core` - The core ID where the fiber was originally spawned.
@@ -248,14 +272,13 @@ pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
         .expect("dtact::wake_fiber() invoked before Runtime Initialization");
     let pool = &runtime.pool;
     let ctx_ptr = pool.get_context_ptr(fiber_index);
-    let pinned = matches!(
-        unsafe { (*ctx_ptr).mode },
-        common_types::TopologyMode::Pinned
-    ) || matches!(
-        unsafe { (*ctx_ptr).affinity },
-        crate::api::topology::Affinity::SameCore
-    );
-    let affinity = unsafe { (*ctx_ptr).affinity };
+    let (mode, affinity, priority) =
+        unsafe { ((*ctx_ptr).mode, (*ctx_ptr).affinity, (*ctx_ptr).priority) };
+    // `Critical` joins the pinned set: "never deflected" is only
+    // enforceable by not handing the fiber to the deflection path at all.
+    let pinned = matches!(mode, common_types::TopologyMode::Pinned)
+        || matches!(affinity, crate::api::topology::Affinity::SameCore)
+        || !priority.may_deflect();
 
     loop {
         // Direct branches are far better for inlining and branch prediction than
@@ -266,7 +289,7 @@ pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
                 origin_core,
                 u64::from(fiber_index),
                 fiber_index,
-                affinity,
+                priority,
             )
         } else {
             enqueue_deflect_shim(
@@ -275,6 +298,8 @@ pub(crate) fn wake_fiber(origin_core: usize, fiber_index: u32) {
                 u64::from(fiber_index),
                 fiber_index,
                 affinity,
+                mode,
+                priority,
             )
         };
         if success {
@@ -296,9 +321,9 @@ fn enqueue_pinned_shim(
     target: usize,
     _flow: u64,
     task: u32,
-    _affinity: crate::api::topology::Affinity,
+    priority: crate::api::Priority,
 ) -> bool {
-    sched.enqueue_pinned(target, task)
+    sched.enqueue_pinned(target, task, priority)
 }
 
 #[inline(always)]
@@ -308,8 +333,10 @@ fn enqueue_deflect_shim(
     flow: u64,
     task: u32,
     affinity: crate::api::topology::Affinity,
+    mode: common_types::TopologyMode,
+    priority: crate::api::Priority,
 ) -> bool {
-    sched.enqueue_deflect(source, flow, task, affinity)
+    sched.enqueue_deflect(source, flow, task, affinity, mode, priority)
 }
 
 /// State-guarded fiber wake by pool index.

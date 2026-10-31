@@ -32,7 +32,14 @@ proptest! {
             worker.deflection_threshold.store(threshold, Ordering::SeqCst);
         }
 
-        let _ = scheduler.enqueue_deflect(source_core, flow_id, 0, Any);
+        let _ = scheduler.enqueue_deflect(
+            source_core,
+            flow_id,
+            0,
+            Any,
+            TopologyMode::P2PMesh,
+            dtact::Priority::Normal,
+        );
 
         // Verify task is successfully enqueued somewhere
         let mut total_tasks = 0;
@@ -72,7 +79,14 @@ proptest! {
             worker.deflection_threshold.store(10, Ordering::SeqCst);
         }
 
-        let _ = scheduler.enqueue_deflect(source_core, flow_id, 1, Any);
+        let _ = scheduler.enqueue_deflect(
+            source_core,
+            flow_id,
+            1,
+            Any,
+            TopologyMode::Global,
+            dtact::Priority::Normal,
+        );
 
         let mut total_tasks = 0;
         unsafe {

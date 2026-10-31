@@ -23,6 +23,7 @@
 //! Academic-only: requires `cargo bench --bench dta_deflect_overhead
 //! --features benchmark`.
 
+use dtact::Priority;
 use dtact::api::topology::Affinity;
 use dtact::dta_scheduler::{DtaScheduler, TopologyMode};
 use std::sync::atomic::Ordering;
@@ -45,12 +46,26 @@ fn bench_deflect_stays_local_ns() -> f64 {
     dtact::future_bridge::__set_current_worker_id_for_test(0);
 
     for i in 0..1024u32 {
-        sched.enqueue_deflect(0, u64::from(i), 0, Affinity::Any);
+        sched.enqueue_deflect(
+            0,
+            u64::from(i),
+            0,
+            Affinity::Any,
+            TopologyMode::Global,
+            Priority::Normal,
+        );
         unsafe { (*sched.workers[0].get()).pop_local() };
     }
     let start = std::time::Instant::now();
     for i in 0..ITERATIONS {
-        core::hint::black_box(sched.enqueue_deflect(0, u64::from(i), 0, Affinity::Any));
+        core::hint::black_box(sched.enqueue_deflect(
+            0,
+            u64::from(i),
+            0,
+            Affinity::Any,
+            TopologyMode::Global,
+            Priority::Normal,
+        ));
         core::hint::black_box(unsafe { (*sched.workers[0].get()).pop_local() });
     }
     let elapsed = start.elapsed();
@@ -86,13 +101,27 @@ fn bench_deflect_cross_worker_ns() -> f64 {
     let flow_id_for = |i: u32| u64::from(i) << 3;
 
     for i in 0..1024u32 {
-        sched.enqueue_deflect(0, flow_id_for(i), 0, Affinity::Any);
+        sched.enqueue_deflect(
+            0,
+            flow_id_for(i),
+            0,
+            Affinity::Any,
+            TopologyMode::Global,
+            Priority::Normal,
+        );
         sched.poll_mailboxes(1);
         unsafe { (*sched.workers[1].get()).pop_local() };
     }
     let start = std::time::Instant::now();
     for i in 0..ITERATIONS {
-        core::hint::black_box(sched.enqueue_deflect(0, flow_id_for(i), 0, Affinity::Any));
+        core::hint::black_box(sched.enqueue_deflect(
+            0,
+            flow_id_for(i),
+            0,
+            Affinity::Any,
+            TopologyMode::Global,
+            Priority::Normal,
+        ));
         core::hint::black_box(sched.poll_mailboxes(1));
         core::hint::black_box(unsafe { (*sched.workers[1].get()).pop_local() });
     }

@@ -30,6 +30,7 @@ clean_fixes.patch
 examples/dtact.dll
 web/dist
 web/target
+.workbuddy-ai/
 
 **/*.aux
 **/*.log

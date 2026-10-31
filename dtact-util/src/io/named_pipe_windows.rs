@@ -188,10 +188,24 @@ fn worker_loop() {
             if entry.lpCompletionKey == WAKE_KEY {
                 continue;
             }
+            // `lpOverlapped` is the very `overlapped` field this op was
+            // submitted with; `overlapped` is `OpState`'s first field, so
+            // the round-trip back to `OpState` is exact. `OpState` is
+            // 64-byte aligned (pulled up by `AtomicWakerSlot`), which is
+            // *stricter* than the 8-byte `OVERLAPPED` clippy sees — but
+            // every `OpState` in this module lives in a `Box<[OpState]>`
+            // allocation, and `Box`/`Vec` always align to `align_of::<T>()`,
+            // so the cast is sound. Clippy cannot see that invariant.
+            #[allow(clippy::cast_ptr_alignment)]
             let op_ptr = entry.lpOverlapped.cast::<OpState>();
             if op_ptr.is_null() {
                 continue;
             }
+            debug_assert_eq!(
+                (op_ptr as usize) % core::mem::align_of::<OpState>(),
+                0,
+                "IOCP returned an OpState pointer that is not 64-byte aligned"
+            );
             let op = unsafe { &*op_ptr };
             let bytes = entry.dwNumberOfBytesTransferred as usize;
             op.result.store(encode_ok(bytes), Ordering::Release);

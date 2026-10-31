@@ -221,7 +221,14 @@ typedef struct dtact_config_t {
      */
     uint8_t mSafetyLevel;
     /*
-     Topology mode (0: `P2PMesh`, 1: Global).
+     Topology mode (0: `P2PMesh`, 1: `Global`, 2: `Pinned`).
+
+     `Pinned` pins every fiber to the worker it was spawned from: it is
+     the runtime-wide default that a fiber can still override with
+     `dtact_spawn_options_t`'s switcher (a `CrossThread` switcher needs
+     migration to be legal, so it cannot opt *into* pinning this way —
+     but the reverse, a `P2PMesh`/`Global` runtime pinning one fiber, is
+     what the per-fiber switcher controls).
      */
     uint8_t mTopologyMode;
     /*
@@ -258,6 +265,18 @@ typedef struct dtact_spawn_options_t {
      0: `CrossThreadFloat`, 1: `CrossThreadNoFloat`, 2: `SameThreadFloat`, 3: `SameThreadNoFloat`
      */
     uint8_t mSwitcher;
+    /*
+     Stack bytes for this fiber. 0 uses the runtime's configured
+     `dtact_config_t::stack_size`; a larger request is clamped to what one
+     arena slot can hold (see `dtact::STACK_CLAMPED_SPAWNS`).
+     */
+    uint32_t mStackSize;
+    /*
+     Per-fiber stack-overflow policy: 0 = none, 1 = canary checked at
+     termination, 2 = canary checked at every suspension.
+     Any other value inherits `dtact_config_t::safety_level`.
+     */
+    uint8_t mSafety;
 } dtact_spawn_options_t;
 
 #ifdef __cplusplus

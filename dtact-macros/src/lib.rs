@@ -72,6 +72,35 @@ impl Parse for TaskArgs {
     }
 }
 
+/// Resolves a `stack = "256K"` style attribute value to a byte count at
+/// compile time, so the generated code carries a plain integer and spawning
+/// the task never parses a string.
+///
+/// Mirrors `dtact::api::fiber::parse_stack_size` (the runtime parser used by
+/// `spawn_with_stack`): an optional binary suffix (`K`/`KiB`, `M`/`MiB`,
+/// `G`/`GiB`) applied to a decimal number. Returns `None` for anything it
+/// cannot resolve, which the expansion turns into "no explicit request" —
+/// the fiber then gets the slot's full stack instead of failing to compile.
+fn stack_size_bytes(spec: &str) -> Option<usize> {
+    let spec = spec.trim();
+    let split = spec
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(spec.len());
+    let (digits, suffix) = spec.split_at(split);
+    let value: usize = digits.parse().ok()?;
+    if value == 0 {
+        return None;
+    }
+    let unit = match suffix.trim().to_ascii_uppercase().as_str() {
+        "" | "B" => 1usize,
+        "K" | "KB" | "KIB" => 1024,
+        "M" | "MB" | "MIB" => 1024 * 1024,
+        "G" | "GB" | "GIB" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    value.checked_mul(unit)
+}
+
 #[proc_macro_attribute]
 pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as TaskArgs);
@@ -89,6 +118,17 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
     let kind_ident = syn::Ident::new(kind, fn_name.span());
     let switcher = &args.switcher;
     let switcher_ident = syn::Ident::new(switcher, fn_name.span());
+
+    // `stack = "..."` resolved to bytes here, at compile time.
+    let stack_bytes = stack_size_bytes(stack);
+    let stack_expr = match stack_bytes {
+        Some(bytes) => quote! { ::core::option::Option::Some(#bytes) },
+        None => quote! { ::core::option::Option::None },
+    };
+    let stack_bytes_const = match stack_bytes {
+        Some(bytes) => quote! { ::core::option::Option::Some(#bytes) },
+        None => quote! { ::core::option::Option::None },
+    };
 
     let return_type = match &input.sig.output {
         syn::ReturnType::Default => quote! { () },
@@ -114,6 +154,7 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
                 priority: dtact::Priority::#priority_ident,
                 affinity: dtact::topology::Affinity::#affinity_ident,
                 kind: dtact::WorkloadKind::#kind_ident,
+                stack_size: #stack_expr,
                 _marker: std::marker::PhantomData,
             }
         }
@@ -123,6 +164,9 @@ pub fn task(args: TokenStream, item: TokenStream) -> TokenStream {
             pub const AFFINITY: dtact::topology::Affinity = dtact::topology::Affinity::#affinity_ident;
             pub const KIND: dtact::WorkloadKind = dtact::WorkloadKind::#kind_ident;
             pub const STACK_SIZE: &'static str = #stack;
+            /// `STACK_SIZE` resolved to bytes at compile time, or `None` if
+            /// the attribute value could not be parsed.
+            pub const STACK_SIZE_BYTES: ::core::option::Option<usize> = #stack_bytes_const;
             pub type SWITCHER = dtact::#switcher_ident;
         }
     };
@@ -162,8 +206,81 @@ pub fn export_async(_args: TokenStream, item: TokenStream) -> TokenStream {
     TokenStream::from(expanded)
 }
 
+/// Parsed arguments of [`export_fiber`].
+///
+/// Every field is optional and defaults to the runtime's own default, so a
+/// bare `#[export_fiber]` behaves exactly as before these knobs existed.
+/// Before this existed the attribute accepted an argument list and silently
+/// discarded it, so `#[export_fiber(stack = "8M")]` produced a fiber with
+/// the default stack and no way to tell.
+#[derive(Default)]
+struct ExportFiberArgs {
+    stack: Option<usize>,
+    priority: Option<String>,
+    safety: Option<String>,
+    name: Option<String>,
+}
+
+impl Parse for ExportFiberArgs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let vars = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
+        let mut args = Self::default();
+        for var in vars {
+            let Meta::NameValue(nv) = var else {
+                return Err(syn::Error::new_spanned(
+                    var,
+                    "expected `name = value` (stack, priority, safety, name)",
+                ));
+            };
+            let str_value = || -> syn::Result<String> {
+                match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) => Ok(s.value()),
+                    other => Err(syn::Error::new_spanned(
+                        other,
+                        "expected a string literal, e.g. `stack = \"256K\"`",
+                    )),
+                }
+            };
+            if nv.path.is_ident("stack") {
+                let spec = str_value()?;
+                args.stack = Some(stack_size_bytes(&spec).ok_or_else(|| {
+                    syn::Error::new_spanned(
+                        &nv.value,
+                        "cannot parse stack size; expected \"256K\", \"2M\", ...",
+                    )
+                })?);
+            } else if nv.path.is_ident("priority") {
+                args.priority = Some(str_value()?);
+            } else if nv.path.is_ident("safety") {
+                args.safety = Some(str_value()?);
+            } else if nv.path.is_ident("name") {
+                args.name = Some(str_value()?);
+            } else {
+                return Err(syn::Error::new_spanned(
+                    &nv.path,
+                    "unknown export_fiber argument (expected stack, priority, safety, name)",
+                ));
+            }
+        }
+        Ok(args)
+    }
+}
+
+/// Exports a plain (blocking) `fn` as a C-callable fiber launcher.
+///
+/// Accepts the same spawn-time knobs as the Rust API, resolved at compile
+/// time:
+/// * `stack = "256K"` — stack size for the exported fiber
+/// * `priority = "High"` — `Low`/`Normal`/`High`/`Critical`
+/// * `safety = "Safety1"` — per-fiber stack-overflow policy
+/// * `name = "db-writer"` — name used in diagnostics and `fiber_info`
+///
+/// Omitted knobs fall back to the runtime defaults.
 #[proc_macro_attribute]
-pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
+pub fn export_fiber(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as ExportFiberArgs);
     let input = parse_macro_input!(item as ItemFn);
     let fn_name = &input.sig.ident;
     let wrapper_name = syn::Ident::new(&format!("dtact_export_fiber_{}", fn_name), fn_name.span());
@@ -182,18 +299,80 @@ pub fn export_fiber(_args: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    let mut opts = quote! { dtact::api::fiber::ClosureSpawnOptions::new() };
+    if let Some(bytes) = args.stack {
+        opts = quote! { #opts.stack_size(#bytes) };
+    }
+    if let Some(priority) = &args.priority {
+        let ident = syn::Ident::new(priority, fn_name.span());
+        opts = quote! { #opts.priority(dtact::Priority::#ident) };
+    }
+    if let Some(safety) = &args.safety {
+        let ident = syn::Ident::new(safety, fn_name.span());
+        opts = quote! { #opts.safety(dtact::memory_management::SafetyLevel::#ident) };
+    }
+    if let Some(name) = &args.name {
+        opts = quote! { #opts.name(#name) };
+    }
+
     let expanded = quote! {
         #input
 
         #[unsafe(no_mangle)]
         pub extern "C" fn #wrapper_name(#(#c_params),*) -> dtact::dtact_handle_t {
-            dtact::api::fiber::spawn_with_stack("2M", move || {
-                #fn_name(#(#call_args),*);
-            })
+            dtact::api::fiber::spawn_closure(
+                move || {
+                    #fn_name(#(#call_args),*);
+                },
+                #opts,
+            )
         }
     };
 
     TokenStream::from(expanded)
+}
+
+/// Reads a `name = 123` or `name = "123"` attribute value as an integer.
+///
+/// Both spellings are accepted because the crate's own documentation and
+/// examples use both; before this, a quoted value was silently discarded and
+/// the argument kept its default — the setting appeared to be honoured while
+/// having no effect at all. A non-numeric value is a hard error rather than a
+/// silent fallback, for the same reason.
+fn int_arg(expr: &syn::Expr) -> syn::Result<Option<usize>> {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: Lit::Int(i), ..
+        }) => Ok(Some(i.base10_parse()?)),
+        syn::Expr::Lit(syn::ExprLit {
+            lit: Lit::Str(s), ..
+        }) => s.value().trim().parse::<usize>().map(Some).map_err(|_| {
+            syn::Error::new_spanned(expr, "expected an integer or a string of digits")
+        }),
+        _ => Err(syn::Error::new_spanned(
+            expr,
+            "expected an integer literal or a string literal",
+        )),
+    }
+}
+
+/// Reads a `stack = 262144`, `stack = "262144"` or `stack = "256K"`
+/// attribute value as a byte count.
+fn stack_arg(expr: &syn::Expr) -> syn::Result<Option<usize>> {
+    if let syn::Expr::Lit(syn::ExprLit {
+        lit: Lit::Str(s), ..
+    }) = expr
+    {
+        let value = s.value();
+        return stack_size_bytes(&value).map(Some).ok_or_else(|| {
+            syn::Error::new_spanned(
+                expr,
+                "cannot parse stack size; expected bytes (\"262144\") or a \
+                 binary suffix (\"256K\", \"2M\", \"1G\")",
+            )
+        });
+    }
+    int_arg(expr)
 }
 
 struct InitArgs {
@@ -232,32 +411,23 @@ impl Parse for InitArgs {
                         safety = s.value();
                     }
                 } else if nv.path.is_ident("workers") {
-                    if let syn::Expr::Lit(syn::ExprLit {
-                        lit: Lit::Int(i), ..
-                    }) = &nv.value
-                    {
-                        workers = i.base10_parse()?;
+                    if let Some(value) = int_arg(&nv.value)? {
+                        workers = value;
                     }
                 } else if nv.path.is_ident("capacity") {
-                    if let syn::Expr::Lit(syn::ExprLit {
-                        lit: Lit::Int(i), ..
-                    }) = &nv.value
-                    {
-                        capacity = i.base10_parse()?;
+                    if let Some(value) = int_arg(&nv.value)? {
+                        capacity = u32::try_from(value).map_err(|_| {
+                            syn::Error::new_spanned(&nv.value, "`capacity` does not fit in a u32")
+                        })?;
                     }
                 } else if nv.path.is_ident("stack") {
-                    if let syn::Expr::Lit(syn::ExprLit {
-                        lit: Lit::Int(i), ..
-                    }) = &nv.value
-                    {
-                        stack = i.base10_parse()?;
+                    if let Some(value) = stack_arg(&nv.value)? {
+                        stack = value;
                     }
                 } else if nv.path.is_ident("numa")
-                    && let syn::Expr::Lit(syn::ExprLit {
-                        lit: Lit::Int(i), ..
-                    }) = &nv.value
+                    && let Some(value) = int_arg(&nv.value)?
                 {
-                    numa = i.base10_parse()?;
+                    numa = value;
                 }
             }
         }
