@@ -42,8 +42,7 @@ use dtact::{dtact_await, dtact_init, spawn, task, yield_now};
 #[task(
     priority = "Normal",
     kind = "Compute",
-    stack = "256K",
-    capacity = "1024"
+    stack = "256K"
 )]
 async fn worker(id: u32) {
     println!("[Fiber {}] Starting async work...", id);
@@ -76,6 +75,22 @@ fn main() {
     println!("[Master] All sub-tasks completed. Exiting cleanly.");
 }
 ```
+
+Every spawn-time knob is applied to the running fiber, not just recorded:
+
+| Knob | Effect |
+| --- | --- |
+| `priority` | `Low`/`High` bias the work-deflection threshold (leave the core sooner / later); `Critical` is never deflected, is inserted at the front of its worker's queue, and a `Critical` chunk that finds no room is parked rather than handed to a third worker. `Normal` reproduces the unprioritised behaviour exactly. |
+| `kind` | Seeds the fiber's adaptive spin budget in `wait_pinned` (`Compute` spins longest, `IO` shortest). |
+| `affinity` | Selects the deflection neighbourhood (`SameCore` pins, `SameCCX`/`SameNUMA` confine deflection, `Any` may go anywhere). |
+| `topology_mode` | Overrides the runtime's topology for one fiber: `P2PMesh` confines deflection to its CCX, `Global` lets it reach any worker even on a `P2PMesh` runtime, `Pinned` never migrates. Unset inherits the runtime default. |
+| `stack` | The stack the fiber is actually granted. The stack starts at the top of the zero-copy buffer and grows down through the slot's reserved stack region; the request is clamped to what one slot can hold (`STACK_CLAMPED_SPAWNS` counts any clamp). |
+| `safety` | Per-fiber stack-overflow policy: `Safety0` = none, `Safety1` = canary checked at termination, `Safety2` = canary checked at every suspension (`STACK_CANARY_TRIPS` counts trips). |
+| `name` | Attached to the fiber and used in abort/overflow/panic diagnostics; readable back via `dtact::fiber_info(handle)`. |
+
+The closure path (`spawn_with_stack`, `spawn_closure`, `#[export_fiber]`) takes the same set through `ClosureSpawnOptions`, and every one of them is reachable from C via `dtact_spawn_options_t` (`priority`, `affinity`, `kind`, `switcher`, `stack_size`, `safety`).
+
+`dtact_init`'s `workers`, `capacity`, `stack`, `safety`, `topology` and `numa` are the runtime-wide counterparts: they size the context arena (one slot per fiber, `stack` bytes of stack each) and the worker pool. `topology` accepts `P2PMesh`, `Global` and `Pinned`.
 
 ### C FFI
 
@@ -115,9 +130,13 @@ void master_fiber(void* arg) {
         if (i % 2 == 0) {
             opts.mKind = 1; // IO
             opts.mSwitcher = 1; // CrossThreadNoFloat
+            opts.mPriority = 0; // Low: first to be deflected under load
+            opts.mStackSize = 64 * 1024; // this fiber's own stack
         } else {
             opts.mKind = 3; // System
             opts.mSwitcher = 0; // CrossThreadFloat
+            opts.mPriority = 2; // High: prefer to stay local
+            opts.mSafety = 2; // canary checked at every suspension
         }
         
         handles[i] = dtact_fiber_launch_ext(worker_fiber, val, &opts);

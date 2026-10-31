@@ -264,6 +264,38 @@ pub struct FiberContext {
     pub mode: TopologyMode,
     /// Metadata: Core Affinity Hint for wake routing.
     pub affinity: crate::api::topology::Affinity,
+    /// Metadata: Scheduling priority supplied at spawn time.
+    ///
+    /// Consumed on every enqueue/wake: `Critical` fibers are routed as
+    /// pinned and inserted at the front of the local queue, `Low`/`High`
+    /// bias the deflection threshold (see [`crate::api::Priority`]).
+    /// Defaults to [`crate::api::Priority::Normal`], whose bias is exactly
+    /// zero, so a default spawn is bit-identical to the pre-priority
+    /// behaviour.
+    pub priority: crate::api::Priority,
+    /// Optional static name supplied at spawn time, for diagnostics only.
+    ///
+    /// Never read by any scheduling decision — it exists so that abort
+    /// messages, panic reports and telemetry can identify a fiber instead
+    /// of printing a bare pool index.
+    pub name: Option<&'static str>,
+    /// Stack bytes actually granted to this fiber, i.e. the distance
+    /// between its initial stack ceiling and [`Self::stack_limit`].
+    pub stack_size: usize,
+    /// Lowest address this fiber's stack may legally touch.
+    ///
+    /// Set by [`grant_stack`] at spawn time from the requested stack size,
+    /// clamped to the slot's own reserved stack region, so a fiber can
+    /// never grow its stack into a neighbouring slot.
+    pub(crate) stack_limit: usize,
+    /// Expected value of the stack-overflow canary word planted just below
+    /// [`Self::stack_limit`]; `0` means "no canary" (`Safety0` fibers).
+    pub(crate) stack_canary: u64,
+    /// Per-fiber stack-overflow policy. Independent of the pool-wide
+    /// [`SafetyLevel`], which only controls the arena's address-space
+    /// layout (guard pages): this one decides whether this particular
+    /// fiber gets a canary, and how often it is checked.
+    pub(crate) stack_safety: SafetyLevel,
 
     /// Current stack pointer for this fiber.
     pub(crate) stack_ptr: usize,
@@ -307,6 +339,12 @@ impl FiberContext {
             kind: WorkloadKind::Compute,
             mode: TopologyMode::P2PMesh,
             affinity: crate::api::topology::Affinity::SameCore,
+            priority: crate::api::Priority::Normal,
+            name: None,
+            stack_size: 0,
+            stack_limit: 0,
+            stack_canary: 0,
+            stack_safety: SafetyLevel::Safety0,
             origin_core: 0,
             fiber_index: 0,
             waiter_thread_id: AtomicU64::new(0),
@@ -349,6 +387,12 @@ impl FiberContext {
             kind: WorkloadKind::Compute,
             mode: TopologyMode::P2PMesh,
             affinity: crate::api::topology::Affinity::SameCore,
+            priority: crate::api::Priority::Normal,
+            name: None,
+            stack_size: 0,
+            stack_limit: 0,
+            stack_canary: 0,
+            stack_safety: SafetyLevel::Safety0,
             origin_core: 0,
             fiber_index: 0,
             waiter_thread_id: AtomicU64::new(0),
@@ -415,6 +459,142 @@ impl FiberContext {
             })
             == Ok(FiberStatus::Yielded as u32)
     }
+
+    /// Checks the fiber's stack-overflow canary, if it has one.
+    ///
+    /// Returns `true` when the canary is either disabled (`Safety0`, no
+    /// [`Self::stack_canary`] planted) or still holds its planted value.
+    /// A `false` result means the fiber's stack grew below
+    /// [`Self::stack_limit`] and overwrote the word guarding it — i.e. the
+    /// fiber has already overflowed its granted stack and is writing into
+    /// the slot's reserved guard band (and, if the pool has guard pages and
+    /// the fiber keeps going, into a hardware-protected page that faults).
+    ///
+    /// Cost on the fast path is one predictable branch on a field that is
+    /// already in the context's first cache line after a dispatch; the
+    /// load only happens for fibers that actually opted into a canary.
+    #[inline(always)]
+    pub(crate) fn stack_guard_intact(&self) -> bool {
+        if self.stack_canary == 0 {
+            return true;
+        }
+        // SAFETY: `stack_limit` was validated by `grant_stack` to leave at
+        // least `CANARY_BYTES` inside the slot below it, so the canary word
+        // it planted is always inside this fiber's own slot.
+        unsafe {
+            core::ptr::read_volatile((self.stack_limit - CANARY_BYTES) as *const u64)
+                == self.stack_canary
+        }
+    }
+
+    /// Best-effort human-readable identity for diagnostics: the name given
+    /// at spawn time when there is one, otherwise the pool index.
+    #[must_use]
+    pub(crate) fn diagnostic_id(&self) -> alloc::string::String {
+        self.name.map_or_else(
+            || alloc::format!("fiber {}", self.fiber_index),
+            |name| alloc::format!("'{name}' (fiber {})", self.fiber_index),
+        )
+    }
+
+    /// Reports a stack overflow exactly once per fiber.
+    ///
+    /// Called at the points where a canary-bearing fiber's stack usage can
+    /// be observed: at termination for `Safety1`/`Safety2`, and at every
+    /// suspension for `Safety2`. After the first trip the canary is
+    /// disarmed, so a fiber that keeps overflowing keeps running (it is
+    /// already past the point where the runtime can save it) but does not
+    /// flood stderr with one report per yield.
+    #[inline(always)]
+    pub(crate) fn check_stack_guard(&mut self) {
+        if self.stack_guard_intact() {
+            return;
+        }
+        // Cold: a stack overflow is a bug in the fiber, never the steady
+        // state — keep it out of the hot path's instruction footprint.
+        core::hint::cold_path();
+        self.stack_canary = 0;
+        crate::STACK_CANARY_TRIPS.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "DTA-V3: stack overflow detected in {} — it wrote below the {} bytes of stack it was granted.",
+            self.diagnostic_id(),
+            self.stack_size
+        );
+    }
+}
+
+/// Width of the stack-overflow canary word planted immediately below a
+/// fiber's granted stack.
+const CANARY_BYTES: usize = 8;
+
+/// Smallest stack a fiber may be granted, regardless of what it asked for.
+///
+/// Covers the ABI-mandated entry sequence (poison return address, shadow
+/// space on Windows) plus enough headroom for the trampoline's own frame;
+/// a smaller request is honoured as exactly this instead of producing a
+/// fiber that faults on its first instruction.
+pub(crate) const MIN_STACK_BYTES: usize = 256;
+
+/// Reserves `requested` bytes of stack for `ctx` inside the address range
+/// `[stack_bottom, stack_ceiling)`, clamps it to what the slot actually
+/// has, plants a canary when `safety` asks for one, records the result on
+/// the context, and returns the resulting stack limit.
+///
+/// `stack_ceiling` is the address the stack starts growing *down* from
+/// (the future's base, or the top of the zero-copy buffer); `stack_bottom`
+/// is the lowest address the slot may use — right after its guard page,
+/// if the pool has one.
+///
+/// The canary lives in the `CANARY_BYTES` immediately below the returned
+/// limit, so it is the first thing an overflowing stack destroys and is
+/// never touched by a stack that stays inside its budget. When `safety`
+/// is [`SafetyLevel::Safety0`] no canary is planted and the full range is
+/// granted.
+///
+/// # Safety
+/// `ctx` must point at a live, exclusively-owned `FiberContext` whose
+/// `fiber_index`/`generation` are already final for this claim, and
+/// `stack_bottom <= stack_ceiling` must both fall inside that context's
+/// own arena slot.
+#[inline(always)]
+pub(crate) unsafe fn grant_stack(
+    ctx: *mut FiberContext,
+    stack_ceiling: usize,
+    stack_bottom: usize,
+    requested: Option<usize>,
+    safety: SafetyLevel,
+) -> usize {
+    let available = stack_ceiling.saturating_sub(stack_bottom);
+    // `Safety0` trades the overflow canary for the whole region. So does any
+    // region too small to hold a canary *and* the minimum stack — a slot that
+    // degenerate is not a configuration this pool can be built with, but
+    // silently granting zero bytes would be worse than skipping the canary.
+    let guarded = !matches!(safety, SafetyLevel::Safety0)
+        && available >= MIN_STACK_BYTES.saturating_add(CANARY_BYTES);
+    let guard = if guarded { CANARY_BYTES } else { 0 };
+    let max_want = available.saturating_sub(guard);
+    let want = requested
+        .map_or(max_want, |r| r.min(max_want))
+        .max(MIN_STACK_BYTES.min(max_want));
+    let limit = stack_ceiling - want;
+
+    unsafe {
+        (*ctx).stack_size = want;
+        (*ctx).stack_limit = limit;
+        (*ctx).stack_safety = safety;
+        (*ctx).stack_canary = 0;
+        if guarded {
+            // A per-fiber canary value rather than a constant, so ordinary
+            // stack contents (return addresses, saved registers) can never
+            // happen to match it and mask a real overflow.
+            let canary = 0xD7AC_0FBE_EF00_0001
+                ^ (u64::from((*ctx).fiber_index) << 32)
+                ^ u64::from((*ctx).generation.load(Ordering::Relaxed));
+            core::ptr::write((limit - CANARY_BYTES) as *mut u64, canary);
+            (*ctx).stack_canary = canary;
+        }
+    }
+    limit
 }
 
 #[cfg(not(loom))]
@@ -458,6 +638,17 @@ pub struct ContextPool {
     /// and cached here so `get_context_ptr` — called on every fiber dispatch —
     /// never re-executes the alignment arithmetic at runtime.
     pub context_end_offset: usize,
+    /// Total stack bytes a slot can hand to one fiber: everything from the
+    /// slot's first usable byte up to the `FiberContext`, i.e. the
+    /// configured `stack_size` plus the 8 KB zero-copy buffer that sits
+    /// directly beneath the context.
+    ///
+    /// Cached because every spawn path needs it, and it is a pure function
+    /// of the layout fixed at construction. A fiber requesting more than
+    /// this is clamped to it (see [`grant_stack`] and
+    /// [`crate::STACK_CLAMPED_SPAWNS`]) — a slot can never lend stack to a
+    /// neighbour without breaking the arena's isolation guarantees.
+    pub stack_capacity: usize,
     /// Per-(pool, worker-id) batch caches amortizing `free_head`'s CAS cost.
     /// See [`LocalFreeCache`] and `alloc_context`/`free_context`.
     local_caches: Box<[UnsafeCell<LocalFreeCache>]>,
@@ -529,6 +720,7 @@ impl ContextPool {
     /// or if hardware protection cannot be applied to the guard pages.
     #[allow(clippy::cast_possible_truncation)]
     #[allow(clippy::cast_sign_loss)]
+    #[allow(clippy::too_many_lines)]
     #[inline(never)]
     pub fn new(
         capacity: u32,
@@ -595,6 +787,7 @@ impl ContextPool {
                 safety,
                 free_head: AtomicU64::new(0),
                 context_end_offset,
+                stack_capacity: slot_size - context_sz,
                 local_caches,
                 batch_size,
             };
@@ -822,6 +1015,31 @@ impl ContextPool {
                 .add(index as usize * self.slot_size + guard_offset + self.context_end_offset)
                 .cast::<FiberContext>()
         }
+    }
+
+    /// The pool-wide [`SafetyLevel`] this arena was built with.
+    ///
+    /// Governs the arena's address-space layout (guard-page placement), and
+    /// is what the C-FFI spawn paths use as the per-fiber stack-overflow
+    /// policy — a C fiber has no per-spawn knob of its own, so it inherits
+    /// the level the embedder configured the whole runtime with.
+    #[inline(always)]
+    pub const fn safety_level(&self) -> SafetyLevel {
+        self.safety
+    }
+
+    /// Returns the address of the lowest byte of slot `index` that a fiber
+    /// may legally use as stack — the start of its slot, just past the
+    /// guard page when the pool has one.
+    ///
+    /// Together with [`Self::stack_capacity`] this bounds every fiber's
+    /// stack to its own slot: a stack that grows below this address is
+    /// overflowing into the guard page (which faults, under `Safety1`/
+    /// `Safety2`) or into the next slot's memory (which the canary planted
+    /// by [`grant_stack`] catches first).
+    #[inline(always)]
+    pub fn stack_bottom(&self, index: u32) -> usize {
+        self.get_context_ptr(index) as usize - self.context_end_offset
     }
 
     /// O(1) pop from this worker's local batch cache (no atomics),
@@ -1265,6 +1483,67 @@ mod tests {
     fn as_worker(id: usize) -> WorkerIdGuard {
         crate::future_bridge::CURRENT_WORKER_ID.with(|c| c.set(id));
         WorkerIdGuard
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn grant_stack_clamps_and_plants_a_canary() {
+        let pool = ContextPool::new(4, 64 * 1024, SafetyLevel::Safety1, 0, 1).expect("pool init");
+        let idx = pool.alloc_context().expect("slot");
+        let ctx = pool.get_context_ptr(idx);
+        let bottom = pool.stack_bottom(idx);
+        // Stand-in for "the future's base inside the zero-copy buffer".
+        let ceiling = bottom + 8192 + 4096;
+
+        // A request that fits is granted exactly, with the canary sitting
+        // immediately below the lowest byte the stack may touch.
+        let limit = unsafe { grant_stack(ctx, ceiling, bottom, Some(4096), SafetyLevel::Safety1) };
+        assert_eq!(limit, ceiling - 4096);
+        unsafe {
+            assert_eq!((*ctx).stack_size, 4096);
+            assert_eq!((*ctx).stack_safety, SafetyLevel::Safety1);
+            assert_ne!((*ctx).stack_canary, 0, "Safety1 must plant a canary");
+            assert!((*ctx).stack_guard_intact());
+        }
+
+        // Clobbering it is exactly what an overflowing stack does.
+        unsafe {
+            core::ptr::write((limit - CANARY_BYTES) as *mut u64, 0);
+            assert!(!(*ctx).stack_guard_intact());
+        }
+        let before = crate::STACK_CANARY_TRIPS.load(Ordering::Relaxed);
+        unsafe { (*ctx).check_stack_guard() };
+        assert_eq!(
+            crate::STACK_CANARY_TRIPS.load(Ordering::Relaxed),
+            before + 1,
+            "a tripped canary must be reported"
+        );
+        // Reported once, then disarmed so a corrupt fiber cannot flood stderr.
+        unsafe { (*ctx).check_stack_guard() };
+        assert_eq!(
+            crate::STACK_CANARY_TRIPS.load(Ordering::Relaxed),
+            before + 1
+        );
+
+        // Safety0 opts out entirely: no canary, the whole region.
+        let limit0 = unsafe { grant_stack(ctx, ceiling, bottom, None, SafetyLevel::Safety0) };
+        assert_eq!(limit0, bottom);
+        unsafe {
+            assert_eq!((*ctx).stack_canary, 0);
+            assert!((*ctx).stack_guard_intact());
+            assert_eq!((*ctx).stack_size, ceiling - bottom);
+        }
+
+        // An oversized request clamps to the slot, leaving room for the canary.
+        let limit_big =
+            unsafe { grant_stack(ctx, ceiling, bottom, Some(usize::MAX), SafetyLevel::Safety2) };
+        assert_eq!(limit_big, bottom + CANARY_BYTES);
+        unsafe {
+            assert_eq!((*ctx).stack_size + CANARY_BYTES, ceiling - bottom);
+            assert_eq!((*ctx).stack_safety, SafetyLevel::Safety2);
+        }
+
+        pool.free_context(idx);
     }
 
     #[test]

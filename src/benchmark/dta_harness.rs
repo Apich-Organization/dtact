@@ -562,6 +562,8 @@ impl TaskSpawner for DtaHarness {
                 u64::from(idx),
                 idx,
                 crate::api::topology::Affinity::Any,
+                self.scheduler.topology,
+                crate::api::Priority::Normal,
             );
         } else {
             // Called from the harness/main thread (not a worker OS thread).
@@ -588,6 +590,8 @@ impl TaskSpawner for DtaHarness {
                 u64::from(idx),
                 idx,
                 crate::api::topology::Affinity::Any,
+                self.scheduler.topology,
+                crate::api::Priority::Normal,
             );
         }
     }

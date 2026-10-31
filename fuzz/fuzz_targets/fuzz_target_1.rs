@@ -39,6 +39,8 @@ fuzz_target!(|data: FuzzInput| {
         data.flow_id as u64,
         data.priority as u32,
         dtact::Affinity::Any,
+        dtact::TopologyMode::P2PMesh,
+        dtact::Priority::from_level(data.priority as u8 % 4),
     );
 
     let mut total_tasks = 0;

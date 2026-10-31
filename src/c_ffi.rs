@@ -15,7 +15,14 @@ pub struct dtact_config_t {
     pub workers: u32,
     /// Memory safety level (0-2).
     pub safety_level: u8,
-    /// Topology mode (0: `P2PMesh`, 1: Global).
+    /// Topology mode (0: `P2PMesh`, 1: `Global`, 2: `Pinned`).
+    ///
+    /// `Pinned` pins every fiber to the worker it was spawned from: it is
+    /// the runtime-wide default that a fiber can still override with
+    /// `dtact_spawn_options_t`'s switcher (a `CrossThread` switcher needs
+    /// migration to be legal, so it cannot opt *into* pinning this way —
+    /// but the reverse, a `P2PMesh`/`Global` runtime pinning one fiber, is
+    /// what the per-fiber switcher controls).
     pub topology_mode: u8,
     /// NUMA node for memory allocation. Set to 0 for default (local node).
     pub numa: u8,
@@ -37,16 +44,26 @@ pub struct dtact_spawn_options_t {
     pub kind: u8,
     /// 0: `CrossThreadFloat`, 1: `CrossThreadNoFloat`, 2: `SameThreadFloat`, 3: `SameThreadNoFloat`
     pub switcher: u8,
+    /// Stack bytes for this fiber. 0 uses the runtime's configured
+    /// `dtact_config_t::stack_size`; a larger request is clamped to what one
+    /// arena slot can hold (see `dtact::STACK_CLAMPED_SPAWNS`).
+    pub stack_size: u32,
+    /// Per-fiber stack-overflow policy: 0 = none, 1 = canary checked at
+    /// termination, 2 = canary checked at every suspension.
+    /// Any other value inherits `dtact_config_t::safety_level`.
+    pub safety: u8,
 }
 
 /// Returns the recommended default options for the Dtact runtime.
 #[unsafe(no_mangle)]
 pub const extern "C" fn dtact_default_spawn_options() -> dtact_spawn_options_t {
     dtact_spawn_options_t {
-        priority: 1, // Normal
-        affinity: 0, // SameCore
-        kind: 0,     // Compute
-        switcher: 0, // CrossThreadFloat
+        priority: 1,   // Normal
+        affinity: 0,   // SameCore
+        kind: 0,       // Compute
+        switcher: 0,   // CrossThreadFloat
+        stack_size: 0, // Runtime default
+        safety: 0xFF,  // Inherit dtact_config_t::safety_level
     }
 }
 
@@ -88,6 +105,7 @@ pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
 
     let topology = match cfg.topology_mode {
         1 => TopologyMode::Global,
+        2 => TopologyMode::Pinned,
         _ => TopologyMode::P2PMesh,
     };
 
@@ -128,8 +146,91 @@ pub unsafe extern "C" fn dtact_init(cfg: *const dtact_config_t) -> *mut c_void {
 /// return without properly terminating via the runtime.
 #[unsafe(no_mangle)]
 pub extern "C" fn dtact_abort() -> ! {
-    eprintln!("DTA-V3 Critical: Fiber attempted to 'return' instead of yielding. Stack corrupted.");
+    let ctx_ptr = crate::future_bridge::CURRENT_FIBER.with(std::cell::Cell::get);
+    if let Some(ctx) = unsafe { ctx_ptr.as_ref() } {
+        eprintln!(
+            "DTA-V3 Critical: {} attempted to 'return' instead of yielding. Stack corrupted.",
+            ctx.diagnostic_id()
+        );
+    } else {
+        eprintln!(
+            "DTA-V3 Critical: Fiber attempted to 'return' instead of yielding. Stack corrupted."
+        );
+    }
     std::process::abort();
+}
+
+/// Prepares the stack a freshly claimed context will run on: the ABI-aligned
+/// ceiling it grows down from, the poison return address at that ceiling,
+/// and — through [`crate::memory_management::grant_stack`] — the granted
+/// limit and overflow canary inside the slot's reserved stack region.
+///
+/// `requested` is the fiber's `dtact_spawn_options_t::stack_size` (`None`
+/// for "runtime default", which grants the whole slot), and `safety` is its
+/// resolved per-fiber overflow policy — `dtact_spawn_options_t::safety` when
+/// the caller set it, otherwise the runtime's `safety_level`.
+///
+/// Returns `(ceiling, limit, bottom)` for the architecture-specific register
+/// setup each launch path does afterwards. Shared by all four C entry points
+/// so they cannot drift apart.
+///
+/// # Safety
+/// `ctx_ptr` must be a claimed, exclusively-owned context whose
+/// `fiber_index` is already final.
+#[inline]
+unsafe fn prepare_stack(
+    ctx_ptr: *mut crate::memory_management::FiberContext,
+    pool: &crate::memory_management::ContextPool,
+    requested: Option<usize>,
+    safety: crate::memory_management::SafetyLevel,
+) -> (usize, usize, usize) {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let ceiling = (ctx_ptr as usize & !0xF) - 72;
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let ceiling = (ctx_ptr as usize & !0xF) - 80;
+
+    // Place a "poison" return address on the stack: if the fiber function
+    // ever attempts to `ret`, it jumps here and aborts.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    unsafe {
+        core::ptr::write(ceiling as *mut u64, dtact_abort as *const () as u64);
+    }
+
+    let bottom = pool.stack_bottom(unsafe { (*ctx_ptr).fiber_index });
+    let limit = unsafe {
+        crate::memory_management::grant_stack(ctx_ptr, ceiling, bottom, requested, safety)
+    };
+    (ceiling, limit, bottom)
+}
+
+/// Resolves `dtact_spawn_options_t::safety` (where any out-of-range value
+/// means "inherit") against the runtime's configured level, and
+/// `stack_size` (`0` means "runtime default") into an optional request.
+///
+/// Also accounts the request against `STACK_CLAMPED_SPAWNS` when one slot
+/// cannot hold it, exactly as the Rust spawn paths do.
+#[inline]
+fn resolve_spawn_extras(
+    opts: &dtact_spawn_options_t,
+    pool: &crate::memory_management::ContextPool,
+) -> (Option<usize>, crate::memory_management::SafetyLevel) {
+    let safety = match opts.safety {
+        0 => crate::memory_management::SafetyLevel::Safety0,
+        1 => crate::memory_management::SafetyLevel::Safety1,
+        2 => crate::memory_management::SafetyLevel::Safety2,
+        _ => pool.safety_level(),
+    };
+    let requested = if opts.stack_size == 0 {
+        None
+    } else {
+        Some(opts.stack_size as usize)
+    };
+    if let Some(bytes) = requested
+        && bytes > pool.stack_capacity
+    {
+        crate::STACK_CLAMPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    (requested, safety)
 }
 
 /// Frees an argument pointer previously allocated for a fiber.
@@ -186,6 +287,8 @@ pub unsafe extern "C" fn dtact_fiber_launch(
         (*ctx_ptr).kind = crate::common_types::WorkloadKind::Compute;
         (*ctx_ptr).mode = crate::common_types::TopologyMode::P2PMesh;
         (*ctx_ptr).affinity = crate::api::topology::Affinity::SameCore;
+        (*ctx_ptr).priority = crate::api::Priority::Normal;
+        (*ctx_ptr).name = None;
 
         (*ctx_ptr).closure_ptr = arg.cast::<()>();
         (*ctx_ptr).trampoline =
@@ -204,20 +307,11 @@ pub unsafe extern "C" fn dtact_fiber_launch(
         // 3. ABI-Compliant Stack Alignment & Poisoning
         // We leave 72 bytes for Shadow Space (Windows) and Future safety.
         // -72 ensures that RSP is 16-byte aligned + 8, which is required by the Windows x64 ABI.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 72;
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 80;
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top_ptr = stack_top as *mut u64;
-
-        // Place a "poison" return address on the stack.
-        // If the fiber function ever attempts to 'ret', it will jump here and abort.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        core::ptr::write(stack_top_ptr, dtact_abort as *const () as u64);
-
-        let stack_top = stack_top as *mut u8;
+        // `prepare_stack` then grants the fiber its stack budget inside the
+        // slot's reserved region, exactly as the Rust spawn paths do.
+        let (stack_ceiling, stack_limit, stack_bottom) =
+            prepare_stack(ctx_ptr, pool, None, pool.safety_level());
+        let stack_top = stack_ceiling as *mut u8;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -225,10 +319,9 @@ pub unsafe extern "C" fn dtact_fiber_launch(
             (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as *const () as u64; // RIP
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[10] = ctx_ptr as u64; // Stack Base
-                (*ctx_ptr).regs.gprs[11] = limit as u64; // Stack Limit
-                (*ctx_ptr).regs.gprs[12] = limit as u64; // DeallocationStack
+                (*ctx_ptr).regs.gprs[10] = stack_ceiling as u64; // Stack Base
+                (*ctx_ptr).regs.gprs[11] = stack_limit as u64; // Stack Limit
+                (*ctx_ptr).regs.gprs[12] = stack_bottom as u64; // DeallocationStack
                 (*ctx_ptr).regs.gprs[13] = !0; // ExceptionList
             }
         }
@@ -238,10 +331,9 @@ pub unsafe extern "C" fn dtact_fiber_launch(
             (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64; // x30 (LR)
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[13] = ctx_ptr as u64; // Stack Base
-                (*ctx_ptr).regs.gprs[14] = limit as u64; // Stack Limit
-                (*ctx_ptr).regs.gprs[15] = limit as u64; // DeallocationStack
+                (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base
+                (*ctx_ptr).regs.gprs[14] = stack_limit as u64; // Stack Limit
+                (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
             }
         }
         #[cfg(target_arch = "riscv64")]
@@ -306,15 +398,14 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
             _ => crate::context_switch::switch_context_cross_thread_float,
         };
 
+        // A `SameThread` switcher can never be migrated, so it is pinned
+        // regardless of what the runtime topology says. Everything else
+        // inherits the runtime's topology verbatim — including `Pinned`,
+        // which is how `dtact_config_t::topology_mode == 2` pins the whole
+        // runtime.
         let allow_deflection = opts.switcher == 0 || opts.switcher == 1;
         (*ctx_ptr).mode = if allow_deflection {
-            let topology = runtime.scheduler.topology;
-            match topology {
-                crate::dta_scheduler::TopologyMode::Global => {
-                    crate::common_types::TopologyMode::Global
-                }
-                _ => crate::common_types::TopologyMode::P2PMesh,
-            }
+            runtime.scheduler.topology
         } else {
             crate::common_types::TopologyMode::Pinned
         };
@@ -326,19 +417,16 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
             _ => crate::api::topology::Affinity::SameCore,
         };
 
-        (*ctx_ptr).kind = match opts.kind {
-            1 => crate::common_types::WorkloadKind::IO,
-            2 => crate::common_types::WorkloadKind::Memory,
-            3 => crate::common_types::WorkloadKind::System,
-            _ => crate::common_types::WorkloadKind::Compute,
-        };
+        (*ctx_ptr).kind = crate::common_types::WorkloadKind::from_level(opts.kind);
 
-        (*ctx_ptr).adaptive_spin_count = match (*ctx_ptr).kind {
-            crate::common_types::WorkloadKind::Compute => 1000,
-            crate::common_types::WorkloadKind::IO => 100,
-            crate::common_types::WorkloadKind::Memory => 500,
-            crate::common_types::WorkloadKind::System => 200,
-        };
+        // The C ABI's `priority` field, until now accepted and dropped.
+        // It now drives both halves of the priority contract: `Low`/`High`
+        // bias the deflection threshold, `Critical` is never deflected and
+        // is inserted at the front of its worker's local queue.
+        (*ctx_ptr).priority = crate::api::Priority::from_level(opts.priority);
+        (*ctx_ptr).name = None;
+
+        (*ctx_ptr).adaptive_spin_count = (*ctx_ptr).kind.spin_budget();
 
         (*ctx_ptr).closure_ptr = arg.cast::<()>();
         (*ctx_ptr).trampoline =
@@ -352,16 +440,10 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
             }
         };
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 72;
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 80;
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top_ptr = stack_top as *mut u64;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        core::ptr::write(stack_top_ptr, dtact_abort as *const () as u64);
-        let stack_top = stack_top as *mut u8;
+        let (requested, safety) = resolve_spawn_extras(&opts, pool);
+        let (stack_ceiling, stack_limit, stack_bottom) =
+            prepare_stack(ctx_ptr, pool, requested, safety);
+        let stack_top = stack_ceiling as *mut u8;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -369,10 +451,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
             (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as *const () as u64;
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[10] = ctx_ptr as u64;
-                (*ctx_ptr).regs.gprs[11] = limit as u64;
-                (*ctx_ptr).regs.gprs[12] = limit as u64;
+                (*ctx_ptr).regs.gprs[10] = stack_ceiling as u64;
+                (*ctx_ptr).regs.gprs[11] = stack_limit as u64;
+                (*ctx_ptr).regs.gprs[12] = stack_bottom as u64;
                 (*ctx_ptr).regs.gprs[13] = !0;
             }
         }
@@ -382,10 +463,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
             (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64;
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[13] = ctx_ptr as u64;
-                (*ctx_ptr).regs.gprs[14] = limit as u64;
-                (*ctx_ptr).regs.gprs[15] = limit as u64;
+                (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64;
+                (*ctx_ptr).regs.gprs[14] = stack_limit as u64;
+                (*ctx_ptr).regs.gprs[15] = stack_bottom as u64;
             }
         }
         #[cfg(target_arch = "riscv64")]
@@ -447,6 +527,8 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
         (*ctx_ptr).kind = crate::common_types::WorkloadKind::Compute;
         (*ctx_ptr).mode = crate::common_types::TopologyMode::P2PMesh;
         (*ctx_ptr).affinity = crate::api::topology::Affinity::SameCore;
+        (*ctx_ptr).priority = crate::api::Priority::Normal;
+        (*ctx_ptr).name = None;
 
         (*ctx_ptr).closure_ptr = arg.cast::<()>();
         (*ctx_ptr).trampoline =
@@ -470,17 +552,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
         };
 
         // ABI-Compliant Stack Alignment & Poisoning
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 72;
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 80;
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top_ptr = stack_top as *mut u64;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        core::ptr::write(stack_top_ptr, dtact_abort as *const () as u64);
-
-        let stack_top = stack_top as *mut u8;
+        let (stack_ceiling, stack_limit, stack_bottom) =
+            prepare_stack(ctx_ptr, pool, None, pool.safety_level());
+        let stack_top = stack_ceiling as *mut u8;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -488,10 +562,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
             (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as *const () as u64; // RIP
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[10] = ctx_ptr as u64; // Stack Base
-                (*ctx_ptr).regs.gprs[11] = limit as u64; // Stack Limit
-                (*ctx_ptr).regs.gprs[12] = limit as u64; // DeallocationStack
+                (*ctx_ptr).regs.gprs[10] = stack_ceiling as u64; // Stack Base
+                (*ctx_ptr).regs.gprs[11] = stack_limit as u64; // Stack Limit
+                (*ctx_ptr).regs.gprs[12] = stack_bottom as u64; // DeallocationStack
                 (*ctx_ptr).regs.gprs[13] = !0; // ExceptionList
             }
         }
@@ -501,10 +574,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
             (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64; // x30 (LR)
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[13] = ctx_ptr as u64; // Stack Base
-                (*ctx_ptr).regs.gprs[14] = limit as u64; // Stack Limit
-                (*ctx_ptr).regs.gprs[15] = limit as u64; // DeallocationStack
+                (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base
+                (*ctx_ptr).regs.gprs[14] = stack_limit as u64; // Stack Limit
+                (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
             }
         }
         #[cfg(target_arch = "riscv64")]
@@ -568,15 +640,14 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
             _ => crate::context_switch::switch_context_cross_thread_float,
         };
 
+        // A `SameThread` switcher can never be migrated, so it is pinned
+        // regardless of what the runtime topology says. Everything else
+        // inherits the runtime's topology verbatim — including `Pinned`,
+        // which is how `dtact_config_t::topology_mode == 2` pins the whole
+        // runtime.
         let allow_deflection = opts.switcher == 0 || opts.switcher == 1;
         (*ctx_ptr).mode = if allow_deflection {
-            let topology = runtime.scheduler.topology;
-            match topology {
-                crate::dta_scheduler::TopologyMode::Global => {
-                    crate::common_types::TopologyMode::Global
-                }
-                _ => crate::common_types::TopologyMode::P2PMesh,
-            }
+            runtime.scheduler.topology
         } else {
             crate::common_types::TopologyMode::Pinned
         };
@@ -588,19 +659,12 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
             _ => crate::api::topology::Affinity::SameCore,
         };
 
-        (*ctx_ptr).kind = match opts.kind {
-            1 => crate::common_types::WorkloadKind::IO,
-            2 => crate::common_types::WorkloadKind::Memory,
-            3 => crate::common_types::WorkloadKind::System,
-            _ => crate::common_types::WorkloadKind::Compute,
-        };
+        (*ctx_ptr).priority = crate::api::Priority::from_level(opts.priority);
+        (*ctx_ptr).name = None;
 
-        (*ctx_ptr).adaptive_spin_count = match (*ctx_ptr).kind {
-            crate::common_types::WorkloadKind::Compute => 1000,
-            crate::common_types::WorkloadKind::IO => 100,
-            crate::common_types::WorkloadKind::Memory => 500,
-            crate::common_types::WorkloadKind::System => 200,
-        };
+        (*ctx_ptr).kind = crate::common_types::WorkloadKind::from_level(opts.kind);
+
+        (*ctx_ptr).adaptive_spin_count = (*ctx_ptr).kind.spin_budget();
 
         (*ctx_ptr).closure_ptr = arg.cast::<()>();
         (*ctx_ptr).trampoline =
@@ -622,16 +686,10 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
             }
         };
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 72;
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        let stack_top = (ctx_ptr as usize & !0xF) - 80;
-
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        let stack_top_ptr = stack_top as *mut u64;
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        core::ptr::write(stack_top_ptr, dtact_abort as *const () as u64);
-        let stack_top = stack_top as *mut u8;
+        let (requested, safety) = resolve_spawn_extras(&opts, pool);
+        let (stack_ceiling, stack_limit, stack_bottom) =
+            prepare_stack(ctx_ptr, pool, requested, safety);
+        let stack_top = stack_ceiling as *mut u8;
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -639,10 +697,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
             (*ctx_ptr).regs.gprs[7] = crate::api::fiber_entry_point as *const () as u64;
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[10] = ctx_ptr as u64;
-                (*ctx_ptr).regs.gprs[11] = limit as u64;
-                (*ctx_ptr).regs.gprs[12] = limit as u64;
+                (*ctx_ptr).regs.gprs[10] = stack_ceiling as u64;
+                (*ctx_ptr).regs.gprs[11] = stack_limit as u64;
+                (*ctx_ptr).regs.gprs[12] = stack_bottom as u64;
                 (*ctx_ptr).regs.gprs[13] = !0;
             }
         }
@@ -652,10 +709,9 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
             (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64;
             #[cfg(windows)]
             {
-                let limit = (ctx_ptr as usize).saturating_sub(pool.slot_size);
-                (*ctx_ptr).regs.gprs[13] = ctx_ptr as u64;
-                (*ctx_ptr).regs.gprs[14] = limit as u64;
-                (*ctx_ptr).regs.gprs[15] = limit as u64;
+                (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64;
+                (*ctx_ptr).regs.gprs[14] = stack_limit as u64;
+                (*ctx_ptr).regs.gprs[15] = stack_bottom as u64;
             }
         }
         #[cfg(target_arch = "riscv64")]

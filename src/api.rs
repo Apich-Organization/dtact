@@ -20,6 +20,66 @@ pub enum Priority {
     Critical,
 }
 
+impl Priority {
+    /// Packed discriminant, used for telemetry and for the C-FFI round-trip.
+    #[inline(always)]
+    #[must_use]
+    pub const fn level(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
+            Self::Critical => 3,
+        }
+    }
+
+    /// Inverse of [`Self::level`]; anything out of range maps to `Normal`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn from_level(level: u8) -> Self {
+        match level {
+            0 => Self::Low,
+            2 => Self::High,
+            3 => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
+
+    /// Signed bias added to a worker's adaptive `deflection_threshold`
+    /// before the load comparison in `DtaScheduler::enqueue_deflect`.
+    ///
+    /// Negative bias = deflect sooner (the fiber is cheap to move and not
+    /// latency-sensitive); positive bias = deflect later. `Normal` is
+    /// exactly `0`, so the default spawn path computes the identical
+    /// comparison it always did.
+    #[inline(always)]
+    pub(crate) const fn deflection_bias(self) -> i8 {
+        match self {
+            Self::Low => -32,
+            Self::High => 24,
+            // `Normal` must reproduce the pre-priority comparison exactly,
+            // and `Critical` never reaches the threshold comparison at all
+            // (see `may_deflect`) — so both are a zero bias.
+            Self::Normal | Self::Critical => 0,
+        }
+    }
+
+    /// `false` for [`Self::Critical`], which is routed as pinned: it is
+    /// never handed to another worker, so it can neither be delayed by a
+    /// remote queue nor migrated away from its cache-warm core.
+    #[inline(always)]
+    pub(crate) const fn may_deflect(self) -> bool {
+        !matches!(self, Self::Critical)
+    }
+
+    /// `true` when a fiber of this priority is inserted at the *front* of
+    /// the local queue instead of the back.
+    #[inline(always)]
+    pub(crate) const fn jumps_queue(self) -> bool {
+        matches!(self, Self::Critical)
+    }
+}
+
 /// Interface for custom context switching logic.
 ///
 /// `ALLOW_DEFLECTION` reports whether fibers using this switcher may be
@@ -83,8 +143,11 @@ pub struct SpawnBuilder<S: ContextSwitcher = CrossThreadFloat> {
     affinity: topology::Affinity,
     priority: Priority,
     kind: WorkloadKind,
-    mode: TopologyMode,
+    /// Per-fiber deflection scope. `None` inherits the runtime's topology;
+    /// an explicit value overrides it for this fiber only.
+    mode: Option<TopologyMode>,
     safety: crate::memory_management::SafetyLevel,
+    stack_size: Option<usize>,
     _marker: core::marker::PhantomData<S>,
 }
 
@@ -106,8 +169,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             affinity: topology::Affinity::SameCore,
             priority: Priority::Normal,
             kind: WorkloadKind::Compute,
-            mode: TopologyMode::P2PMesh,
+            mode: None,
             safety: crate::memory_management::SafetyLevel::Safety0,
+            stack_size: None,
             _marker: core::marker::PhantomData,
         }
     }
@@ -120,19 +184,57 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
         self
     }
 
-    /// Sets the topology mode (P2P Mesh or Local Queue).
+    /// Sets this fiber's deflection scope, overriding the runtime's topology
+    /// for this fiber only.
+    ///
+    /// * `P2PMesh` — deflection is confined to the fibre's own CCX
+    ///   neighbourhood (the default on a `P2PMesh` runtime).
+    /// * `Global` — deflection may target any worker in the mesh, even on a
+    ///   `P2PMesh` runtime. Useful for long-running, cache-cold work that
+    ///   benefits from being placed wherever there is room.
+    /// * `Pinned` — never deflected at all; the fiber stays on its origin
+    ///   worker (also forced for `SameThread` switchers, which cannot
+    ///   survive migration).
+    ///
+    /// Leaving this unset inherits the runtime's topology, which is what
+    /// every fiber got before this override existed.
     #[inline(always)]
     #[must_use]
     pub const fn topology_mode(mut self, mode: TopologyMode) -> Self {
-        self.mode = mode;
+        self.mode = Some(mode);
         self
     }
 
     /// Sets the hardware safety level (0-2).
+    ///
+    /// This is the *per-fiber* stack-overflow policy, and is independent of
+    /// the pool-wide `SafetyLevel` passed to the runtime initializer (which
+    /// only decides the arena's address-space layout):
+    /// * `Safety0` — no canary; the fiber gets the whole slot stack.
+    /// * `Safety1` — an 8-byte canary is planted below the granted stack and
+    ///   verified when the fiber terminates.
+    /// * `Safety2` — as `Safety1`, and additionally verified at every
+    ///   suspension point, so an overflow is reported at the first `.await`
+    ///   that follows it rather than only at termination.
     #[inline(always)]
     #[must_use]
     pub const fn safety(mut self, safety: crate::memory_management::SafetyLevel) -> Self {
         self.safety = safety;
+        self
+    }
+
+    /// Requests `bytes` of stack for this fiber.
+    ///
+    /// The request is clamped to what one slot can actually provide (the
+    /// runtime's configured `stack_size` plus the 8 KB zero-copy buffer);
+    /// an oversized request is recorded in [`crate::STACK_CLAMPED_SPAWNS`]
+    /// rather than silently ignored. Leaving this unset grants the fiber
+    /// the whole slot, which is what every fiber got before this knob
+    /// existed.
+    #[inline(always)]
+    #[must_use]
+    pub const fn stack_size(mut self, bytes: usize) -> Self {
+        self.stack_size = Some(bytes);
         self
     }
 
@@ -171,6 +273,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             kind: self.kind,
             mode: self.mode,
             safety: self.safety,
+            stack_size: self.stack_size,
             _marker: core::marker::PhantomData,
         }
     }
@@ -281,8 +384,11 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             (*ctx_ptr).kind = self.kind;
             // Switcher policy overrides user mode: SameThread switchers can never deflect.
             // Compile-time const, dead-code-eliminated to a single branch by the optimizer.
+            // An unset mode inherits the runtime's topology, so a `Pinned`
+            // runtime pins every fiber and a `Global` one makes Global the
+            // default scope without any per-fiber configuration.
             (*ctx_ptr).mode = if S::ALLOW_DEFLECTION {
-                self.mode
+                self.mode.unwrap_or(runtime.scheduler.topology)
             } else {
                 TopologyMode::Pinned
             };
@@ -291,14 +397,11 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             (*ctx_ptr).fiber_index = ctx_id;
             (*ctx_ptr).switch_fn = S::SWITCH_FN;
             (*ctx_ptr).last_os_thread_id = 0; // Reset for new fiber execution
+            (*ctx_ptr).priority = self.priority;
+            (*ctx_ptr).name = self.name;
 
-            // Set adaptive spin count based on workload kind
-            (*ctx_ptr).adaptive_spin_count = match self.kind {
-                WorkloadKind::Compute => 1000,
-                WorkloadKind::IO => 100,
-                WorkloadKind::Memory => 500,
-                WorkloadKind::System => 200,
-            };
+            // Seed the adaptive spin budget from the workload kind.
+            (*ctx_ptr).adaptive_spin_count = self.kind.spin_budget();
 
             // Aligned Zero-Copy Future Migration
             let align = core::mem::align_of::<F>();
@@ -308,8 +411,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             let aligned_fut_addr = (buffer_end - fut_size) & !(align - 1);
 
             // Determine where the stack region ends (just below the future).
-            // The stack grows DOWNWARD from this address toward buffer_start.
-            let stack_limit: usize = if aligned_fut_addr < buffer_start
+            // The stack grows DOWNWARD from this address toward the slot's
+            // own bottom.
+            let stack_ceiling: usize = if aligned_fut_addr < buffer_start
                 || (aligned_fut_addr + fut_size) > buffer_end
             {
                 // Future exceeds pre-allocated 8KB buffer. Fallback to heap.
@@ -356,11 +460,34 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 aligned_fut_addr
             };
 
+            // Hand the fiber its stack: from the ceiling just computed down
+            // to the slot's own bottom, honouring the requested size and
+            // planting the overflow canary if this fiber asked for one.
+            //
+            // Before this, the stack was confined to the 8 KB zero-copy
+            // buffer even though every slot also reserves a full
+            // `stack_size` region below it — so a runtime configured with
+            // 512 KB stacks gave its fibers 8 KB, and the rest of the slot
+            // was address space nobody could reach.
+            let stack_bottom = pool.stack_bottom(ctx_id);
+            if let Some(requested) = self.stack_size
+                && requested > pool.stack_capacity
+            {
+                crate::STACK_CLAMPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            let stack_limit = crate::memory_management::grant_stack(
+                ctx_ptr,
+                stack_ceiling,
+                stack_bottom,
+                self.stack_size,
+                self.safety,
+            );
+
             // ABI-compliant stack alignment
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            let stack_top = (stack_limit & !0xF) - 8;
+            let stack_top = (stack_ceiling & !0xF) - 8;
             #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-            let stack_top = stack_limit & !0xF;
+            let stack_top = stack_ceiling & !0xF;
 
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             let stack_top_ptr = stack_top as *mut u64;
@@ -378,15 +505,13 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 (*ctx_ptr).regs.gprs[7] = fiber_entry_point as *const () as u64; // RIP
                 #[cfg(windows)]
                 {
-                    // Calculate the true bottom of the stack (start of the slot)
-                    let align = 64;
-                    let context_sz =
-                        (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
-                    let slot_base = (ctx_ptr as usize + context_sz).saturating_sub(pool.slot_size);
-
-                    (*ctx_ptr).regs.gprs[10] = stack_limit as u64; // Stack Base (top)
-                    (*ctx_ptr).regs.gprs[11] = slot_base as u64; // Stack Limit (bottom)
-                    (*ctx_ptr).regs.gprs[12] = slot_base as u64; // DeallocationStack
+                    // The TIB's three stack bounds are now exactly the ones
+                    // `grant_stack` just granted: base = the ceiling the
+                    // stack grows down from, limit = the lowest byte it may
+                    // touch, deallocation stack = the slot's own bottom.
+                    (*ctx_ptr).regs.gprs[10] = stack_ceiling as u64; // Stack Base (top)
+                    (*ctx_ptr).regs.gprs[11] = stack_limit as u64; // Stack Limit (bottom)
+                    (*ctx_ptr).regs.gprs[12] = stack_bottom as u64; // DeallocationStack
                     (*ctx_ptr).regs.gprs[13] = 0; // ExceptionList
                 }
             }
@@ -410,14 +535,9 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 (*ctx_ptr).regs.gprs[11] = signed_lr; // Signed x30 (LR)
                 #[cfg(windows)]
                 {
-                    let align = 64;
-                    let context_sz =
-                        (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
-                    let slot_base = (ctx_ptr as usize + context_sz).saturating_sub(pool.slot_size);
-
-                    (*ctx_ptr).regs.gprs[13] = stack_limit as u64; // Stack Base (top)
-                    (*ctx_ptr).regs.gprs[14] = slot_base as u64; // Stack Limit (bottom)
-                    (*ctx_ptr).regs.gprs[15] = slot_base as u64; // DeallocationStack
+                    (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base (top)
+                    (*ctx_ptr).regs.gprs[14] = stack_limit as u64; // Stack Limit (bottom)
+                    (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
                 }
             }
             #[cfg(target_arch = "riscv64")]
@@ -472,6 +592,12 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
         unsafe { cleanup(ctx.closure_ptr) };
     }
 
+    // Stack-overflow canary (Safety1/Safety2). Checked here, once, at the
+    // single point where the fiber's stack usage is complete — the canary
+    // word sits immediately below the granted limit, so a tripped canary
+    // means this fiber's deepest frame reached past the stack it was given.
+    ctx.check_stack_guard();
+
     let final_state = match result {
         Ok(()) => crate::memory_management::FiberStatus::Finished,
         Err(payload) => {
@@ -485,6 +611,18 @@ pub(crate) unsafe extern "C" fn fiber_entry_point() {
             {
                 crate::memory_management::FiberStatus::Cancelled
             } else {
+                // A named fiber gets its name into the log alongside the
+                // panic hook's own message: without it, the only thing tying
+                // a panic to a fiber is the pool index in `outcome`, which
+                // nobody has at the moment the panic is printed. Unnamed
+                // fibers stay silent here — the default hook already said
+                // everything useful about them.
+                if let Some(name) = ctx.name {
+                    eprintln!(
+                        "DTA-V3: fiber '{name}' ({}) panicked; payload is available from dtact::outcome.",
+                        ctx.fiber_index
+                    );
+                }
                 // Double-boxed so the fat `Box<dyn Any + Send>` pointer fits
                 // in `panic_payload_ptr`'s thin `*mut ()`; retrieved by
                 // `crate::api::outcome`, and otherwise dropped by
@@ -719,16 +857,165 @@ pub mod spawn {
 /// Fiber-local execution and synchronization utilities.
 pub mod fiber {
     use super::{dtact_handle_t, topology};
+
+    /// Parses a human-readable stack size such as `"256K"`, `"2M"`, `"64KiB"`
+    /// or a bare byte count into bytes.
+    ///
+    /// Accepts an optional binary suffix (`K`/`KiB`, `M`/`MiB`, `G`/`GiB`,
+    /// case-insensitive) applied to a decimal number. Returns `None` for
+    /// anything it cannot parse, for a zero/empty value, and on overflow —
+    /// callers treat that as "no explicit request" and let the slot's own
+    /// capacity stand, rather than failing a spawn over a typo.
+    ///
+    /// Cold path by construction: it runs once per spawn of a
+    /// `spawn_with_stack` fiber, never per task. The `#[task]` attribute
+    /// resolves its stack size at compile time instead.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn parse_stack_size(spec: &str) -> Option<usize> {
+        let spec = spec.trim();
+        let split = spec
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(spec.len());
+        let (digits, suffix) = spec.split_at(split);
+        let value: usize = digits.parse().ok()?;
+        if value == 0 {
+            return None;
+        }
+        let unit = match suffix.trim().to_ascii_uppercase().as_str() {
+            "" | "B" => 1usize,
+            "K" | "KB" | "KIB" => 1024,
+            "M" | "MB" | "MIB" => 1024 * 1024,
+            "G" | "GB" | "GIB" => 1024 * 1024 * 1024,
+            _ => return None,
+        };
+        value.checked_mul(unit)
+    }
+
+    /// Spawn-time options for the closure-based spawn path
+    /// ([`spawn_closure`] / [`spawn_with_stack`]).
+    ///
+    /// The closure path exists because a plain `fn`/`FnOnce` cannot be a
+    /// future; it needs the same knobs the future path gets from
+    /// [`super::SpawnBuilder`], or a fiber spawned from C could never be
+    /// given a stack size, a priority or a name. This struct is that
+    /// parity, and `#[dtact::export_fiber]` builds one from its attribute
+    /// arguments.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ClosureSpawnOptions {
+        /// Stack bytes to grant. `None` = the slot's full capacity.
+        pub stack_size: Option<usize>,
+        /// Scheduling priority (see [`super::Priority`]).
+        pub priority: super::Priority,
+        /// Per-fiber stack-overflow policy.
+        pub safety: crate::memory_management::SafetyLevel,
+        /// Optional static name, surfaced in diagnostics and by
+        /// [`super::fiber_info`].
+        pub name: Option<&'static str>,
+    }
+
+    impl ClosureSpawnOptions {
+        /// Defaults: no explicit stack request, `Normal` priority,
+        /// `Safety0`, unnamed — i.e. exactly what `spawn_with_stack` did
+        /// before the other knobs existed.
+        #[must_use]
+        pub const fn new() -> Self {
+            Self {
+                stack_size: None,
+                priority: super::Priority::Normal,
+                safety: crate::memory_management::SafetyLevel::Safety0,
+                name: None,
+            }
+        }
+
+        /// Requests `bytes` of stack (clamped to the slot's capacity).
+        #[inline(always)]
+        #[must_use]
+        pub const fn stack_size(mut self, bytes: usize) -> Self {
+            self.stack_size = Some(bytes);
+            self
+        }
+
+        /// Sets the scheduling priority.
+        #[inline(always)]
+        #[must_use]
+        pub const fn priority(mut self, priority: super::Priority) -> Self {
+            self.priority = priority;
+            self
+        }
+
+        /// Sets the per-fiber stack-overflow policy.
+        #[inline(always)]
+        #[must_use]
+        pub const fn safety(mut self, safety: crate::memory_management::SafetyLevel) -> Self {
+            self.safety = safety;
+            self
+        }
+
+        /// Sets a static name for diagnostics.
+        #[inline(always)]
+        #[must_use]
+        pub const fn name(mut self, name: &'static str) -> Self {
+            self.name = Some(name);
+            self
+        }
+    }
+
+    impl Default for ClosureSpawnOptions {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     /// Spawns a fiber from a closure with a specific stack configuration.
+    ///
+    /// `stack_size_str` accepts the same syntax as
+    /// [`parse_stack_size`] (`"256K"`, `"2M"`, ...) and is the stack this
+    /// closure is actually granted: the stack starts immediately below the
+    /// closure's own slot in the zero-copy buffer and grows down through
+    /// the slot's reserved stack region, stopping at the granted limit. An
+    /// unparseable or oversized request falls back to the slot's full
+    /// capacity (an oversized one is also counted in
+    /// [`crate::STACK_CLAMPED_SPAWNS`]).
+    ///
+    /// Shorthand for [`spawn_closure`] with
+    /// `ClosureSpawnOptions::new().stack_size(..)`; use that function
+    /// directly to also set the priority, per-fiber safety level or name.
+    ///
+    /// # Panics
+    /// * Panics if the runtime is not initialized.
+    /// * Panics if the context pool is exhausted.
+    #[inline]
+    pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(
+        stack_size_str: &str,
+        f: F,
+    ) -> dtact_handle_t {
+        let opts = parse_stack_size(stack_size_str)
+            .map_or_else(ClosureSpawnOptions::new, |bytes| {
+                ClosureSpawnOptions::new().stack_size(bytes)
+            });
+        spawn_closure(f, opts)
+    }
+
+    /// Spawns a fiber from a closure with the full set of spawn-time options.
+    ///
+    /// The closure path is inherently pinned to the spawning thread
+    /// (`SameThreadNoFloat` switcher): a plain `FnOnce` has no suspension
+    /// points, so it never needs to migrate, and its switcher could not
+    /// survive migration anyway. `opts.priority` therefore only affects
+    /// queue placement (a `Critical` closure jumps the local queue), and
+    /// `opts.name`/`opts.safety`/`opts.stack_size` apply exactly as they do
+    /// for a future-based fiber.
     ///
     /// # Panics
     /// * Panics if the runtime is not initialized.
     /// * Panics if the context pool is exhausted.
     #[inline]
     #[allow(clippy::cast_possible_truncation)]
-    pub fn spawn_with_stack<F: FnOnce() + Send + 'static>(
-        _stack_size_str: &str,
+    #[allow(clippy::too_many_lines)]
+    pub fn spawn_closure<F: FnOnce() + Send + 'static>(
         f: F,
+        opts: ClosureSpawnOptions,
     ) -> dtact_handle_t {
         let runtime = crate::GLOBAL_RUNTIME
             .get()
@@ -739,6 +1026,13 @@ pub mod fiber {
         #[allow(clippy::cast_possible_truncation)]
         let current_core = topology::current().core_id as usize;
 
+        let requested = opts.stack_size;
+        if let Some(bytes) = requested
+            && bytes > pool.stack_capacity
+        {
+            crate::STACK_CLAMPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+
         unsafe {
             (*ctx_ptr).state.store(
                 crate::memory_management::FiberStatus::Running as u32,
@@ -747,6 +1041,15 @@ pub mod fiber {
             (*ctx_ptr).origin_core = current_core as u16;
             (*ctx_ptr).fiber_index = ctx_id;
             (*ctx_ptr).switch_fn = crate::context_switch::switch_context_same_thread_no_float;
+            // A same-thread switcher can never be deflected; make that
+            // explicit here too so the wake path does not have to infer it.
+            (*ctx_ptr).mode = crate::common_types::TopologyMode::Pinned;
+            (*ctx_ptr).affinity = topology::Affinity::SameCore;
+            (*ctx_ptr).priority = opts.priority;
+            (*ctx_ptr).name = opts.name;
+            (*ctx_ptr).kind = crate::common_types::WorkloadKind::Compute;
+            (*ctx_ptr).adaptive_spin_count =
+                crate::common_types::WorkloadKind::Compute.spin_budget();
 
             let f_ptr = (*ctx_ptr).read_buffer_ptr.cast::<F>();
             core::ptr::write(f_ptr, f);
@@ -758,13 +1061,26 @@ pub mod fiber {
 
             // Point 1: Shadow Space Separation (Stack MUST start BELOW the 8KB Future buffer)
             let buffer_start = (*ctx_ptr).read_buffer_ptr as usize;
-            let stack_top = (buffer_start & !0xF) - 72;
-            let stack_top_ptr = stack_top as *mut u64;
+            let stack_ceiling = (buffer_start & !0xF) - 72;
+            let stack_bottom = pool.stack_bottom(ctx_id);
 
             // Point 4: "Return-to-Nowhere" Protection
+            let stack_top_ptr = stack_ceiling as *mut u64;
             core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
 
-            let stack_top = stack_top as *mut u8;
+            // Grant the requested stack. The closure occupies the bottom of
+            // the 8 KB buffer, so the whole granted region lives in the
+            // slot's reserved stack area below it — exactly what
+            // `ContextPool::new`'s `stack_size` argument reserved.
+            let stack_limit = crate::memory_management::grant_stack(
+                ctx_ptr,
+                stack_ceiling,
+                stack_bottom,
+                requested,
+                opts.safety,
+            );
+
+            let stack_top = stack_ceiling as *mut u8;
 
             #[cfg(target_arch = "x86_64")]
             {
@@ -772,14 +1088,9 @@ pub mod fiber {
                 (*ctx_ptr).regs.gprs[7] = super::fiber_entry_point as *const () as u64; // RIP
                 #[cfg(windows)]
                 {
-                    let align = 64;
-                    let context_sz =
-                        (core::mem::size_of::<crate::FiberContext>() + align - 1) & !(align - 1);
-                    let slot_base = (ctx_ptr as usize + context_sz).saturating_sub(pool.slot_size);
-
-                    (*ctx_ptr).regs.gprs[10] = buffer_start as u64; // Stack Base (top)
-                    (*ctx_ptr).regs.gprs[11] = slot_base as u64; // Stack Limit (bottom)
-                    (*ctx_ptr).regs.gprs[12] = slot_base as u64; // DeallocationStack
+                    (*ctx_ptr).regs.gprs[10] = stack_ceiling as u64; // Stack Base (top)
+                    (*ctx_ptr).regs.gprs[11] = stack_limit as u64; // Stack Limit (bottom)
+                    (*ctx_ptr).regs.gprs[12] = stack_bottom as u64; // DeallocationStack
                     (*ctx_ptr).regs.gprs[13] = 0; // ExceptionList
                 }
             }
@@ -802,14 +1113,9 @@ pub mod fiber {
                 (*ctx_ptr).regs.gprs[11] = signed_lr; // Signed x30 (LR)
                 #[cfg(windows)]
                 {
-                    let align = 64;
-                    let context_sz =
-                        (core::mem::size_of::<FiberContext>() + align - 1) & !(align - 1);
-                    let slot_base = (ctx_ptr as usize + context_sz).saturating_sub(pool.slot_size);
-
-                    (*ctx_ptr).regs.gprs[13] = buffer_start as u64; // Stack Base (top)
-                    (*ctx_ptr).regs.gprs[14] = slot_base as u64; // Stack Limit (bottom)
-                    (*ctx_ptr).regs.gprs[15] = slot_base as u64; // DeallocationStack
+                    (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base (top)
+                    (*ctx_ptr).regs.gprs[14] = stack_limit as u64; // Stack Limit (bottom)
+                    (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
                 }
             }
             #[cfg(target_arch = "riscv64")]
@@ -819,8 +1125,22 @@ pub mod fiber {
             }
         }
 
+        let r#gen = u64::from(unsafe {
+            (*ctx_ptr)
+                .generation
+                .load(core::sync::atomic::Ordering::Acquire)
+        });
         crate::wake_fiber(current_core, ctx_id);
-        dtact_handle_t(u64::from(ctx_id) | ((current_core as u64) << 32))
+        // Same handle layout as every other spawn path — `[1-bit Valid |
+        // 15-bit Generation | 16-bit CoreID | 32-bit ContextID]`. The
+        // generation and valid bit are what let `dtact_await`/`fiber_info`
+        // tell this fiber apart from a later occupant of the same slot.
+        dtact_handle_t(
+            u64::from(ctx_id)
+                | ((current_core as u64) << 32)
+                | ((r#gen & 0x7FFF) << 48)
+                | (1 << 63),
+        )
     }
 
     /// Yields execution directly to another fiber.
@@ -1088,6 +1408,66 @@ pub fn outcome(
     }
 }
 
+/// Runtime-visible metadata of a fiber, as supplied at spawn time.
+///
+/// This is what the `name`, `priority`, `kind`, `affinity` and stack-size
+/// knobs on [`SpawnBuilder`] actually turn into: the scheduler reads
+/// `priority`/`affinity` from the same context on every enqueue, and this
+/// struct exposes the whole set for telemetry, debugging and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FiberInfo {
+    /// The `&'static str` passed to [`SpawnBuilder::name`], if any.
+    pub name: Option<&'static str>,
+    /// The scheduling priority this fiber is dispatched with.
+    pub priority: Priority,
+    /// The workload kind used to seed its adaptive spin budget.
+    pub kind: WorkloadKind,
+    /// The affinity hint used by the wake/deflection path.
+    pub affinity: Affinity,
+    /// Stack bytes actually granted, after clamping to the slot.
+    pub stack_size: usize,
+    /// The worker index this fiber was spawned from.
+    pub origin_core: u16,
+}
+
+/// Reads back the spawn-time metadata of the fiber `handle` refers to.
+///
+/// Returns `None` when the runtime is not initialized or the handle's
+/// generation no longer matches (its slot has since been recycled), so a
+/// stale handle reports "gone" instead of describing an unrelated fiber.
+#[must_use]
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+pub fn fiber_info(handle: dtact_handle_t) -> Option<FiberInfo> {
+    let runtime = crate::GLOBAL_RUNTIME.get()?;
+    let handle_val = handle.0 & !(1 << 63); // Strip sentinel bit
+    #[allow(clippy::cast_possible_truncation)]
+    let ctx_id = (handle_val & 0xFFFF_FFFF) as u32;
+    let handle_gen = ((handle_val >> 48) & 0x7FFF) as u16;
+
+    let ctx = runtime.pool.get_context_ptr(ctx_id);
+    // SAFETY: every index below `capacity` maps to an initialized
+    // `FiberContext` for the pool's whole lifetime.
+    unsafe {
+        if ((*ctx)
+            .generation
+            .load(core::sync::atomic::Ordering::Acquire) as u16)
+            & 0x7FFF
+            != handle_gen
+        {
+            return None;
+        }
+        Some(FiberInfo {
+            name: (*ctx).name,
+            priority: (*ctx).priority,
+            kind: (*ctx).kind,
+            affinity: (*ctx).affinity,
+            stack_size: (*ctx).stack_size,
+            origin_core: (*ctx).origin_core,
+        })
+    }
+}
+
 /// Global Runtime Configuration and Telemetry.
 pub mod config {
     use core::sync::atomic::Ordering;
@@ -1133,6 +1513,10 @@ pub struct TaskFuture<F, S> {
     pub affinity: Affinity,
     /// The workload category/kind.
     pub kind: WorkloadKind,
+    /// Stack bytes requested by the `#[task(stack = "...")]` attribute, if
+    /// any. Resolved to a byte count at compile time, so spawning a task
+    /// costs no parsing.
+    pub stack_size: Option<usize>,
     /// Phantom data for the context switcher.
     pub _marker: core::marker::PhantomData<S>,
 }
@@ -1165,11 +1549,17 @@ pub mod spawner_traits {
             self,
             task: TaskFuture<F, S>,
         ) -> dtact_handle_t {
-            SpawnBuilder::<S>::new()
+            let builder = SpawnBuilder::<S>::new()
                 .priority(task.priority)
                 .affinity(task.affinity)
-                .kind(task.kind)
-                .spawn(task.future)
+                .kind(task.kind);
+            // `stack_size` is only overridden when the attribute asked for
+            // one; otherwise the fiber gets the slot's full capacity, same
+            // as a plain `spawn()`.
+            match task.stack_size {
+                Some(bytes) => builder.stack_size(bytes).spawn(task.future),
+                None => builder.spawn(task.future),
+            }
         }
     }
 

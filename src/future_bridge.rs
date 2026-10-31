@@ -237,6 +237,21 @@ pub fn wait_pinned<F: Future>(mut fut_pinned: Pin<&mut F>) -> F::Output {
                     .is_ok()
                 {
                     unsafe { dtact_asm_fiber_suspend(ctx_ptr) };
+
+                    // `Safety2` fibers also verify their stack-overflow
+                    // canary on every resumption, not just at termination:
+                    // an overflow is then reported at the first suspension
+                    // after it happened, while the fiber still has a chance
+                    // to unwind cleanly, instead of only at the very end.
+                    // `Safety0`/`Safety1` fibers skip this entirely — the
+                    // check is a single predictable branch on a field the
+                    // resume path already has in cache.
+                    if matches!(
+                        ctx.stack_safety,
+                        crate::memory_management::SafetyLevel::Safety2
+                    ) {
+                        ctx.check_stack_guard();
+                    }
                 }
             }
         }
