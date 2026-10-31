@@ -177,7 +177,7 @@ pub extern "C" fn dtact_abort() -> ! {
 /// # Safety
 /// `ctx_ptr` must be a claimed, exclusively-owned context whose
 /// `fiber_index` is already final.
-#[inline]
+#[inline(always)]
 unsafe fn prepare_stack(
     ctx_ptr: *mut crate::memory_management::FiberContext,
     pool: &crate::memory_management::ContextPool,
@@ -209,7 +209,7 @@ unsafe fn prepare_stack(
 ///
 /// Also accounts the request against `STACK_CLAMPED_SPAWNS` when one slot
 /// cannot hold it, exactly as the Rust spawn paths do.
-#[inline]
+#[inline(always)]
 fn resolve_spawn_extras(
     opts: &dtact_spawn_options_t,
     pool: &crate::memory_management::ContextPool,
