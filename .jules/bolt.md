@@ -4,4 +4,4 @@
 
 ## 2026-11-03 - Cross-platform CI tests qemu missing installation candidate
 **Learning:** `qemu-user-static` fails to install on latest ubuntu (`ubuntu-26.04`) in CI via `apt-get` due to having no installation candidate.
-**Action:** Replace `qemu-user-static` with `qemu-user-binfmt` in the `apt-get install` commands when targeting QEMU in cross-compilation CI pipelines.
+**Action:** Replace `qemu-user-static` with `qemu-user-binfmt` in the `apt-get install` commands when targeting QEMU in cross-compilation CI pipelines. Also, dynamically resolve the `RUNNER_CMD` by checking `command -v qemu-...-static` and falling back to `qemu-...`.
