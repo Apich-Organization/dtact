@@ -1294,13 +1294,20 @@ impl Worker {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
         let mut head = self.local_head.load(Ordering::Relaxed);
 
-        if head == self.local_tail.load(Ordering::Relaxed) {
+        // Cache local_tail locally to avoid redundant atomic loads across loop iterations.
+        // It is only reloaded from atomic memory when head == tail to check for newly enqueued tasks.
+        let mut tail = self.local_tail.load(Ordering::Relaxed);
+
+        if head == tail {
             return false;
         }
 
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
+            if head == tail {
+                tail = self.local_tail.load(Ordering::Relaxed);
+                if head == tail {
+                    break;
+                }
             }
 
             let task = unsafe {
