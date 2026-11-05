@@ -1293,14 +1293,18 @@ impl Worker {
     pub unsafe fn dispatch_loop(&self, pool: &crate::memory_management::ContextPool) -> bool {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
         let mut head = self.local_head.load(Ordering::Relaxed);
+        let mut tail = self.local_tail.load(Ordering::Relaxed);
 
-        if head == self.local_tail.load(Ordering::Relaxed) {
+        if head == tail {
             return false;
         }
 
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
+            if head == tail {
+                tail = self.local_tail.load(Ordering::Relaxed);
+                if head == tail {
+                    break;
+                }
             }
 
             let task = unsafe {
@@ -1352,6 +1356,11 @@ impl Worker {
             // Relaxed: same-thread field, and this loop is the only place
             // that stores it while a fiber is on this thread's stack.
             head = self.local_head.load(Ordering::Relaxed);
+
+            // `local_tail` might also have been updated by tasks that were
+            // pushed to the local queue by the fiber that just ran.
+            // We'll update the cached `tail` on the next loop iteration when `head == tail`
+            // to save a redundant atomic load per iteration when `tail` hasn't changed.
 
             // Optimized lifecycle state machine: handle Finished, Notified, or Suspending transitions.
             let post_state = unsafe { (*target_ptr).state.load(Ordering::Acquire) };
