@@ -1,0 +1,3 @@
+## 2026-11-06 - Avoid redundant atomic loads when indirect writes occur
+**Learning:** In the Dtact scheduler (`src/dta_scheduler.rs`), tasks executed by `dispatch_loop` can indirectly write to `local_tail` (via `push_local` or similar helper functions). When optimizing hot loops, we can avoid redundant atomic loads across loop iterations by caching `local_tail` in a local variable, and only reloading it from atomic memory when `head == tail` to accurately check for newly enqueued tasks.
+**Action:** When working on SPSC/MPMC queues in high-frequency loops where variables are mutated indirectly by helper functions, hoist the load and accumulate or accurately re-check state on exhaustion (like `head == tail`) to avoid redundant atomic reads without bypassing safety checks.
