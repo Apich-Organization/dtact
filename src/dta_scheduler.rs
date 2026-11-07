@@ -1298,9 +1298,14 @@ impl Worker {
             return false;
         }
 
+        let mut cached_tail = self.local_tail.load(Ordering::Relaxed);
+
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
+            if head == cached_tail {
+                cached_tail = self.local_tail.load(Ordering::Relaxed);
+                if head == cached_tail {
+                    break;
+                }
             }
 
             let task = unsafe {
