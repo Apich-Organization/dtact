@@ -1293,14 +1293,19 @@ impl Worker {
     pub unsafe fn dispatch_loop(&self, pool: &crate::memory_management::ContextPool) -> bool {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
         let mut head = self.local_head.load(Ordering::Relaxed);
+        let mut tail = self.local_tail.load(Ordering::Relaxed);
 
-        if head == self.local_tail.load(Ordering::Relaxed) {
+        if head == tail {
             return false;
         }
 
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
+            if head == tail {
+                // Fetch the latest tail just in case the previously executed task pushed new work
+                tail = self.local_tail.load(Ordering::Relaxed);
+                if head == tail {
+                    break;
+                }
             }
 
             let task = unsafe {
@@ -2082,12 +2087,7 @@ impl DtaScheduler {
             //    re-read mid-iteration. A one-iteration delay in leaving back-
             //    pressure mode is negligible; correctness is not affected.
             let warehouse_busy = scheduler.warehouse.is_busy();
-            let mut activity = if warehouse_busy {
-                // Drain FIRST so we have tasks before dispatching.
-                scheduler.drain_warehouse(current_core)
-            } else {
-                false
-            };
+            let mut activity = warehouse_busy && scheduler.drain_warehouse(current_core);
 
             // 1. Dispatch local tasks (all local queue accesses are Relaxed — single thread).
             //    dispatch_loop now returns whether it executed anything, so we
