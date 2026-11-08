@@ -309,7 +309,7 @@ pub unsafe extern "C" fn dtact_fiber_launch(
         // -72 ensures that RSP is 16-byte aligned + 8, which is required by the Windows x64 ABI.
         // `prepare_stack` then grants the fiber its stack budget inside the
         // slot's reserved region, exactly as the Rust spawn paths do.
-        let (stack_ceiling, stack_limit, stack_bottom) =
+        let (stack_ceiling, _stack_limit, _stack_bottom) =
             prepare_stack(ctx_ptr, pool, None, pool.safety_level());
         let stack_top = stack_ceiling as *mut u8;
 
@@ -441,7 +441,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
         };
 
         let (requested, safety) = resolve_spawn_extras(&opts, pool);
-        let (stack_ceiling, stack_limit, stack_bottom) =
+        let (stack_ceiling, _stack_limit, _stack_bottom) =
             prepare_stack(ctx_ptr, pool, requested, safety);
         let stack_top = stack_ceiling as *mut u8;
 
@@ -552,7 +552,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
         };
 
         // ABI-Compliant Stack Alignment & Poisoning
-        let (stack_ceiling, stack_limit, stack_bottom) =
+        let (stack_ceiling, _stack_limit, _stack_bottom) =
             prepare_stack(ctx_ptr, pool, None, pool.safety_level());
         let stack_top = stack_ceiling as *mut u8;
 
@@ -687,7 +687,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
         };
 
         let (requested, safety) = resolve_spawn_extras(&opts, pool);
-        let (stack_ceiling, stack_limit, stack_bottom) =
+        let (stack_ceiling, _stack_limit, _stack_bottom) =
             prepare_stack(ctx_ptr, pool, requested, safety);
         let stack_top = stack_ceiling as *mut u8;
 

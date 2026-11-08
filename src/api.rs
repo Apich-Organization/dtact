@@ -475,7 +475,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             {
                 crate::STACK_CLAMPED_SPAWNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             }
-            let stack_limit = crate::memory_management::grant_stack(
+            let _stack_limit = crate::memory_management::grant_stack(
                 ctx_ptr,
                 stack_ceiling,
                 stack_bottom,
@@ -1072,7 +1072,7 @@ pub mod fiber {
             // the 8 KB buffer, so the whole granted region lives in the
             // slot's reserved stack area below it — exactly what
             // `ContextPool::new`'s `stack_size` argument reserved.
-            let stack_limit = crate::memory_management::grant_stack(
+            let _stack_limit = crate::memory_management::grant_stack(
                 ctx_ptr,
                 stack_ceiling,
                 stack_bottom,
