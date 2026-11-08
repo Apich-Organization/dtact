@@ -54,9 +54,15 @@ jobs:
           version: "0.13.0"
 
       - name: Install Dependencies
+        shell: bash
         run: |
           cargo install cargo-zigbuild --locked
-          sudo apt-get update && sudo apt-get install -y qemu-user-static libc6-arm64-cross libc6-riscv64-cross gcc-riscv64-linux-gnu
+          if [ "$RUNNER_OS" == "Linux" ]; then
+            sudo apt-get update || true
+            sudo apt-get install -y qemu-user-static || true
+            sudo apt-get install -y gcc-aarch64-linux-gnu libc6-arm64-cross libc6-dev-arm64-cross || true
+            sudo apt-get install -y gcc-riscv64-linux-gnu libc6-riscv64-cross libc6-dev-riscv64-cross || true
+          fi
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
