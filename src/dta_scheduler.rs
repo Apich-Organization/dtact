@@ -1294,13 +1294,22 @@ impl Worker {
         // Relaxed: local_head and local_tail are only accessed by this worker thread.
         let mut head = self.local_head.load(Ordering::Relaxed);
 
-        if head == self.local_tail.load(Ordering::Relaxed) {
+        // Cache local_tail locally. Tasks executed by this loop can indirectly write to
+        // local_tail via push_local, so we only reload from atomic memory when head == tail
+        // to check for newly enqueued tasks, avoiding redundant atomic loads across iterations.
+        let mut tail = self.local_tail.load(Ordering::Relaxed);
+
+        if head == tail {
             return false;
         }
 
         loop {
-            if head == self.local_tail.load(Ordering::Relaxed) {
-                break;
+            if head == tail {
+                // Reload tail in case fibers pushed new tasks (e.g. spawned children)
+                tail = self.local_tail.load(Ordering::Relaxed);
+                if head == tail {
+                    break;
+                }
             }
 
             let task = unsafe {
@@ -2082,12 +2091,8 @@ impl DtaScheduler {
             //    re-read mid-iteration. A one-iteration delay in leaving back-
             //    pressure mode is negligible; correctness is not affected.
             let warehouse_busy = scheduler.warehouse.is_busy();
-            let mut activity = if warehouse_busy {
-                // Drain FIRST so we have tasks before dispatching.
-                scheduler.drain_warehouse(current_core)
-            } else {
-                false
-            };
+            // Drain FIRST so we have tasks before dispatching.
+            let mut activity = warehouse_busy && scheduler.drain_warehouse(current_core);
 
             // 1. Dispatch local tasks (all local queue accesses are Relaxed — single thread).
             //    dispatch_loop now returns whether it executed anything, so we
