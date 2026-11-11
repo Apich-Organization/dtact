@@ -1,0 +1,12 @@
+<<<<<<< SEARCH
+    pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
+=======
+    #[allow(clippy::future_not_send)]
+    pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    pub async fn recv(&mut self) -> Option<T> {
+=======
+    #[allow(clippy::future_not_send)]
+    pub async fn recv(&mut self) -> Option<T> {
+>>>>>>> REPLACE
