@@ -1902,3 +1902,211 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
         "ret"
     );
 }
+
+// ============================================================================
+// LOONGARCH64
+// ============================================================================
+
+/// Switches execution context while preserving floating-point state (LoongArch64).
+///
+/// Preserves callee-saved GPRs (fp, s0-s8), stack pointer (sp), return address (ra),
+/// the FP control/status register (fcsr0, holding the rounding mode), and floating-point registers (fs0-fs7).
+///
+/// # Arguments
+/// * `save` (a0): Pointer to `Registers`.
+/// * `restore` (a1): Pointer to `Registers`.
+#[cfg(all(target_arch = "loongarch64", unix))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context_cross_thread_float(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "st.d $sp, $a0, 0",
+        "st.d $fp, $a0, 8",
+        "st.d $s0, $a0, 16",
+        "st.d $s1, $a0, 24",
+        "st.d $s2, $a0, 32",
+        "st.d $s3, $a0, 40",
+        "st.d $s4, $a0, 48",
+        "st.d $s5, $a0, 56",
+        "st.d $s6, $a0, 64",
+        "st.d $s7, $a0, 72",
+        "st.d $s8, $a0, 80",
+        "st.d $ra, $a0, 104",
+        "movfcsr2gr $t0, $fcsr0",
+        "st.d $t0, $a0, 112",
+        "fst.d $fs0, $a0, 128",
+        "fst.d $fs1, $a0, 136",
+        "fst.d $fs2, $a0, 144",
+        "fst.d $fs3, $a0, 152",
+        "fst.d $fs4, $a0, 160",
+        "fst.d $fs5, $a0, 168",
+        "fst.d $fs6, $a0, 176",
+        "fst.d $fs7, $a0, 184",
+        "ld.d $fp, $a1, 8",
+        "ld.d $s0, $a1, 16",
+        "ld.d $s1, $a1, 24",
+        "ld.d $s2, $a1, 32",
+        "ld.d $s3, $a1, 40",
+        "ld.d $s4, $a1, 48",
+        "ld.d $s5, $a1, 56",
+        "ld.d $s6, $a1, 64",
+        "ld.d $s7, $a1, 72",
+        "ld.d $s8, $a1, 80",
+        "ld.d $ra, $a1, 104",
+        "ld.d $t0, $a1, 112",
+        "movgr2fcsr $fcsr0, $t0",
+        "fld.d $fs0, $a1, 128",
+        "fld.d $fs1, $a1, 136",
+        "fld.d $fs2, $a1, 144",
+        "fld.d $fs3, $a1, 152",
+        "fld.d $fs4, $a1, 160",
+        "fld.d $fs5, $a1, 168",
+        "fld.d $fs6, $a1, 176",
+        "fld.d $fs7, $a1, 184",
+        "ld.d $sp, $a1, 0",
+        "jr $ra",
+    );
+}
+
+/// Switches execution context without preserving floating-point state (LoongArch64).
+///
+/// Preserves only callee-saved GPRs (fp, s0-s8), stack pointer (sp), and return
+/// address (ra). Floating-point registers (fs0-fs7) and fcsr0 are not preserved; fibers switched
+/// with this variant must not rely on floating-point state across context switches.
+///
+/// # Arguments
+/// * `save` (a0): Pointer to `Registers`.
+/// * `restore` (a1): Pointer to `Registers`.
+#[cfg(all(target_arch = "loongarch64", unix))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context_cross_thread_no_float(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "st.d $sp, $a0, 0",
+        "st.d $fp, $a0, 8",
+        "st.d $s0, $a0, 16",
+        "st.d $s1, $a0, 24",
+        "st.d $s2, $a0, 32",
+        "st.d $s3, $a0, 40",
+        "st.d $s4, $a0, 48",
+        "st.d $s5, $a0, 56",
+        "st.d $s6, $a0, 64",
+        "st.d $s7, $a0, 72",
+        "st.d $s8, $a0, 80",
+        "st.d $ra, $a0, 104",
+        "ld.d $fp, $a1, 8",
+        "ld.d $s0, $a1, 16",
+        "ld.d $s1, $a1, 24",
+        "ld.d $s2, $a1, 32",
+        "ld.d $s3, $a1, 40",
+        "ld.d $s4, $a1, 48",
+        "ld.d $s5, $a1, 56",
+        "ld.d $s6, $a1, 64",
+        "ld.d $s7, $a1, 72",
+        "ld.d $s8, $a1, 80",
+        "ld.d $ra, $a1, 104",
+        "ld.d $sp, $a1, 0",
+        "jr $ra",
+    );
+}
+
+/// Lightweight context switch for fibers pinned to the current thread (LoongArch64).
+///
+/// LoongArch64 has no OS-specific thread metadata (TIB/TEB), so this is identical
+/// to the cross-thread variant and preserves the same callee-saved register set.
+#[cfg(all(target_arch = "loongarch64", unix))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context_same_thread_float(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "st.d $sp, $a0, 0",
+        "st.d $fp, $a0, 8",
+        "st.d $s0, $a0, 16",
+        "st.d $s1, $a0, 24",
+        "st.d $s2, $a0, 32",
+        "st.d $s3, $a0, 40",
+        "st.d $s4, $a0, 48",
+        "st.d $s5, $a0, 56",
+        "st.d $s6, $a0, 64",
+        "st.d $s7, $a0, 72",
+        "st.d $s8, $a0, 80",
+        "st.d $ra, $a0, 104",
+        "movfcsr2gr $t0, $fcsr0",
+        "st.d $t0, $a0, 112",
+        "fst.d $fs0, $a0, 128",
+        "fst.d $fs1, $a0, 136",
+        "fst.d $fs2, $a0, 144",
+        "fst.d $fs3, $a0, 152",
+        "fst.d $fs4, $a0, 160",
+        "fst.d $fs5, $a0, 168",
+        "fst.d $fs6, $a0, 176",
+        "fst.d $fs7, $a0, 184",
+        "ld.d $fp, $a1, 8",
+        "ld.d $s0, $a1, 16",
+        "ld.d $s1, $a1, 24",
+        "ld.d $s2, $a1, 32",
+        "ld.d $s3, $a1, 40",
+        "ld.d $s4, $a1, 48",
+        "ld.d $s5, $a1, 56",
+        "ld.d $s6, $a1, 64",
+        "ld.d $s7, $a1, 72",
+        "ld.d $s8, $a1, 80",
+        "ld.d $ra, $a1, 104",
+        "ld.d $t0, $a1, 112",
+        "movgr2fcsr $fcsr0, $t0",
+        "fld.d $fs0, $a1, 128",
+        "fld.d $fs1, $a1, 136",
+        "fld.d $fs2, $a1, 144",
+        "fld.d $fs3, $a1, 152",
+        "fld.d $fs4, $a1, 160",
+        "fld.d $fs5, $a1, 168",
+        "fld.d $fs6, $a1, 176",
+        "fld.d $fs7, $a1, 184",
+        "ld.d $sp, $a1, 0",
+        "jr $ra",
+    );
+}
+
+/// The fastest possible context switch: same-thread and no floating-point (LoongArch64).
+///
+/// Preserves only callee-saved GPRs, stack pointer, and return address.
+#[cfg(all(target_arch = "loongarch64", unix))]
+#[unsafe(naked)]
+pub unsafe extern "C" fn switch_context_same_thread_no_float(
+    save: *mut Registers,
+    restore: *const Registers,
+) {
+    naked_asm!(
+        "st.d $sp, $a0, 0",
+        "st.d $fp, $a0, 8",
+        "st.d $s0, $a0, 16",
+        "st.d $s1, $a0, 24",
+        "st.d $s2, $a0, 32",
+        "st.d $s3, $a0, 40",
+        "st.d $s4, $a0, 48",
+        "st.d $s5, $a0, 56",
+        "st.d $s6, $a0, 64",
+        "st.d $s7, $a0, 72",
+        "st.d $s8, $a0, 80",
+        "st.d $ra, $a0, 104",
+        "ld.d $fp, $a1, 8",
+        "ld.d $s0, $a1, 16",
+        "ld.d $s1, $a1, 24",
+        "ld.d $s2, $a1, 32",
+        "ld.d $s3, $a1, 40",
+        "ld.d $s4, $a1, 48",
+        "ld.d $s5, $a1, 56",
+        "ld.d $s6, $a1, 64",
+        "ld.d $s7, $a1, 72",
+        "ld.d $s8, $a1, 80",
+        "ld.d $ra, $a1, 104",
+        "ld.d $sp, $a1, 0",
+        "jr $ra",
+    );
+}

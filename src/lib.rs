@@ -1,7 +1,7 @@
 //! # Dtact-V3: Distributed Task-Aware Coroutine Toolkit
 //!
 //! Dtact is a high-performance, low-latency asynchronous runtime designed for systems-level
-//! programming across heterogeneous architectures (`x86_64`, `AArch64`, `RISC-V`).
+//! programming across heterogeneous architectures (`x86_64`, `AArch64`, `RISC-V`, `LoongArch64`).
 //!
 //! ## Core Architecture
 //! 1. **Lock-Free Arena**: A page-aligned memory pool for fiber contexts, providing O(1) allocation

@@ -80,8 +80,11 @@ tokio = { version = "1.52", features = [
     "process",
 ], optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", not(target_arch = "loongarch64")))'.dependencies]
 io-uring = { version = "0.7", features = ["direct-syscall"], optional = true }
+
+[target.'cfg(all(target_os = "linux", target_arch = "loongarch64"))'.dependencies]
+io-uring = { version = "0.7", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

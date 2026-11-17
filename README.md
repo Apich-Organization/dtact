@@ -24,6 +24,7 @@ Dtact explores an alternative approach to asynchronous execution by leveraging s
 * **Zero-Copy Future Migration**: For Rust users, Dtact attempts to place `Future` payloads directly onto the pre-allocated stack of the fiber. This zero-copy approach helps minimize heap allocations for small-to-medium futures.
 * **Cross-Language FFI**: Since fibers have their own stacks, they integrate naturally with foreign function interfaces. Dtact provides a C-FFI out of the box, allowing C and C++ code to seamlessly launch and await fibers.
 * **Customizable Context Switchers**: Dtact provides different assembly-level context switchers (e.g., floating-point vs. no-floating-point preservation, cross-thread vs. same-thread) to allow developers to tailor the cost of a context switch to their specific workload.
+* **Multi-Architecture Runtime**: Native context switching is available on x86_64, AArch64, RISC-V 64, and LoongArch64.
 
 ## Performance Characteristics
 
