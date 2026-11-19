@@ -149,3 +149,56 @@ fn test_future_resolved_via_wait_ext() {
     dtact_await(handle);
     assert_eq!(result.load(Ordering::SeqCst), 77);
 }
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn read_fcsr0() -> u32 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("movfcsr2gr {value}, $fcsr0", value = out(reg) value);
+    }
+    value as u32
+}
+
+#[cfg(target_arch = "loongarch64")]
+#[inline]
+fn write_fcsr0(value: u32) {
+    unsafe {
+        core::arch::asm!(
+            "movgr2fcsr $fcsr0, {value}",
+            value = in(reg) u64::from(value)
+        );
+    }
+}
+
+#[test]
+#[cfg(target_arch = "loongarch64")]
+#[cfg_attr(miri, ignore)]
+fn test_loongarch_float_switcher_preserves_fcsr0() {
+    common::init_runtime();
+    let observed_rounding_mode = Arc::new(AtomicU32::new(u32::MAX));
+    let observed = observed_rounding_mode.clone();
+
+    let handle = spawn_with()
+        .switcher::<SameThreadFloat>()
+        .spawn(async move {
+            const ROUNDING_MODE_MASK: u32 = 0b11 << 8;
+            const ROUND_TOWARD_ZERO: u32 = 0b01 << 8;
+
+            let original = read_fcsr0();
+            let modified = (original & !ROUNDING_MODE_MASK) | ROUND_TOWARD_ZERO;
+            write_fcsr0(modified);
+            yield_now().await;
+            let restored = read_fcsr0();
+            write_fcsr0(original);
+
+            observed.store(restored & ROUNDING_MODE_MASK, Ordering::SeqCst);
+        });
+
+    dtact_await(handle);
+    assert_eq!(
+        observed_rounding_mode.load(Ordering::SeqCst),
+        0b01 << 8,
+        "FCSR0 rounding mode was not restored after yielding"
+    );
+}

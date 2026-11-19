@@ -828,6 +828,20 @@ fn warehouse_backoff(worker_id: usize, retry: u32) {
         );
     }
 
+    // LoongArch64 — `addi.d` with -1, branch-if-nonzero.
+    #[cfg(target_arch = "loongarch64")]
+    // SAFETY: pure counted NOP loop; touches only the counter register.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "nop",
+            "addi.d {n}, {n}, -1",
+            "bnez {n}, 2b",
+            n = inout(reg) cycles => _,
+            options(nostack),
+        );
+    }
+
     // Fallback for architectures without hand-written asm.
     // `black_box` prevents the compiler from eliminating the loop body as a
     // dead no-op; actual timing accuracy is best-effort on this path.
@@ -835,7 +849,8 @@ fn warehouse_backoff(worker_id: usize, retry: u32) {
         target_arch = "x86",
         target_arch = "x86_64",
         target_arch = "aarch64",
-        target_arch = "riscv64"
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
     )))]
     {
         for i in 0_u64..cycles {
@@ -1321,6 +1336,10 @@ impl Worker {
             #[cfg(target_arch = "aarch64")]
             unsafe {
                 core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) target_ptr, options(nostack, preserves_flags));
+            }
+            #[cfg(target_arch = "loongarch64")]
+            unsafe {
+                core::arch::asm!("preld 0, {0}, 0", in(reg) target_ptr, options(nostack, preserves_flags));
             }
             #[cfg(all(target_arch = "riscv64", feature = "hw-acceleration"))]
             unsafe {

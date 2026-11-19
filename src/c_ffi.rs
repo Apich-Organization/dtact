@@ -336,7 +336,7 @@ pub unsafe extern "C" fn dtact_fiber_launch(
                 (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
             }
         }
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64; // SP
             (*ctx_ptr).regs.gprs[13] = crate::api::fiber_entry_point as *const () as u64; // RA
@@ -468,7 +468,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
                 (*ctx_ptr).regs.gprs[15] = stack_bottom as u64;
             }
         }
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64;
             (*ctx_ptr).regs.gprs[13] = crate::api::fiber_entry_point as *const () as u64;
@@ -579,7 +579,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
                 (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
             }
         }
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64; // SP
             (*ctx_ptr).regs.gprs[13] = crate::api::fiber_entry_point as *const () as u64; // RA
@@ -714,7 +714,7 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
                 (*ctx_ptr).regs.gprs[15] = stack_bottom as u64;
             }
         }
-        #[cfg(target_arch = "riscv64")]
+        #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64;
             (*ctx_ptr).regs.gprs[13] = crate::api::fiber_entry_point as *const () as u64;

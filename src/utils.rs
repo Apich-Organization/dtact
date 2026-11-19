@@ -22,10 +22,22 @@ pub fn rdtsc() -> u64 {
         core::arch::asm!("rdcycle {0}", out(reg) cycles);
         cycles
     }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        let cycles: u64;
+        // `rdtime.d` reads the Stable Counter value into `rd` and the Counter ID into `rj`.
+        core::arch::asm!(
+            "rdtime.d {cycles}, {counter_id}",
+            cycles = out(reg) cycles,
+            counter_id = out(reg) _,
+        );
+        cycles
+    }
     #[cfg(not(any(
         target_arch = "x86_64",
         target_arch = "aarch64",
-        target_arch = "riscv64"
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
     )))]
     {
         0

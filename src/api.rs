@@ -540,7 +540,7 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                     (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
                 }
             }
-            #[cfg(target_arch = "riscv64")]
+            #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
             {
                 (*ctx_ptr).regs.gprs[0] = stack_top as u64; // SP
                 (*ctx_ptr).regs.gprs[13] = fiber_entry_point as *const () as u64; // RA
@@ -1118,7 +1118,7 @@ pub mod fiber {
                     (*ctx_ptr).regs.gprs[15] = stack_bottom as u64; // DeallocationStack
                 }
             }
-            #[cfg(target_arch = "riscv64")]
+            #[cfg(any(target_arch = "riscv64", target_arch = "loongarch64"))]
             {
                 (*ctx_ptr).regs.gprs[0] = stack_top as u64; // SP
                 (*ctx_ptr).regs.gprs[13] = super::fiber_entry_point as *const () as u64; // RA
@@ -1188,6 +1188,8 @@ pub mod hw {
         unsafe {
             core::arch::asm!("cbo.clean 0({0})", in(reg) ptr);
         }
+        #[cfg(target_arch = "loongarch64")]
+        let _ = ptr;
     }
 
     /// User-mode interrupt wakeup signal
@@ -1211,6 +1213,8 @@ pub mod hw {
         unsafe {
             core::arch::asm!("csrw uipi, {0}", in(reg) target_cpu);
         }
+        #[cfg(target_arch = "loongarch64")]
+        let _ = target_cpu;
     }
 }
 
