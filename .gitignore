@@ -28,8 +28,6 @@ examples/c_async.exe
 windows_fixes.patch
 clean_fixes.patch
 examples/dtact.dll
-web/dist
-web/target
 .workbuddy-ai/
 
 **/*.aux
