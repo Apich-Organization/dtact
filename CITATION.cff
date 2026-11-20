@@ -18,7 +18,7 @@ identifiers:
   - type: doi
     value: 10.5281/zenodo.20002105
 repository-code: 'https://github.com/Apich-Organization/dtact'
-url: 'https://dtact.apich.org'
+url: 'https://apich.org/projects/dtact/'
 repository-artifact: 'https://github.com/Apich-Organization/dtact/releases'
 abstract: >-
   Dtact is a non-preemptive, stackful coroutine (fiber)
