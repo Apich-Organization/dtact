@@ -489,6 +489,18 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
             let stack_top = stack_ceiling & !0xF;
 
+            debug_assert!(
+                (stack_top as usize) > stack_limit && stack_limit >= stack_bottom,
+                "DTA-V3 invariant: initial stack bounds invalid (top: {:#x}, limit: {:#x}, bottom: {:#x})",
+                stack_top as usize,
+                stack_limit,
+                stack_bottom
+            );
+
+            (*ctx_ptr).tib_stack_limit = stack_limit;
+            (*ctx_ptr).tib_stack_base = stack_ceiling;
+            (*ctx_ptr).stack_ptr = stack_top;
+
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             let stack_top_ptr = stack_top as *mut u64;
 
@@ -517,22 +529,11 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
             }
             #[cfg(target_arch = "aarch64")]
             {
-                let lr = fiber_entry_point as *const () as u64;
                 let sp = stack_top as u64;
-                #[allow(unused)]
-                let mut signed_lr = lr;
-                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened",))]
-                core::arch::asm!(
-                    "mov x16, {lr}",
-                    "mov x17, {sp}",
-                    ".inst 0xDAC10230", // pacia x16, x17
-                    "mov {lr}, x16",
-                    lr = inout(reg) signed_lr,
-                    sp = in(reg) sp,
-                    out("x16") _, out("x17") _,
-                );
+                (*ctx_ptr).regs.gprs[10] = 0; // x29 (FP)
                 (*ctx_ptr).regs.gprs[12] = sp; // SP
-                (*ctx_ptr).regs.gprs[11] = signed_lr; // Signed x30 (LR)
+                (*ctx_ptr).regs.gprs[11] =
+                    sign_aarch64_lr(fiber_trampoline as *const () as u64, sp);
                 #[cfg(windows)]
                 {
                     (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base (top)
@@ -563,6 +564,50 @@ impl<S: ContextSwitcher> SpawnBuilder<S> {
                 | (1 << 63),
         )
     }
+}
+
+/// Signs an initial AArch64 link register (`lr`) with `sp` using `pacia1716`.
+///
+/// Uses `pacia1716` (`HINT #8`, `0xD503211F`) rather than `pacia x16, x17`,
+/// because `HINT`-space instructions are guaranteed to execute as `NOP` on
+/// AArch64 cores without Pointer Authentication (`FEAT_PAuth`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub(crate) unsafe fn sign_aarch64_lr(mut lr: u64, sp: u64) -> u64 {
+    unsafe {
+        core::arch::asm!(
+            "mov x17, {lr}",
+            "mov x16, {sp}",
+            ".inst 0xD503211F", // pacia1716 (HINT #8)
+            "mov {lr}, x17",
+            lr = inout(reg) lr,
+            sp = in(reg) sp,
+            out("x16") _,
+            out("x17") _,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    lr
+}
+
+/// Naked entry trampoline for AArch64 fibers.
+///
+/// Clears the frame pointer (`x29`) and link register (`x30`) before
+/// branching to [`fiber_entry_point`]. Because `switch_context_*` enters
+/// a new fiber via `ret` (jumping to `x30`), entering `fiber_entry_point`
+/// directly leaves `x30 == fiber_entry_point`, which causes stack unwinders
+/// (such as `libunwind` on macOS during `RUST_BACKTRACE=1`) to loop on
+/// `fiber_entry_point` and dereference a null or stale frame pointer.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn fiber_trampoline() {
+    core::arch::naked_asm!(
+        "bti c",
+        "mov x29, #0",
+        "mov x30, #0",
+        "b {entry}",
+        entry = sym fiber_entry_point,
+    );
 }
 
 pub(crate) unsafe extern "C" fn fiber_entry_point() {
@@ -1082,6 +1127,18 @@ pub mod fiber {
 
             let stack_top = stack_ceiling as *mut u8;
 
+            debug_assert!(
+                (stack_top as usize) > stack_limit && stack_limit >= stack_bottom,
+                "DTA-V3 invariant: initial stack bounds invalid (top: {:#x}, limit: {:#x}, bottom: {:#x})",
+                stack_top as usize,
+                stack_limit,
+                stack_bottom
+            );
+
+            (*ctx_ptr).tib_stack_limit = stack_limit;
+            (*ctx_ptr).tib_stack_base = stack_ceiling;
+            (*ctx_ptr).stack_ptr = stack_top as usize;
+
             #[cfg(target_arch = "x86_64")]
             {
                 (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
@@ -1096,21 +1153,11 @@ pub mod fiber {
             }
             #[cfg(target_arch = "aarch64")]
             {
-                let lr = super::fiber_entry_point as *const () as u64;
                 let sp = stack_top as u64;
-                let mut signed_lr = lr;
-                #[cfg(all(target_arch = "aarch64", unix, feature = "security-hardened",))]
-                core::arch::asm!(
-                    "mov x16, {lr}",
-                    "mov x17, {sp}",
-                    ".inst 0xDAC10230", // pacia x16, x17
-                    "mov {lr}, x16",
-                    lr = inout(reg) signed_lr,
-                    sp = in(reg) sp,
-                    out("x16") _, out("x17") _,
-                );
+                (*ctx_ptr).regs.gprs[10] = 0; // x29 (FP)
                 (*ctx_ptr).regs.gprs[12] = sp; // SP
-                (*ctx_ptr).regs.gprs[11] = signed_lr; // Signed x30 (LR)
+                (*ctx_ptr).regs.gprs[11] =
+                    super::sign_aarch64_lr(super::fiber_trampoline as *const () as u64, sp);
                 #[cfg(windows)]
                 {
                     (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base (top)

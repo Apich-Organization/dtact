@@ -441,11 +441,7 @@ impl DtaHarness {
             }
 
             let warehouse_busy = self.scheduler.warehouse.is_busy();
-            let mut activity = if warehouse_busy {
-                self.scheduler.drain_warehouse(core)
-            } else {
-                false
-            };
+            let mut activity = warehouse_busy && self.scheduler.drain_warehouse(core);
 
             let worker = unsafe { &*self.scheduler.workers[core].get() };
             loop {

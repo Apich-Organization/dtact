@@ -70,10 +70,6 @@ debug-assertions = false
 overflow-checks = false
 incremental = true
 
-[profile.release.package.dtact-web]
-opt-level = 'z'
-codegen-units = 1
-
 [profile.dev]
 lto = false
 opt-level = 0
@@ -84,7 +80,6 @@ default = []
 hw-acceleration = []
 hypervisor = []
 windows-root = []
-security-hardened = []
 kernel = []
 cooperative-yield = []
 # Academic-only: builds the pure-work-stealing comparison baseline and the
