@@ -1106,12 +1106,18 @@ pub mod fiber {
 
             // Point 1: Shadow Space Separation (Stack MUST start BELOW the 8KB Future buffer)
             let buffer_start = (*ctx_ptr).read_buffer_ptr as usize;
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             let stack_ceiling = (buffer_start & !0xF) - 72;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            let stack_ceiling = (buffer_start & !0xF) - 80;
             let stack_bottom = pool.stack_bottom(ctx_id);
 
             // Point 4: "Return-to-Nowhere" Protection
-            let stack_top_ptr = stack_ceiling as *mut u64;
-            core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                let stack_top_ptr = stack_ceiling as *mut u64;
+                core::ptr::write(stack_top_ptr, crate::c_ffi::dtact_abort as *const () as u64);
+            }
 
             // Grant the requested stack. The closure occupies the bottom of
             // the 8 KB buffer, so the whole granted region lives in the

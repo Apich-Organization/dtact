@@ -75,7 +75,7 @@ jobs:
           #!/bin/bash
           args=()
           for arg in "\$@"; do
-            if [[ "\$arg" == --target=* ]]; then
+            if [[ "\$arg" == --target=* || "\$arg" == "-Wl,--fix-cortex-a53-843419" || "\$arg" == "--fix-cortex-a53-843419" ]]; then
               continue
             fi
             args+=("\$arg")
@@ -88,7 +88,7 @@ jobs:
           #!/bin/bash
           args=()
           for arg in "\$@"; do
-            if [[ "\$arg" == --target=* ]]; then
+            if [[ "\$arg" == --target=* || "\$arg" == "-Wl,--fix-cortex-a53-843419" || "\$arg" == "--fix-cortex-a53-843419" ]]; then
               continue
             fi
             args+=("\$arg")
@@ -142,4 +142,10 @@ jobs:
           fi
 
           cargo build --target ${{ matrix.platform }} --no-default-features --tests
-          cargo test --target ${{ matrix.platform }} --no-default-features
+          if [ -n "${{ matrix.qemu_arch }}" ]; then
+            # QEMU user-mode does not emulate io_uring_setup (ENOSYS), which
+            # the README.md doctest exercises via dtact-util's native backend.
+            cargo test --target ${{ matrix.platform }} --no-default-features --lib --tests
+          else
+            cargo test --target ${{ matrix.platform }} --no-default-features
+          fi
