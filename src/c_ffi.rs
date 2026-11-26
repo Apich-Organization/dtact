@@ -313,6 +313,18 @@ pub unsafe extern "C" fn dtact_fiber_launch(
             prepare_stack(ctx_ptr, pool, None, pool.safety_level());
         let stack_top = stack_ceiling as *mut u8;
 
+        debug_assert!(
+            (stack_top as usize) > stack_limit && stack_limit >= stack_bottom,
+            "DTA-V3 invariant: initial stack bounds invalid (top: {:#x}, limit: {:#x}, bottom: {:#x})",
+            stack_top as usize,
+            stack_limit,
+            stack_bottom
+        );
+
+        (*ctx_ptr).tib_stack_limit = stack_limit;
+        (*ctx_ptr).tib_stack_base = stack_ceiling;
+        (*ctx_ptr).stack_ptr = stack_top as usize;
+
         #[cfg(target_arch = "x86_64")]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
@@ -327,8 +339,11 @@ pub unsafe extern "C" fn dtact_fiber_launch(
         }
         #[cfg(target_arch = "aarch64")]
         {
-            (*ctx_ptr).regs.gprs[12] = stack_top as u64; // SP
-            (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64; // x30 (LR)
+            let sp = stack_top as u64;
+            (*ctx_ptr).regs.gprs[10] = 0; // x29 (FP)
+            (*ctx_ptr).regs.gprs[12] = sp; // SP
+            (*ctx_ptr).regs.gprs[11] =
+                crate::api::sign_aarch64_lr(crate::api::fiber_trampoline as *const () as u64, sp);
             #[cfg(windows)]
             {
                 (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base
@@ -445,6 +460,18 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
             prepare_stack(ctx_ptr, pool, requested, safety);
         let stack_top = stack_ceiling as *mut u8;
 
+        debug_assert!(
+            (stack_top as usize) > stack_limit && stack_limit >= stack_bottom,
+            "DTA-V3 invariant: initial stack bounds invalid (top: {:#x}, limit: {:#x}, bottom: {:#x})",
+            stack_top as usize,
+            stack_limit,
+            stack_bottom
+        );
+
+        (*ctx_ptr).tib_stack_limit = stack_limit;
+        (*ctx_ptr).tib_stack_base = stack_ceiling;
+        (*ctx_ptr).stack_ptr = stack_top as usize;
+
         #[cfg(target_arch = "x86_64")]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64;
@@ -459,8 +486,11 @@ pub unsafe extern "C" fn dtact_fiber_launch_ext(
         }
         #[cfg(target_arch = "aarch64")]
         {
-            (*ctx_ptr).regs.gprs[12] = stack_top as u64;
-            (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64;
+            let sp = stack_top as u64;
+            (*ctx_ptr).regs.gprs[10] = 0;
+            (*ctx_ptr).regs.gprs[12] = sp;
+            (*ctx_ptr).regs.gprs[11] =
+                crate::api::sign_aarch64_lr(crate::api::fiber_trampoline as *const () as u64, sp);
             #[cfg(windows)]
             {
                 (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64;
@@ -556,6 +586,18 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
             prepare_stack(ctx_ptr, pool, None, pool.safety_level());
         let stack_top = stack_ceiling as *mut u8;
 
+        debug_assert!(
+            (stack_top as usize) > stack_limit && stack_limit >= stack_bottom,
+            "DTA-V3 invariant: initial stack bounds invalid (top: {:#x}, limit: {:#x}, bottom: {:#x})",
+            stack_top as usize,
+            stack_limit,
+            stack_bottom
+        );
+
+        (*ctx_ptr).tib_stack_limit = stack_limit;
+        (*ctx_ptr).tib_stack_base = stack_ceiling;
+        (*ctx_ptr).stack_ptr = stack_top as usize;
+
         #[cfg(target_arch = "x86_64")]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64; // RSP
@@ -570,8 +612,11 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup(
         }
         #[cfg(target_arch = "aarch64")]
         {
-            (*ctx_ptr).regs.gprs[12] = stack_top as u64; // SP
-            (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64; // x30 (LR)
+            let sp = stack_top as u64;
+            (*ctx_ptr).regs.gprs[10] = 0; // x29 (FP)
+            (*ctx_ptr).regs.gprs[12] = sp; // SP
+            (*ctx_ptr).regs.gprs[11] =
+                crate::api::sign_aarch64_lr(crate::api::fiber_trampoline as *const () as u64, sp);
             #[cfg(windows)]
             {
                 (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64; // Stack Base
@@ -691,6 +736,18 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
             prepare_stack(ctx_ptr, pool, requested, safety);
         let stack_top = stack_ceiling as *mut u8;
 
+        debug_assert!(
+            (stack_top as usize) > stack_limit && stack_limit >= stack_bottom,
+            "DTA-V3 invariant: initial stack bounds invalid (top: {:#x}, limit: {:#x}, bottom: {:#x})",
+            stack_top as usize,
+            stack_limit,
+            stack_bottom
+        );
+
+        (*ctx_ptr).tib_stack_limit = stack_limit;
+        (*ctx_ptr).tib_stack_base = stack_ceiling;
+        (*ctx_ptr).stack_ptr = stack_top as usize;
+
         #[cfg(target_arch = "x86_64")]
         {
             (*ctx_ptr).regs.gprs[0] = stack_top as u64;
@@ -705,8 +762,11 @@ pub unsafe extern "C" fn dtact_fiber_launch_with_cleanup_ext(
         }
         #[cfg(target_arch = "aarch64")]
         {
-            (*ctx_ptr).regs.gprs[12] = stack_top as u64;
-            (*ctx_ptr).regs.gprs[11] = crate::api::fiber_entry_point as *const () as u64;
+            let sp = stack_top as u64;
+            (*ctx_ptr).regs.gprs[10] = 0;
+            (*ctx_ptr).regs.gprs[12] = sp;
+            (*ctx_ptr).regs.gprs[11] =
+                crate::api::sign_aarch64_lr(crate::api::fiber_trampoline as *const () as u64, sp);
             #[cfg(windows)]
             {
                 (*ctx_ptr).regs.gprs[13] = stack_ceiling as u64;

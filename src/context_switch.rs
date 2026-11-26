@@ -170,10 +170,12 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 
 /// Switches execution context while preserving floating-point state (Unix AArch64).
 ///
-/// Implements BTI and PAC protection. Preserves x19-x30, SIMD d8-d15
-/// (q8-q15 saved), and FPCR (the exception-trap-enable/rounding-mode
-/// control register — stored at offset 104, the gap between the GPR block
-/// ending at 96+8 and the SIMD block starting at 128).
+/// Implements BTI and PAC protection using HINT-space instructions (`bti c`,
+/// `paciasp`, `autiasp`), which execute as NOPs on AArch64 cores without
+/// BTI/PAC support. Preserves x19-x30, SIMD d8-d15 (q8-q15 saved), and FPCR
+/// (the exception-trap-enable/rounding-mode control register — stored at
+/// offset 104, the gap between the GPR block ending at 96+8 and the SIMD
+/// block starting at 128).
 ///
 /// # Arguments
 /// * `save` (x0): Pointer to `Registers`.
@@ -182,136 +184,7 @@ pub unsafe extern "C" fn switch_context_cross_thread_float(
 /// # Security
 /// * `bti c`: Branch target identification for indirect calls.
 /// * `paciasp` / `autiasp`: Pointer authentication for the link register (x30).
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    not(feature = "security-hardened")
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_cross_thread_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "prfm pldl1keep, [x1, 128]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "mrs x9, fpcr",
-        "str x9, [x0, 104]",
-        "stp d8,  d9,  [x0, 128]",
-        "stp d10, d11, [x0, 144]",
-        "stp d12, d13, [x0, 160]",
-        "stp d14, d15, [x0, 176]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 104]",
-        "msr fpcr, x9",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "ldp d8,  d9,  [x1, 128]",
-        "ldp d10, d11, [x1, 144]",
-        "ldp d12, d13, [x1, 160]",
-        "ldp d14, d15, [x1, 176]",
-        "ret"
-    );
-}
-
-/// Switches execution context while preserving floating-point state (Unix AArch64).
-///
-/// Implements BTI and PAC protection. Preserves x19-x30, SIMD d8-d15
-/// (q8-q15 saved), and FPCR (stored at offset 104 — see the non-hardened
-/// variant's doc comment above for why that offset is safe to use).
-///
-/// # Arguments
-/// * `save` (x0): Pointer to `Registers`.
-/// * `restore` (x1): Pointer to `Registers`.
-///
-/// # Security
-/// * `bti c`: Branch target identification for indirect calls.
-/// * `paciasp` / `autiasp`: Pointer authentication for the link register (x30).
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    feature = "security-hardened"
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_cross_thread_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "bti c",
-        "paciasp",
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "prfm pldl1keep, [x1, 128]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "mrs x9, fpcr",
-        "str x9, [x0, 104]",
-        "stp d8,  d9,  [x0, 128]",
-        "stp d10, d11, [x0, 144]",
-        "stp d12, d13, [x0, 160]",
-        "stp d14, d15, [x0, 176]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 104]",
-        "msr fpcr, x9",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "ldp d8,  d9,  [x1, 128]",
-        "ldp d10, d11, [x1, 144]",
-        "ldp d12, d13, [x1, 160]",
-        "ldp d14, d15, [x1, 176]",
-        "autiasp",
-        "ret"
-    );
-}
-
-/// macOS AArch64: PAC-compliant context switch with SIMD preservation.
-///
-/// Adheres to Apple Silicon's security model by using BTI and PAC.
-/// This implementation signs the link register using the SP as a modifier.
-/// Also preserves FPCR (stored at offset 104 — see
-/// `switch_context_cross_thread_float`'s plain-Unix doc comment above for
-/// why that offset is safe to use).
-///
-/// # Security
-/// * `bti c`: Branch target identification.
-/// * `paciasp` / `autiasp`: Standard ARMv8.3-A pointer authentication.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(target_arch = "aarch64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_cross_thread_float(
     save: *mut Registers,
@@ -697,103 +570,14 @@ pub unsafe extern "C" fn switch_context_cross_thread_no_float(
 
 /// Switches execution context without preserving floating-point state (Unix AArch64).
 ///
-/// Includes BTI and PAC protection.
+/// Includes BTI and PAC protection using HINT-space instructions (`bti c`,
+/// `paciasp`, `autiasp`), which execute as NOPs on AArch64 cores without
+/// BTI/PAC support.
 ///
 /// # Security
 /// * `bti c`: Indirect branch protection.
 /// * `paciasp` / `autiasp`: Return address integrity.
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    not(feature = "security-hardened")
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_cross_thread_no_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "ret"
-    );
-}
-
-/// Switches execution context without preserving floating-point state (Unix AArch64).
-///
-/// Includes BTI and PAC protection.
-///
-/// # Security
-/// * `bti c`: Indirect branch protection.
-/// * `paciasp` / `autiasp`: Return address integrity.
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    feature = "security-hardened"
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_cross_thread_no_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "bti c",
-        "paciasp",
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "autiasp",
-        "ret"
-    );
-}
-
-/// macOS AArch64: PAC-compliant no-float cross-thread switch.
-///
-/// # Security
-/// * `bti c`: Branch target identification.
-/// * `paciasp` / `autiasp`: Pointer authentication for x30.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(target_arch = "aarch64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_cross_thread_no_float(
     save: *mut Registers,
@@ -1112,134 +896,15 @@ pub unsafe extern "C" fn switch_context_same_thread_float(
 
 /// Lightweight context switch for fibers pinned to the current thread (Unix AArch64).
 ///
-/// Skips TIB/TEB metadata preservation but maintains BTI and PAC security,
-/// and preserves FPCR (offset 104 — see `switch_context_cross_thread_float`'s
-/// plain-Unix doc comment above for why that offset is safe to use).
+/// Skips TIB/TEB metadata preservation but maintains BTI and PAC security
+/// using HINT-space instructions (`bti c`, `paciasp`, `autiasp`), which
+/// execute as NOPs on AArch64 cores without BTI/PAC support. Also preserves
+/// FPCR (offset 104).
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
 /// * `paciasp` / `autiasp`: Pointer authentication for x30.
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    not(feature = "security-hardened")
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_same_thread_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "prfm pldl1keep, [x1, 128]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "mrs x9, fpcr",
-        "str x9, [x0, 104]",
-        "stp d8,  d9,  [x0, 128]",
-        "stp d10, d11, [x0, 144]",
-        "stp d12, d13, [x0, 160]",
-        "stp d14, d15, [x0, 176]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 104]",
-        "msr fpcr, x9",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "ldp d8,  d9,  [x1, 128]",
-        "ldp d10, d11, [x1, 144]",
-        "ldp d12, d13, [x1, 160]",
-        "ldp d14, d15, [x1, 176]",
-        "ret"
-    );
-}
-
-/// Lightweight context switch for fibers pinned to the current thread (Unix AArch64).
-///
-/// Skips TIB/TEB metadata preservation but maintains BTI and PAC security,
-/// and preserves FPCR (offset 104).
-///
-/// # Security
-/// * `bti c`: Branch target identification.
-/// * `paciasp` / `autiasp`: Pointer authentication for x30.
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    feature = "security-hardened"
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_same_thread_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "bti c",
-        "paciasp",
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "prfm pldl1keep, [x1, 128]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "mrs x9, fpcr",
-        "str x9, [x0, 104]",
-        "stp d8,  d9,  [x0, 128]",
-        "stp d10, d11, [x0, 144]",
-        "stp d12, d13, [x0, 160]",
-        "stp d14, d15, [x0, 176]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 104]",
-        "msr fpcr, x9",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "ldp d8,  d9,  [x1, 128]",
-        "ldp d10, d11, [x1, 144]",
-        "ldp d12, d13, [x1, 160]",
-        "ldp d14, d15, [x1, 176]",
-        "autiasp",
-        "ret"
-    );
-}
-
-/// macOS AArch64: PAC-compliant same-thread float switch.
-///
-/// Also preserves FPCR (offset 104).
-///
-/// # Security
-/// * `bti c`: Branch target identification.
-/// * `paciasp` / `autiasp`: Pointer authentication for x30.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(target_arch = "aarch64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_same_thread_float(
     save: *mut Registers,
@@ -1622,103 +1287,14 @@ pub unsafe extern "C" fn switch_context_same_thread_no_float(
 
 /// The fastest possible context switch: same-thread and no floating-point (Unix AArch64).
 ///
-/// Includes BTI and PAC security.
+/// Includes BTI and PAC security using HINT-space instructions (`bti c`,
+/// `paciasp`, `autiasp`), which execute as NOPs on AArch64 cores without
+/// BTI/PAC support.
 ///
 /// # Security
 /// * `bti c`: Branch target identification.
 /// * `paciasp` / `autiasp`: Pointer authentication for x30.
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    not(feature = "security-hardened")
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_same_thread_no_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "ret"
-    );
-}
-
-/// The fastest possible context switch: same-thread and no floating-point (Unix AArch64).
-///
-/// Includes BTI and PAC security.
-///
-/// # Security
-/// * `bti c`: Branch target identification.
-/// * `paciasp` / `autiasp`: Pointer authentication for x30.
-#[cfg(all(
-    target_arch = "aarch64",
-    unix,
-    not(target_os = "macos"),
-    feature = "security-hardened"
-))]
-#[unsafe(naked)]
-pub unsafe extern "C" fn switch_context_same_thread_no_float(
-    save: *mut Registers,
-    restore: *const Registers,
-) {
-    naked_asm!(
-        "bti c",
-        "paciasp",
-        "prfm pstl1keep, [x0]",
-        "prfm pldl1keep, [x1]",
-        "prfm pldl1keep, [x1, 64]",
-        "ldr x9, [x1, 96]",
-        "prfm pldl1keep, [x9]",
-        "prfm pldl1keep, [x9, 64]",
-        "stp x19, x20, [x0, 0]",
-        "stp x21, x22, [x0, 16]",
-        "stp x23, x24, [x0, 32]",
-        "stp x25, x26, [x0, 48]",
-        "stp x27, x28, [x0, 64]",
-        "stp x29, x30, [x0, 80]",
-        "mov x9, sp",
-        "str x9, [x0, 96]",
-        "ldp x19, x20, [x1, 0]",
-        "ldp x21, x22, [x1, 16]",
-        "ldp x23, x24, [x1, 32]",
-        "ldp x25, x26, [x1, 48]",
-        "ldp x27, x28, [x1, 64]",
-        "ldp x29, x30, [x1, 80]",
-        "ldr x9, [x1, 96]",
-        "mov sp, x9",
-        "autiasp",
-        "ret"
-    );
-}
-
-/// macOS AArch64: PAC-compliant same-thread no-float switch.
-///
-/// # Security
-/// * `bti c`: Branch target identification.
-/// * `paciasp` / `autiasp`: Pointer authentication for x30.
-#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[cfg(all(target_arch = "aarch64", unix))]
 #[unsafe(naked)]
 pub unsafe extern "C" fn switch_context_same_thread_no_float(
     save: *mut Registers,

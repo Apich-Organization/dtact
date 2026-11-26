@@ -172,6 +172,7 @@ impl<T> Sender<T> {
     /// # Errors
     /// Returns `value` back in [`SendError`] if the receiver has been
     /// dropped.
+    #[allow(clippy::future_not_send)]
     #[inline(always)]
     pub async fn send(&self, value: T) -> Result<(), SendError<T>> {
         let mut value = Some(value);
@@ -272,6 +273,7 @@ impl<T> Receiver<T> {
     /// Receive the next message, waiting if the channel is currently
     /// empty. Returns `None` once every [`Sender`] has been dropped and
     /// the buffer is drained.
+    #[allow(clippy::future_not_send)]
     #[inline(always)]
     pub async fn recv(&mut self) -> Option<T> {
         std::future::poll_fn(|cx| self.poll_recv(cx)).await
@@ -385,6 +387,7 @@ impl<T> UnboundedReceiver<T> {
     /// Receive the next message, waiting if the channel is currently
     /// empty. Returns `None` once every sender has been dropped and the
     /// buffer is drained.
+    #[allow(clippy::future_not_send)]
     #[inline(always)]
     pub async fn recv(&mut self) -> Option<T> {
         self.inner.recv().await

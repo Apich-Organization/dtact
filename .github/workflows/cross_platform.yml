@@ -56,7 +56,7 @@ jobs:
       - name: Install Dependencies
         run: |
           cargo install cargo-zigbuild --locked
-          sudo apt-get update && sudo apt-get install -y qemu-user-static libc6-arm64-cross libc6-riscv64-cross gcc-riscv64-linux-gnu
+          sudo apt-get update && sudo apt-get install -y qemu-user libc6-arm64-cross libc6-riscv64-cross gcc-riscv64-linux-gnu
 
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
 
@@ -75,7 +75,7 @@ jobs:
           #!/bin/bash
           args=()
           for arg in "\$@"; do
-            if [[ "\$arg" == --target=* ]]; then
+            if [[ "\$arg" == --target=* || "\$arg" == "-Wl,--fix-cortex-a53-843419" || "\$arg" == "--fix-cortex-a53-843419" ]]; then
               continue
             fi
             args+=("\$arg")
@@ -88,7 +88,7 @@ jobs:
           #!/bin/bash
           args=()
           for arg in "\$@"; do
-            if [[ "\$arg" == --target=* ]]; then
+            if [[ "\$arg" == --target=* || "\$arg" == "-Wl,--fix-cortex-a53-843419" || "\$arg" == "--fix-cortex-a53-843419" ]]; then
               continue
             fi
             args+=("\$arg")
@@ -121,7 +121,7 @@ jobs:
 
           if [ -n "${{ matrix.qemu_arch }}" ]; then
             # QEMU needs the path to the cross-compiled dynamic libraries
-            RUNNER_CMD="qemu-${{ matrix.qemu_arch }}-static"
+            RUNNER_CMD="qemu-${{ matrix.qemu_arch }}"
 
             case "${{ matrix.qemu_arch }}" in
               riscv64)
@@ -142,4 +142,10 @@ jobs:
           fi
 
           cargo build --target ${{ matrix.platform }} --no-default-features --tests
-          cargo test --target ${{ matrix.platform }} --no-default-features
+          if [ -n "${{ matrix.qemu_arch }}" ]; then
+            # QEMU user-mode does not emulate io_uring_setup (ENOSYS), which
+            # the README.md doctest exercises via dtact-util's native backend.
+            cargo test --target ${{ matrix.platform }} --no-default-features --lib --tests
+          else
+            cargo test --target ${{ matrix.platform }} --no-default-features
+          fi
